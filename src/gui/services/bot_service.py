@@ -50,6 +50,18 @@ class BotService:
         if not CONFIG.get('hyperliquid_private_key') and not CONFIG.get('mnemonic'):
             raise ValueError("HYPERLIQUID_PRIVATE_KEY or MNEMONIC not configured. Please set it in .env file.")
 
+        # Optional Thalex venue: only validate if any Thalex env var is present.
+        if CONFIG.get('thalex_key_id') or CONFIG.get('thalex_private_key_path'):
+            from pathlib import Path as _Path
+            if not CONFIG.get('thalex_key_id'):
+                raise ValueError("THALEX_KEY_ID is required when THALEX_PRIVATE_KEY_PATH is set.")
+            pem = CONFIG.get('thalex_private_key_path')
+            if not pem or not _Path(pem).exists():
+                raise ValueError(f"THALEX_PRIVATE_KEY_PATH file not found: {pem}")
+            net = (CONFIG.get('thalex_network') or 'test').lower()
+            if net not in {'test', 'prod'}:
+                raise ValueError(f"THALEX_NETWORK must be 'test' or 'prod', got {net!r}.")
+
         # Use provided values or fall back to config
         assets = assets or self.config['assets']
         interval = interval or self.config['interval']

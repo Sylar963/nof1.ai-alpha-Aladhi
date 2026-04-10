@@ -42,6 +42,10 @@ class Trade(Base):
     asset = Column(String(20), nullable=False, index=True)  # BTC, ETH, SOL, etc.
     action = Column(String(10), nullable=False, index=True)  # buy, sell
 
+    # Multi-venue routing — every trade tags which exchange executed it.
+    venue = Column(String(20), nullable=False, default='hyperliquid', index=True)
+    instrument_name = Column(String(64), nullable=True, index=True)  # full venue instrument id (e.g. BTC-27JUN25-100000-C)
+
     # Entry details
     entry_timestamp = Column(DateTime, nullable=False, default=func.now(), index=True)
     entry_price = Column(Float, nullable=False)
@@ -68,7 +72,7 @@ class Trade(Base):
     reasoning_tokens = Column(Text, nullable=True)  # Full reasoning chain (JSON)
 
     # Execution details
-    order_id = Column(String(100), nullable=True)  # Hyperliquid order ID
+    order_id = Column(String(100), nullable=True)  # Venue-native order id (string-typed for compatibility)
     fill_count = Column(Integer, default=1)  # Number of fills to complete order
 
     # Status tracking
@@ -90,9 +94,11 @@ class Trade(Base):
 
 class Position(Base):
     """
-    Current open positions - synchronized with Hyperliquid account state.
+    Current open positions, synchronized across all configured venues.
 
-    Tracks active positions with real-time P&L.
+    Multi-venue: the same underlying asset can have positions on different
+    venues simultaneously (e.g. BTC perp on Hyperliquid hedging a BTC option
+    on Thalex). Identity is (asset, venue, instrument_name).
     """
     __tablename__ = 'positions'
 
@@ -100,7 +106,9 @@ class Position(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
 
     # Position identification
-    asset = Column(String(20), nullable=False, unique=True, index=True)
+    asset = Column(String(20), nullable=False, index=True)
+    venue = Column(String(20), nullable=False, default='hyperliquid', index=True)
+    instrument_name = Column(String(64), nullable=True, index=True)
 
     # Position details
     side = Column(String(10), nullable=False)  # long, short
@@ -125,8 +133,13 @@ class Position(Base):
     opened_at = Column(DateTime, nullable=False, default=func.now(), index=True)
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
+    __table_args__ = (
+        UniqueConstraint('asset', 'venue', 'instrument_name', name='uq_position_asset_venue_instrument'),
+        Index('idx_position_venue', 'venue'),
+    )
+
     def __repr__(self):
-        return f"<Position(id={self.id}, asset={self.asset}, side={self.side}, size={self.size})>"
+        return f"<Position(id={self.id}, venue={self.venue}, asset={self.asset}, side={self.side}, size={self.size})>"
 
 
 class DiaryEntry(Base):

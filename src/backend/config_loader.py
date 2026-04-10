@@ -76,6 +76,14 @@ CONFIG = {
     # Hyperliquid network/base URL overrides
     "hyperliquid_base_url": _get_env("HYPERLIQUID_BASE_URL"),
     "hyperliquid_network": _get_env("HYPERLIQUID_NETWORK", "mainnet"),
+    # Thalex (options venue)
+    "thalex_network": _get_env("THALEX_NETWORK", "test"),
+    "thalex_key_id": _get_env("THALEX_KEY_ID"),
+    "thalex_private_key_path": _get_env("THALEX_PRIVATE_KEY_PATH"),
+    "thalex_account": _get_env("THALEX_ACCOUNT"),
+    "thalex_max_contracts_per_trade": float(_get_env("THALEX_MAX_CONTRACTS_PER_TRADE", "0.1") or 0.1),
+    "thalex_max_open_positions": _get_int("THALEX_MAX_OPEN_POSITIONS", 3),
+    "thalex_underlyings": _get_list("THALEX_UNDERLYINGS", ["BTC"]),
     # LLM via OpenRouter
     "openrouter_api_key": _get_env("OPENROUTER_API_KEY"),
     "openrouter_base_url": _get_env("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),

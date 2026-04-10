@@ -41,7 +41,27 @@ class TradingAgent:
     def _decide(self, context, assets):
         """Dispatch decision request to the LLM and enforce output contract."""
         system_prompt = (
-            "You are a rigorous QUANTITATIVE TRADER and interdisciplinary MATHEMATICIAN-ENGINEER optimizing risk-adjusted returns for perpetual futures under real execution, margin, and funding constraints.\n"
+            "You are a rigorous QUANTITATIVE TRADER and interdisciplinary MATHEMATICIAN-ENGINEER optimizing risk-adjusted returns across PERPETUAL FUTURES (Hyperliquid) and OPTIONS (Thalex) under real execution, margin, and funding constraints.\n"
+            "MULTI-VENUE ROUTING:\n"
+            "- Each decision MUST include a 'venue' field: either 'hyperliquid' (perps) or 'thalex' (BTC options only for v1).\n"
+            "- Default venue is 'hyperliquid' when omitted.\n"
+            "- Use 'thalex' when you want directional or premium-selling exposure expressed via OPTIONS rather than perps.\n"
+            "OPTIONS STRATEGIES (thalex venue):\n"
+            "- 'credit_put': sell an OTM put to collect premium below support. action='sell'. Provide: strategy, underlying, kind='put', tenor_days, target_strike, contracts.\n"
+            "- 'credit_spread': defined-risk premium sale with two legs. action='sell'. Provide: strategy, underlying, tenor_days, legs=[{kind, side, target_strike, contracts}, ...].\n"
+            "- 'long_call_delta_hedged': buy a call and the bot auto-hedges delta on Hyperliquid perp. action='buy'. Provide: strategy, underlying, kind='call', tenor_days, target_strike, contracts.\n"
+            "- 'long_put_delta_hedged': buy a put and the bot auto-hedges delta on Hyperliquid perp. action='buy'. Provide: strategy, underlying, kind='put', tenor_days, target_strike, contracts.\n"
+            "RISK CAPS (hard limits — orders that violate are rejected):\n"
+            "- max_contracts_per_trade=0.1, max_open_positions=3, allowed underlyings=BTC.\n"
+            "POSITION SIZING:\n"
+            "- For thalex options, ALWAYS express size as 'contracts' (float), not 'allocation_usd'. Cap at 0.1 contracts per trade.\n"
+            "- For hyperliquid perps, use 'allocation_usd' as before.\n"
+            "TENOR / STRIKE GUIDANCE:\n"
+            "- tenor_days: integer days to expiry. The adapter picks the closest available expiry.\n"
+            "- target_strike: numerical strike. The adapter picks the closest available strike.\n"
+            "- For directional plays prefer 14-45 day tenors. For premium selling prefer 7-21 day tenors.\n"
+        )
+        system_prompt += (
             "You will receive market + account context for SEVERAL assets, including:\n"
             f"- assets = {json.dumps(assets)}\n"
             "- per-asset intraday (5m) and higher-timeframe (4h) metrics\n"
@@ -82,9 +102,11 @@ class TradingAgent:
             "- Favor alignment across 4h and 5m. Counter-trend scalps require stronger intraday confirmation and tighter risk.\n\n"
             "Output contract\n"
             "- Output a STRICT JSON object with exactly two properties in this order:\n"
-            "  • reasoning: long-form string capturing detailed, step-by-step analysis that means you can acknowledge existing information as clarity, or acknowledge that you need more information to make a decision (be verbose).\n"
+            "  • reasoning: long-form string capturing detailed, step-by-step analysis (be verbose).\n"
             "  • trade_decisions: array ordered to match the provided assets list.\n"
-            "- Each item inside trade_decisions must contain the keys {asset, action, allocation_usd, tp_price, sl_price, exit_plan, rationale}.\n"
+            "- Each item REQUIRES {asset, action, rationale}.\n"
+            "- For Hyperliquid (default venue) ALSO provide: allocation_usd, tp_price, sl_price, exit_plan.\n"
+            "- For Thalex options ALSO provide: venue='thalex', strategy, underlying, tenor_days, contracts, AND either (kind, target_strike) for single-leg OR legs[] for multi-leg spreads.\n"
             "- Do not emit Markdown or any extra properties.\n"
         )
         user_prompt = context
@@ -215,17 +237,59 @@ class TradingAgent:
         allow_structured = True
 
         def _build_schema():
-            """Assemble the JSON schema used for structured LLM responses."""
+            """Assemble the JSON schema used for structured LLM responses.
+
+            Multi-venue: includes optional Thalex options fields alongside the
+            legacy Hyperliquid spot/perp fields. Strict validation happens in
+            the Python parser (`decision_schema.parse_decision`) downstream.
+            """
+            leg_schema = {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "enum": ["call", "put"]},
+                    "side": {"type": "string", "enum": ["buy", "sell"]},
+                    "contracts": {"type": "number", "minimum": 0},
+                    "target_strike": {"type": ["number", "null"]},
+                    "target_delta": {"type": ["number", "null"]},
+                },
+                "required": ["kind", "side", "contracts", "target_strike", "target_delta"],
+                "additionalProperties": False,
+            }
             base_properties = {
                 "asset": {"type": "string", "enum": assets},
                 "action": {"type": "string", "enum": ["buy", "sell", "hold"]},
-                "allocation_usd": {"type": "number", "minimum": 0},
+                "rationale": {"type": "string"},
+                "venue": {"type": "string", "enum": ["hyperliquid", "thalex"]},
+                # Hyperliquid perp fields
+                "allocation_usd": {"type": ["number", "null"], "minimum": 0},
                 "tp_price": {"type": ["number", "null"]},
                 "sl_price": {"type": ["number", "null"]},
-                "exit_plan": {"type": "string"},
-                "rationale": {"type": "string"},
+                "exit_plan": {"type": ["string", "null"]},
+                # Thalex options fields
+                "strategy": {
+                    "type": ["string", "null"],
+                    "enum": [
+                        "credit_put",
+                        "credit_spread",
+                        "long_call_delta_hedged",
+                        "long_put_delta_hedged",
+                        None,
+                    ],
+                },
+                "underlying": {"type": ["string", "null"]},
+                "kind": {"type": ["string", "null"], "enum": ["call", "put", None]},
+                "tenor_days": {"type": ["integer", "null"], "minimum": 1, "maximum": 365},
+                "target_strike": {"type": ["number", "null"]},
+                "target_delta": {"type": ["number", "null"]},
+                "contracts": {"type": ["number", "null"], "minimum": 0},
+                "legs": {"type": ["array", "null"], "items": leg_schema},
             }
-            required_keys = ["asset", "action", "allocation_usd", "tp_price", "sl_price", "exit_plan", "rationale"]
+            required_keys = [
+                "asset", "action", "rationale", "venue",
+                "allocation_usd", "tp_price", "sl_price", "exit_plan",
+                "strategy", "underlying", "kind", "tenor_days",
+                "target_strike", "target_delta", "contracts", "legs",
+            ]
             return {
                 "type": "object",
                 "properties": {

@@ -13,10 +13,12 @@ from pathlib import Path
 from typing import Dict, List, Optional, Callable, Any
 
 from src.backend.agent.decision_maker import TradingAgent
+from src.backend.agent.decision_schema import DecisionParseError, parse_decision
 from src.backend.config_loader import CONFIG
 from src.backend.indicators.taapi_client import TAAPIClient
 from src.backend.models.trade_proposal import TradeProposal
 from src.backend.trading.hyperliquid_api import HyperliquidAPI
+from src.backend.trading.options_strategies import OptionsExecutor
 from src.backend.utils.prompt_utils import json_default
 
 
@@ -86,6 +88,19 @@ class TradingBotEngine:
         self.hyperliquid = HyperliquidAPI()
         self.agent = TradingAgent()
 
+        # Optional Thalex options venue. Constructed lazily so a missing
+        # config doesn't break Hyperliquid-only deployments.
+        self.thalex = None
+        self.options_executor: Optional[OptionsExecutor] = None
+        if CONFIG.get("thalex_key_id") and CONFIG.get("thalex_private_key_path"):
+            try:
+                from src.backend.trading.thalex_api import ThalexAPI
+                self.thalex = ThalexAPI()
+                self.options_executor = OptionsExecutor(thalex=self.thalex, hyperliquid=self.hyperliquid)
+                self.logger.info("Thalex options venue enabled (network=%s)", self.thalex.network_name)
+            except Exception as exc:  # pylint: disable=broad-except
+                self.logger.warning("Thalex venue not initialized: %s", exc)
+
         # Bot state
         self.state = BotState()
         self.is_running = False
@@ -108,6 +123,50 @@ class TradingBotEngine:
         # File paths
         self.diary_path = Path("data/diary.jsonl")
         self.diary_path.parent.mkdir(parents=True, exist_ok=True)
+
+    async def _execute_thalex_decision(self, decision_payload: Dict) -> None:
+        """Route a Thalex options decision through the OptionsExecutor.
+
+        Skips silently with a logged warning when Thalex is not configured. The
+        executor is responsible for risk-cap preflight, intent → instrument
+        resolution, leg orders, and the perp delta hedge.
+        """
+        if self.options_executor is None or self.thalex is None:
+            self.logger.warning("Thalex decision received but venue is not configured: %s", decision_payload)
+            return
+        try:
+            decision = parse_decision(decision_payload)
+        except DecisionParseError as exc:
+            self.logger.error("Invalid Thalex decision payload: %s — %s", exc, decision_payload)
+            return
+
+        try:
+            # Ensure WS is connected before the first request.
+            await self.thalex.connect()
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.error("Thalex connect failed: %s", exc)
+            return
+
+        open_count = sum(1 for t in self.active_trades if (t.get('venue') or 'hyperliquid') == 'thalex')
+        result = await self.options_executor.execute(decision, open_positions_count=open_count)
+        if result.ok:
+            self.logger.info(
+                "Thalex %s executed: thalex=%d hl=%d",
+                decision.strategy,
+                len(result.thalex_orders),
+                len(result.hyperliquid_orders),
+            )
+            self.active_trades.append({
+                "venue": "thalex",
+                "asset": decision.asset,
+                "strategy": decision.strategy,
+                "rationale": decision.rationale,
+                "thalex_orders": [o.order_id for o in result.thalex_orders],
+                "hyperliquid_orders": [o.order_id for o in result.hyperliquid_orders],
+                "opened_at": datetime.now(UTC).isoformat(),
+            })
+        else:
+            self.logger.warning("Thalex decision rejected: %s", result.reason)
 
     async def start(self):
         """Start the trading bot"""
@@ -406,9 +465,16 @@ class TradingBotEngine:
                         if asset not in self.assets:
                             continue
 
+                        # Multi-venue routing: Thalex options decisions are
+                        # handled by the OptionsExecutor; everything else falls
+                        # through to the existing Hyperliquid path.
+                        if (decision.get('venue') or 'hyperliquid').lower() == 'thalex':
+                            await self._execute_thalex_decision(decision)
+                            continue
+
                         action = decision.get('action')
                         rationale = decision.get('rationale', '')
-                        allocation = float(decision.get('allocation_usd', 0))
+                        allocation = float(decision.get('allocation_usd') or 0)
                         tp_price = decision.get('tp_price')
                         sl_price = decision.get('sl_price')
                         exit_plan = decision.get('exit_plan', '')

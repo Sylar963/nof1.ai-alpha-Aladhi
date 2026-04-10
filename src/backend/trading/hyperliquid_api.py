@@ -11,6 +11,7 @@ import logging
 import aiohttp
 from typing import TYPE_CHECKING
 from src.backend.config_loader import CONFIG
+from src.backend.trading.exchange_adapter import ExchangeAdapter
 from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
 from hyperliquid.utils import constants  # For MAINNET/TESTNET
@@ -31,13 +32,16 @@ if TYPE_CHECKING:
 else:
     Account = _Account
 
-class HyperliquidAPI:
+class HyperliquidAPI(ExchangeAdapter):
     """Facade around Hyperliquid SDK clients with async convenience methods.
 
     The class owns wallet credentials, connection configuration, and provides
     coroutine helpers that keep retry semantics and logging consistent across
-    the trading agent.
+    the trading agent. Implements :class:`ExchangeAdapter` so the bot engine can
+    route trade decisions polymorphically across multiple venues.
     """
+
+    venue = "hyperliquid"
 
     def __init__(self):
         """Initialize wallet credentials and instantiate exchange clients.

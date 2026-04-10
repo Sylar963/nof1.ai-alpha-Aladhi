@@ -43,7 +43,11 @@ def create_settings(bot_service: BotService, state_manager: StateManager):
                 'taapi_api_key': CONFIG.get('taapi_api_key') or '',
                 'hyperliquid_private_key': CONFIG.get('hyperliquid_private_key') or '',
                 'hyperliquid_network': CONFIG.get('hyperliquid_network') or 'mainnet',
-                'openrouter_api_key': CONFIG.get('openrouter_api_key') or ''
+                'openrouter_api_key': CONFIG.get('openrouter_api_key') or '',
+                'thalex_network': CONFIG.get('thalex_network') or 'test',
+                'thalex_key_id': CONFIG.get('thalex_key_id') or '',
+                'thalex_private_key_path': CONFIG.get('thalex_private_key_path') or '',
+                'thalex_account': CONFIG.get('thalex_account') or '',
             },
             'risk_management': {
                 'max_position_size': 1000,
@@ -243,6 +247,36 @@ def create_settings(bot_service: BotService, state_manager: StateManager):
 
                     ui.separator()
 
+                    # Thalex (options venue)
+                    ui.label('Thalex (Options Venue)').classes('text-lg font-semibold text-white')
+                    ui.label('JWT RS512 with an RSA private key generated in the Thalex UI. Start on TESTNET.').classes('text-xs text-gray-400')
+
+                    thalex_network = ui.select(
+                        label='Thalex Network',
+                        options=['test', 'prod'],
+                        value=config_data['api_keys']['thalex_network'],
+                    ).classes('w-full')
+
+                    thalex_key_id_input = ui.input(
+                        label='Thalex Key ID (kid)',
+                        placeholder='K...',
+                        value=config_data['api_keys']['thalex_key_id'],
+                    ).classes('w-full')
+
+                    thalex_pem_input = ui.input(
+                        label='Thalex Private Key PEM Path',
+                        placeholder='./secrets/thalex_private.pem',
+                        value=config_data['api_keys']['thalex_private_key_path'],
+                    ).classes('w-full')
+
+                    thalex_account_input = ui.input(
+                        label='Thalex Account (optional, for sub-accounts)',
+                        placeholder='',
+                        value=config_data['api_keys']['thalex_account'],
+                    ).classes('w-full')
+
+                    ui.separator()
+
                     # Test connections button
                     async def test_api_connections():
                         """Test all API connections"""
@@ -287,6 +321,10 @@ def create_settings(bot_service: BotService, state_manager: StateManager):
                             config_data['api_keys']['hyperliquid_private_key'] = hyperliquid_input.value
                             config_data['api_keys']['hyperliquid_network'] = hyperliquid_network.value
                             config_data['api_keys']['openrouter_api_key'] = openrouter_input.value
+                            config_data['api_keys']['thalex_network'] = thalex_network.value
+                            config_data['api_keys']['thalex_key_id'] = thalex_key_id_input.value
+                            config_data['api_keys']['thalex_private_key_path'] = thalex_pem_input.value
+                            config_data['api_keys']['thalex_account'] = thalex_account_input.value
 
                             # Save to file
                             if save_config(config_data):
@@ -297,6 +335,14 @@ def create_settings(bot_service: BotService, state_manager: StateManager):
                                     os.environ['HYPERLIQUID_PRIVATE_KEY'] = hyperliquid_input.value
                                 if openrouter_input.value:
                                     os.environ['OPENROUTER_API_KEY'] = openrouter_input.value
+                                if thalex_network.value:
+                                    os.environ['THALEX_NETWORK'] = thalex_network.value
+                                if thalex_key_id_input.value:
+                                    os.environ['THALEX_KEY_ID'] = thalex_key_id_input.value
+                                if thalex_pem_input.value:
+                                    os.environ['THALEX_PRIVATE_KEY_PATH'] = thalex_pem_input.value
+                                if thalex_account_input.value:
+                                    os.environ['THALEX_ACCOUNT'] = thalex_account_input.value
 
                                 ui.notify('API keys saved successfully!', type='positive')
                                 ui.notify('Note: Restart the bot for changes to take effect', type='info')
