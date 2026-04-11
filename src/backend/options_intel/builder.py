@@ -36,6 +36,7 @@ async def build_options_context(
     persist_anchor: bool = True,
     top_mispricings: int = 5,
     min_edge_bps: float = 100.0,
+    use_interpolation: bool = False,
 ) -> OptionsContext:
     """Run the full options-intel pipeline and return a snapshot.
 
@@ -100,6 +101,7 @@ async def build_options_context(
         deribit_chain=deribit_chain,
         top_n=top_mispricings,
         min_edge_bps=min_edge_bps,
+        use_interpolation=use_interpolation,
     )
 
     user_state = {}

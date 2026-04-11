@@ -155,3 +155,73 @@ async def test_get_instruments_returns_empty_list_on_missing_result():
 
     client._get = _empty  # type: ignore[assignment]
     assert await client.get_instruments(currency="BTC", kind="option") == []
+
+
+# ---------------------------------------------------------------------------
+# Mark price history
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_mark_price_history_returns_close_series():
+    """The mark price history endpoint returns [[ts_ms, price], ...].
+    The client must extract the price column as a list of floats."""
+    client = DeribitPublicClient()
+    fake = _fake_transport({
+        "result": [
+            [1745107200000, 60000.0],
+            [1745193600000, 60500.0],
+            [1745280000000, 61000.0],
+            [1745366400000, 60750.0],
+        ]
+    })
+    client._get = fake  # type: ignore[assignment]
+
+    closes = await client.get_mark_price_history(
+        instrument_name="BTC-PERPETUAL",
+        start_timestamp_ms=1745107200000,
+        end_timestamp_ms=1745366400000,
+        resolution_seconds=86400,
+    )
+    assert closes == [60000.0, 60500.0, 61000.0, 60750.0]
+    assert fake.sent[0]["path"] == "/public/get_mark_price_history"
+    assert fake.sent[0]["params"]["instrument_name"] == "BTC-PERPETUAL"
+    assert fake.sent[0]["params"]["resolution"] == "86400"
+
+
+@pytest.mark.asyncio
+async def test_get_mark_price_history_handles_empty_result():
+    client = DeribitPublicClient()
+    fake = _fake_transport({"result": []})
+    client._get = fake  # type: ignore[assignment]
+    closes = await client.get_mark_price_history(
+        instrument_name="BTC-PERPETUAL",
+        start_timestamp_ms=0,
+        end_timestamp_ms=0,
+    )
+    assert closes == []
+
+
+@pytest.mark.asyncio
+async def test_get_mark_price_history_caches_within_ttl():
+    """Two consecutive calls with the same args inside the TTL hit the wire once."""
+    client = DeribitPublicClient()
+    fake = _fake_transport({"result": [[1, 60000.0]]})
+    client._get = fake  # type: ignore[assignment]
+
+    a = await client.get_mark_price_history("BTC-PERPETUAL", 0, 1, 86400)
+    b = await client.get_mark_price_history("BTC-PERPETUAL", 0, 1, 86400)
+    assert a == b
+    assert len(fake.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_get_mark_price_history_returns_empty_on_malformed_payload():
+    client = DeribitPublicClient()
+
+    async def _bad(path, params=None):
+        return {"result": "unexpected"}
+
+    client._get = _bad  # type: ignore[assignment]
+    closes = await client.get_mark_price_history("BTC-PERPETUAL", 0, 0)
+    assert closes == []

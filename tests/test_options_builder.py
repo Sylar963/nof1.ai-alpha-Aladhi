@@ -166,6 +166,47 @@ async def test_build_includes_top_mispricings(thalex_chain, deribit_chain, tmp_p
 
 
 @pytest.mark.asyncio
+async def test_build_passes_interpolation_flag_to_mispricing_scan(thalex_chain, tmp_path):
+    """When use_interpolation=True, the builder must surface interpolated mispricings
+    even when the Thalex tenor isn't an exact Deribit match."""
+    from datetime import datetime as _dt, timezone as _tz
+
+    def _ts(year, month, day):
+        return int(_dt(year, month, day, 8, 0, 0, tzinfo=_tz.utc).timestamp())
+
+    # Deribit has bracketing expiries (Apr 18 and May 30) but NOT Apr 25
+    # which is what the Thalex chain uses for its 15d tenor.
+    deribit_chain = [
+        {"instrument_name": "BTC-18APR26-60000-C", "kind": "option", "option_type": "call",
+         "strike": 60000, "mark_iv": 0.50, "expiration_timestamp": _ts(2026, 4, 18) * 1000},
+        {"instrument_name": "BTC-18APR26-60000-P", "kind": "option", "option_type": "put",
+         "strike": 60000, "mark_iv": 0.51, "expiration_timestamp": _ts(2026, 4, 18) * 1000},
+        {"instrument_name": "BTC-30MAY26-60000-C", "kind": "option", "option_type": "call",
+         "strike": 60000, "mark_iv": 0.70, "expiration_timestamp": _ts(2026, 5, 30) * 1000},
+        {"instrument_name": "BTC-30MAY26-60000-P", "kind": "option", "option_type": "put",
+         "strike": 60000, "mark_iv": 0.71, "expiration_timestamp": _ts(2026, 5, 30) * 1000},
+    ]
+    thalex = FakeThalexAdapter(instruments_cache=thalex_chain, tickers={})
+    deribit = FakeDeribitClient(summaries=deribit_chain)
+    store = IVHistoryStore(db_path=str(tmp_path / "iv.db"))
+
+    ctx = await build_options_context(
+        thalex=thalex,
+        deribit=deribit,
+        iv_history=store,
+        spot_history=[60000.0] * 16,
+        today=_TEST_TODAY,
+        use_interpolation=True,
+        min_edge_bps=0.0,
+    )
+
+    # Without interpolation, the Apr 25 Thalex tenor would have no Deribit
+    # match. With interpolation, the mispricing scanner finds at least one
+    # synthetic match by interpolating between Apr 18 and May 30.
+    assert len(ctx.top_mispricings_vs_deribit) >= 1
+
+
+@pytest.mark.asyncio
 async def test_build_tolerates_empty_thalex_chain(deribit_chain, tmp_path):
     """No instruments → builder must return a sensible empty-ish context, not raise."""
     thalex = FakeThalexAdapter(instruments_cache=[], tickers={})
