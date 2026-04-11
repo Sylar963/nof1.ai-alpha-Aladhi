@@ -331,6 +331,182 @@ async def test_target_gamma_btc_falls_back_to_single_tenor_when_zero():
 
 
 @pytest.mark.asyncio
+async def test_multi_tenor_aborts_when_one_tenor_fails_to_resolve_no_orders_submitted():
+    """If any tenor can't be resolved during the staging phase, the executor must
+    return failure WITHOUT submitting any Thalex or Hyperliquid orders. The
+    staged-resolve-first design means a half-built curve is impossible."""
+    thalex = FakeThalex()
+    hl = FakeHyperliquid()
+    executor = OptionsExecutor(thalex=thalex, hyperliquid=hl)
+
+    # Wire 3 of 4 default tenors; tenor=14 deliberately missing.
+    for tenor in (7, 30, 60):
+        thalex.instruments_by_intent[("BTC", "call", tenor, 60000.0)] = f"BTC-{tenor}D-60000-C"
+
+    # Override resolve_intent so the missing tenor returns None instead of
+    # the FakeThalex's default fallback (which always returns SOMETHING).
+    real_resolve = thalex.resolve_intent
+
+    async def _resolve(intent):
+        key = (intent.underlying, intent.kind, intent.tenor_days, intent.target_strike)
+        if key not in thalex.instruments_by_intent:
+            return None
+        return thalex.instruments_by_intent[key]
+
+    thalex.resolve_intent = _resolve
+
+    decision = parse_decision({
+        "venue": "thalex",
+        "asset": "BTC",
+        "action": "buy",
+        "strategy": "long_call_delta_hedged",
+        "underlying": "BTC",
+        "kind": "call",
+        "tenor_days": 30,
+        "target_strike": 60000,
+        "target_gamma_btc": 0.004,
+        "rationale": "build gamma curve",
+    })
+    result = await executor.execute(decision, open_positions_count=0)
+
+    assert result.ok is False
+    assert "tenor" in result.reason.lower() or "instrument" in result.reason.lower()
+    # The critical assertion: NOTHING was submitted on either venue.
+    assert thalex.calls == []
+    assert hl.calls == []
+
+
+@pytest.mark.asyncio
+async def test_multi_tenor_unwinds_thalex_legs_when_a_later_submit_fails():
+    """If submission for a later tenor fails after retries, the executor must
+    submit opposing orders for the already-placed legs (best-effort unwind)."""
+    thalex = FakeThalex()
+    hl = FakeHyperliquid()
+    executor = OptionsExecutor(thalex=thalex, hyperliquid=hl)
+
+    for tenor in (7, 14, 30, 60):
+        thalex.instruments_by_intent[("BTC", "call", tenor, 60000.0)] = f"BTC-{tenor}D-60000-C"
+        thalex.delta_per_position[f"BTC-{tenor}D-60000-C"] = 0.5
+
+    # Make the third Thalex submission fail on every retry.
+    real_buy = thalex.place_buy_order
+
+    async def _failing_buy(asset, amount, slippage=0.01):
+        if asset == "BTC-30D-60000-C":
+            raise RuntimeError("simulated thalex outage")
+        return await real_buy(asset, amount, slippage)
+
+    thalex.place_buy_order = _failing_buy
+
+    decision = parse_decision({
+        "venue": "thalex",
+        "asset": "BTC",
+        "action": "buy",
+        "strategy": "long_call_delta_hedged",
+        "underlying": "BTC",
+        "kind": "call",
+        "tenor_days": 30,
+        "target_strike": 60000,
+        "target_gamma_btc": 0.004,
+        "rationale": "x",
+    })
+    result = await executor.execute(decision, open_positions_count=0)
+
+    assert result.ok is False
+    # Two successful Thalex buys (7d, 14d) should each be unwound by an
+    # opposing sell. We assert the unwind sells happened.
+    sells = [c for c in thalex.calls if c.method == "sell"]
+    assert len(sells) >= 2
+    sell_assets = {c.asset for c in sells}
+    assert "BTC-7D-60000-C" in sell_assets
+    assert "BTC-14D-60000-C" in sell_assets
+
+    # Both perp hedges from the successful legs should also be unwound.
+    # Long call hedges = sells; unwinds = buys.
+    hl_buys = [c for c in hl.calls if c.method == "buy"]
+    assert len(hl_buys) >= 2
+
+
+@pytest.mark.asyncio
+async def test_multi_tenor_retries_transient_thalex_failure_and_succeeds():
+    """A transient failure on the first attempt must be retried by the
+    multi-tenor submit wrapper, and the leg should ultimately succeed."""
+    thalex = FakeThalex()
+    hl = FakeHyperliquid()
+    executor = OptionsExecutor(thalex=thalex, hyperliquid=hl)
+
+    for tenor in (7, 14, 30, 60):
+        thalex.instruments_by_intent[("BTC", "call", tenor, 60000.0)] = f"BTC-{tenor}D-60000-C"
+        thalex.delta_per_position[f"BTC-{tenor}D-60000-C"] = 0.5
+
+    real_buy = thalex.place_buy_order
+    fail_count = {"n": 0}
+
+    async def _flaky_buy(asset, amount, slippage=0.01):
+        # Fail the FIRST attempt for the 14d tenor only, then succeed.
+        if asset == "BTC-14D-60000-C" and fail_count["n"] == 0:
+            fail_count["n"] += 1
+            raise RuntimeError("transient")
+        return await real_buy(asset, amount, slippage)
+
+    thalex.place_buy_order = _flaky_buy
+
+    decision = parse_decision({
+        "venue": "thalex",
+        "asset": "BTC",
+        "action": "buy",
+        "strategy": "long_call_delta_hedged",
+        "underlying": "BTC",
+        "kind": "call",
+        "tenor_days": 30,
+        "target_strike": 60000,
+        "target_gamma_btc": 0.004,
+        "rationale": "x",
+    })
+    result = await executor.execute(decision, open_positions_count=0)
+
+    assert result.ok is True
+    # All 4 buys succeed; no unwind.
+    buys = [c for c in thalex.calls if c.method == "buy"]
+    assert len(buys) == 4
+    sells = [c for c in thalex.calls if c.method == "sell"]
+    assert sells == []
+
+
+@pytest.mark.asyncio
+async def test_multi_tenor_logs_and_aborts_on_resolve_intent_exception():
+    """If resolve_intent raises (adapter init failure, network error), the
+    executor must catch the exception, log it, and abort cleanly without
+    submitting any orders."""
+    thalex = FakeThalex()
+    hl = FakeHyperliquid()
+    executor = OptionsExecutor(thalex=thalex, hyperliquid=hl)
+
+    async def _broken_resolve(intent):
+        raise RuntimeError("adapter not initialized")
+
+    thalex.resolve_intent = _broken_resolve
+
+    decision = parse_decision({
+        "venue": "thalex",
+        "asset": "BTC",
+        "action": "buy",
+        "strategy": "long_call_delta_hedged",
+        "underlying": "BTC",
+        "kind": "call",
+        "tenor_days": 30,
+        "target_strike": 60000,
+        "target_gamma_btc": 0.004,
+        "rationale": "x",
+    })
+    result = await executor.execute(decision, open_positions_count=0)
+
+    assert result.ok is False
+    assert thalex.calls == []
+    assert hl.calls == []
+
+
+@pytest.mark.asyncio
 async def test_target_gamma_btc_respects_max_open_positions_cap():
     """The multi-tenor expansion still has to respect max_open_positions."""
     thalex = FakeThalex()

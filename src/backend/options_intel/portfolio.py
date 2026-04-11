@@ -5,18 +5,36 @@ the adapter, parses days-to-expiry from each instrument name, and returns
 two compact structures the LLM-facing snapshot consumes:
 
 - ``open_positions``: list of dicts (one per leg) carrying instrument name,
-  size, side, per-contract greeks, and days-to-expiry. The decision agent
-  reads this to know what's already on the books.
+  size, side, days-to-expiry, and — when greeks were available — the
+  per-contract ``delta``, ``gamma``, ``vega``, ``theta`` keys. The decision
+  agent reads this to know what's already on the books.
 
 - ``portfolio_greeks``: net delta/gamma/vega/theta totals across all open
   positions, with sign flipped for short legs. The agent uses these to
   understand current risk exposure before sizing a new trade.
 
-Failure modes are intentionally tolerant: if a single ``get_greeks`` call
-fails or an instrument name doesn't parse as an option, the offending
-position is silently dropped from both lists rather than blowing up the
-whole snapshot. Per-position errors are logged so they're visible during
-calibration but never crash the bot.
+Failure handling — **fail-open by design**:
+
+- **``get_greeks`` failure**: the position is RETAINED in ``open_positions``
+  but with NO per-contract greek fields, so the operator still sees what
+  the bot is holding even when the ticker hiccups. The failing leg
+  contributes zero to ``portfolio_greeks`` totals. See the
+  ``greeks = {}`` fallback in :func:`aggregate_portfolio_greeks` around
+  line 79 — that's the explicit reset point.
+
+- **Unparseable instrument name** (perpetual, future, garbage): the
+  position is dropped from both outputs because we can't compute
+  days-to-expiry or bucket it sensibly with the rest of the options.
+
+- Per-position errors are logged so they're visible during calibration
+  but never crash the bot.
+
+**Caller contract**: each entry in ``open_positions`` may or may not
+contain the ``delta``/``gamma``/``vega``/``theta`` keys. Consumers must
+not assume the greek fields are present — read them with ``.get(...)``
+or check ``"delta" in entry`` first. The aggregate ``portfolio_greeks``
+dict is always present and always has all four keys, but contributions
+from greekless legs will simply be zero.
 """
 
 from __future__ import annotations
