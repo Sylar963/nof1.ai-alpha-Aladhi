@@ -18,8 +18,13 @@ from typing import Optional
 
 from src.backend.options_intel.iv_history_store import IVHistoryRow, IVHistoryStore
 from src.backend.options_intel.mispricing import scan_mispricings
+from src.backend.options_intel.portfolio import aggregate_portfolio_greeks
 from src.backend.options_intel.regime import classify_regime
 from src.backend.options_intel.snapshot import OptionsContext
+from src.backend.options_intel.technicals import (
+    compute_keltner_channel,
+    compute_opening_range,
+)
 from src.backend.options_intel.vol_surface import build_vol_surface
 
 
@@ -37,14 +42,14 @@ async def build_options_context(
     top_mispricings: int = 5,
     min_edge_bps: float = 100.0,
     use_interpolation: bool = False,
+    intraday_minute_prices: Optional[list[tuple[int, float]]] = None,
+    daily_closes_for_keltner: Optional[list[float]] = None,
 ) -> OptionsContext:
     """Run the full options-intel pipeline and return a snapshot.
 
     Args:
         thalex: ThalexAPI instance (or stand-in). Must expose
-            ``_instruments_cache`` and ``get_user_state``. ``get_greeks`` is
-            currently unused by the builder but kept in the interface for
-            future expansion.
+            ``_instruments_cache``, ``get_user_state``, and ``get_greeks``.
         deribit: DeribitPublicClient. Must expose
             ``get_book_summary_by_currency`` and ``get_index_price``.
         iv_history: persistent SQLite store for straddle anchors.
@@ -53,6 +58,14 @@ async def build_options_context(
             ``iv_history`` so the regime classifier has a fresh data point.
         top_mispricings: how many of the largest IV gaps to surface.
         min_edge_bps: drop mispricings below this absolute IV diff.
+        use_interpolation: forward to ``scan_mispricings``; when True the
+            scanner fills unmatched Thalex tenors with synthetic Deribit IVs.
+        intraday_minute_prices: optional list of ``(unix_seconds, price)``
+            tuples for the technical opening-range calc. When None or
+            empty the snapshot's ``opening_range`` stays ``unknown``.
+        daily_closes_for_keltner: optional longer daily-close series (>=20
+            entries) used to compute the Keltner channel. Falls back to
+            ``spot_history`` when not supplied.
 
     Returns:
         :class:`OptionsContext` digest ready to feed the LLM.
@@ -111,12 +124,41 @@ async def build_options_context(
         logger.warning("thalex get_user_state failed: %s", exc)
     capital_available = float(_user_state_field(user_state, "balance", default=0.0))
 
+    today_for_signals = today or datetime.now(timezone.utc).date()
+
+    # Opening range — first hour of the current UTC day on BTC.
+    opening_range = compute_opening_range(
+        intraday_minute_prices or [],
+        today=today_for_signals,
+        current_spot=spot,
+    )
+
+    # Keltner channel — EMA20 ± 2×ATR(14) on BTC daily closes. Falls back
+    # to the same spot_history we use for realized vol when no longer
+    # series is supplied.
+    keltner_closes = list(daily_closes_for_keltner or spot_history or [])
+    keltner = compute_keltner_channel(
+        closes=keltner_closes,
+        period=20,
+        atr_period=14,
+        atr_multiplier=2.0,
+        current_spot=spot,
+    )
+
+    # Portfolio greeks — walk Thalex positions and aggregate per-leg greeks.
+    raw_positions = _extract_positions(user_state)
+    portfolio = await aggregate_portfolio_greeks(
+        positions=raw_positions,
+        greeks_source=thalex,
+        today=today_for_signals,
+    )
+
     return OptionsContext(
         timestamp_utc=datetime.now(timezone.utc).isoformat(),
         spot=float(spot),
         spot_24h_change_pct=_spot_change_pct(spot_history),
-        opening_range={"high": None, "low": None, "position": "unknown"},
-        keltner={"ema20": None, "upper": None, "lower": None, "position": "unknown"},
+        opening_range=opening_range,
+        keltner=keltner,
         atm_iv_by_tenor=surface.atm_iv_by_tenor,
         skew_25d_by_tenor=surface.skew_25d_by_tenor,
         term_structure_slope=surface.term_structure_slope,
@@ -131,14 +173,42 @@ async def build_options_context(
             "label": regime_reading.signal_1_label,
         },
         top_mispricings_vs_deribit=mispricing_report.top,
-        open_positions=[],
-        portfolio_greeks={"delta": 0.0, "gamma": 0.0, "vega": 0.0, "theta": 0.0},
+        open_positions=portfolio["open_positions"],
+        portfolio_greeks=portfolio["portfolio_greeks"],
         capital_available=capital_available,
         max_contracts_per_trade=0.1,
         max_open_positions=3,
-        open_position_count=0,
+        open_position_count=len(portfolio["open_positions"]),
         recent_options_trades=[],
     )
+
+
+def _extract_positions(user_state) -> list[dict]:
+    """Pull the positions list from a user_state response in either shape.
+
+    The Thalex adapter normalizes get_user_state into an :class:`AccountState`
+    dataclass with a ``positions`` attribute. The pure-dict shape is also
+    supported (handy for tests + future-proofing).
+    """
+    if user_state is None:
+        return []
+    if isinstance(user_state, dict):
+        raw = user_state.get("positions") or []
+    else:
+        raw = getattr(user_state, "positions", []) or []
+
+    out: list[dict] = []
+    for entry in raw:
+        if isinstance(entry, dict):
+            out.append(entry)
+            continue
+        # PositionSnapshot dataclass — convert to the dict the aggregator expects
+        out.append({
+            "instrument_name": getattr(entry, "instrument_name", None) or getattr(entry, "asset", ""),
+            "size": getattr(entry, "size", 0.0),
+            "side": getattr(entry, "side", "long"),
+        })
+    return out
 
 
 def _user_state_field(user_state, key: str, default):

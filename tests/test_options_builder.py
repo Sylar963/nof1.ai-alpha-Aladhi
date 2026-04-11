@@ -207,6 +207,90 @@ async def test_build_passes_interpolation_flag_to_mispricing_scan(thalex_chain, 
 
 
 @pytest.mark.asyncio
+async def test_build_populates_opening_range_when_intraday_supplied(thalex_chain, deribit_chain, tmp_path):
+    """A non-empty intraday minute series must produce a real opening range."""
+    from datetime import datetime as _dt, timezone as _tz
+
+    today_dt = _dt(2026, 4, 10, tzinfo=_tz.utc)
+    today_start = int(today_dt.timestamp())
+    intraday = [
+        (today_start + 5 * 60, 60050.0),
+        (today_start + 30 * 60, 60500.0),  # high
+        (today_start + 45 * 60, 59800.0),  # low
+        (today_start + 59 * 60, 60100.0),
+    ]
+
+    thalex = FakeThalexAdapter(instruments_cache=thalex_chain, tickers={})
+    deribit = FakeDeribitClient(summaries=deribit_chain)
+    store = IVHistoryStore(db_path=str(tmp_path / "iv.db"))
+
+    ctx = await build_options_context(
+        thalex=thalex,
+        deribit=deribit,
+        iv_history=store,
+        spot_history=[60000.0] * 16,
+        today=_TEST_TODAY,
+        intraday_minute_prices=intraday,
+    )
+
+    assert ctx.opening_range["high"] == 60500.0
+    assert ctx.opening_range["low"] == 59800.0
+    assert ctx.opening_range["position"] in {"above", "inside", "below"}
+
+
+@pytest.mark.asyncio
+async def test_build_populates_keltner_when_long_daily_series_supplied(thalex_chain, deribit_chain, tmp_path):
+    """When daily_closes_for_keltner has 25+ entries, the channel must populate."""
+    thalex = FakeThalexAdapter(instruments_cache=thalex_chain, tickers={})
+    deribit = FakeDeribitClient(summaries=deribit_chain)
+    store = IVHistoryStore(db_path=str(tmp_path / "iv.db"))
+
+    daily = [60000.0 + i * 50 for i in range(30)]  # gentle uptrend, 30 closes
+    ctx = await build_options_context(
+        thalex=thalex,
+        deribit=deribit,
+        iv_history=store,
+        spot_history=[60000.0] * 16,
+        today=_TEST_TODAY,
+        daily_closes_for_keltner=daily,
+    )
+
+    assert ctx.keltner["ema20"] is not None
+    assert ctx.keltner["upper"] is not None
+    assert ctx.keltner["lower"] is not None
+    assert ctx.keltner["position"] in {"above", "inside", "below"}
+
+
+@pytest.mark.asyncio
+async def test_build_aggregates_portfolio_greeks_from_thalex_positions(thalex_chain, deribit_chain, tmp_path):
+    """A Thalex user_state with open positions must produce real portfolio greeks."""
+    thalex = FakeThalexAdapter(instruments_cache=thalex_chain, tickers={})
+    thalex.user_state_response = {
+        "balance": 12000.0,
+        "positions": [
+            {"instrument_name": "BTC-25APR26-65000-C", "size": 0.05, "side": "long"},
+        ],
+    }
+    deribit = FakeDeribitClient(summaries=deribit_chain)
+    store = IVHistoryStore(db_path=str(tmp_path / "iv.db"))
+
+    ctx = await build_options_context(
+        thalex=thalex,
+        deribit=deribit,
+        iv_history=store,
+        spot_history=[60000.0] * 16,
+        today=_TEST_TODAY,
+    )
+
+    assert len(ctx.open_positions) == 1
+    pos = ctx.open_positions[0]
+    assert pos["instrument_name"] == "BTC-25APR26-65000-C"
+    # FakeThalexAdapter.get_greeks returns delta=0.5 by default → portfolio delta = 0.025
+    assert ctx.portfolio_greeks["delta"] == pytest.approx(0.025)
+    assert ctx.open_position_count == 1
+
+
+@pytest.mark.asyncio
 async def test_build_tolerates_empty_thalex_chain(deribit_chain, tmp_path):
     """No instruments → builder must return a sensible empty-ish context, not raise."""
     thalex = FakeThalexAdapter(instruments_cache=[], tickers={})

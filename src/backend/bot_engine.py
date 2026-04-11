@@ -339,18 +339,28 @@ class TradingBotEngine:
             try:
                 store = IVHistoryStore(db_path="data/iv_history.sqlite")
                 spot_history = await self._fetch_btc_daily_closes(deribit, days=16)
+                # Pull a longer 30-day series so the Keltner channel (EMA20 +
+                # ATR14) has enough data to populate.
+                keltner_closes = await self._fetch_btc_daily_closes(deribit, days=30)
+                # First-hour minute data for the opening-range signal.
+                intraday_minutes = await self._fetch_btc_first_hour_minutes(deribit)
                 self._latest_options_context = await build_options_context(
                     thalex=self.thalex,
                     deribit=deribit,
                     iv_history=store,
                     spot_history=spot_history,
                     use_interpolation=True,
+                    intraday_minute_prices=intraday_minutes,
+                    daily_closes_for_keltner=keltner_closes,
                 )
                 self.logger.info(
-                    "OptionsContext refreshed (regime=%s confidence=%s, spot_history=%d closes)",
+                    "OptionsContext refreshed (regime=%s confidence=%s, spot_history=%d closes, "
+                    "intraday=%d minutes, positions=%d)",
                     self._latest_options_context.vol_regime,
                     self._latest_options_context.vol_regime_confidence,
                     len(spot_history),
+                    len(intraday_minutes),
+                    self._latest_options_context.open_position_count,
                 )
             finally:
                 await deribit.close()
@@ -384,6 +394,35 @@ class TradingBotEngine:
         if intraday:
             return intraday[-days:]
         return [60000.0] * days
+
+    async def _fetch_btc_first_hour_minutes(self, deribit) -> list:
+        """Fetch BTC mark prices at 1-minute resolution for the first hour of today UTC.
+
+        Returns a list of ``(unix_seconds, price)`` tuples — the shape the
+        opening-range helper expects. Returns ``[]`` on any failure so the
+        snapshot's opening_range stays ``unknown`` rather than crashing.
+        """
+        try:
+            now = datetime.now(UTC)
+            today_start = datetime(now.year, now.month, now.day, tzinfo=UTC)
+            start_ms = int(today_start.timestamp() * 1000)
+            end_ms = start_ms + 60 * 60 * 1000  # +1 hour
+            closes = await deribit.get_mark_price_history(
+                instrument_name="BTC-PERPETUAL",
+                start_timestamp_ms=start_ms,
+                end_timestamp_ms=end_ms,
+                resolution_seconds=60,
+            )
+            # The Deribit client only returns the price column; we need
+            # timestamps too. Reconstruct an evenly-spaced minute grid
+            # starting at today_start to attach timestamps to each close.
+            if not closes:
+                return []
+            start_seconds = int(today_start.timestamp())
+            return [(start_seconds + i * 60, float(price)) for i, price in enumerate(closes)]
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.warning("Deribit first-hour minute fetch failed: %s", exc)
+            return []
 
     async def _run_options_decision_cycle(self) -> None:
         """Background task: run the options agent against the cached snapshot.
