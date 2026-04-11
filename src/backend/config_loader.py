@@ -84,6 +84,16 @@ CONFIG = {
     "thalex_max_contracts_per_trade": float(_get_env("THALEX_MAX_CONTRACTS_PER_TRADE", "0.1") or 0.1),
     "thalex_max_open_positions": _get_int("THALEX_MAX_OPEN_POSITIONS", 3),
     "thalex_underlyings": _get_list("THALEX_UNDERLYINGS", ["BTC"]),
+    # Two-cadence options scheduler. Disabled by default — set
+    # OPTIONS_SCHEDULER_ENABLED=1 to turn on the 15m surface refresh +
+    # 3h decision loop alongside the existing 5m perps loop.
+    "options_scheduler_enabled": _get_bool("OPTIONS_SCHEDULER_ENABLED", False),
+    "options_vol_surface_interval_seconds": _get_int(
+        "OPTIONS_VOL_SURFACE_INTERVAL_SECONDS", 900
+    ),
+    "options_decision_interval_seconds": _get_int(
+        "OPTIONS_DECISION_INTERVAL_SECONDS", 10800
+    ),
     # BTC delta drift (signed) before the perp hedge re-trades. Threshold-only —
     # the loop polls for free, only fires a perp order when |drift| > this.
     "thalex_delta_threshold": float(_get_env("THALEX_DELTA_THRESHOLD", "0.02") or 0.02),

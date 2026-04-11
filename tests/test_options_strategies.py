@@ -144,33 +144,6 @@ class FakeHyperliquid(ExchangeAdapter):
 
 
 @pytest.mark.asyncio
-async def test_credit_put_executes_a_single_sell():
-    thalex = FakeThalex()
-    hl = FakeHyperliquid()
-    executor = OptionsExecutor(thalex=thalex, hyperliquid=hl)
-
-    decision = parse_decision({
-        "venue": "thalex",
-        "asset": "BTC",
-        "action": "sell",
-        "strategy": "credit_put",
-        "underlying": "BTC",
-        "kind": "put",
-        "tenor_days": 14,
-        "target_strike": 55000,
-        "contracts": 0.05,
-        "rationale": "premium sale",
-    })
-    result = await executor.execute(decision, open_positions_count=0)
-
-    assert result.ok is True
-    assert len(thalex.calls) == 1
-    assert thalex.calls[0].method == "sell"
-    assert thalex.calls[0].amount == 0.05
-    assert hl.calls == []  # no perp hedge for credit put
-
-
-@pytest.mark.asyncio
 async def test_long_call_delta_hedged_places_thalex_buy_and_hyperliquid_short():
     thalex = FakeThalex()
     hl = FakeHyperliquid()
@@ -257,7 +230,105 @@ async def test_lookup_delta_falls_through_to_get_greeks_when_cache_empty():
 
 
 @pytest.mark.asyncio
-async def test_credit_spread_places_two_legs_in_correct_directions():
+async def test_credit_put_spread_executes_two_legs_in_correct_directions():
+    """Sell near put + buy further OTM put = defined-risk credit put spread."""
+    thalex = FakeThalex()
+    hl = FakeHyperliquid()
+    executor = OptionsExecutor(thalex=thalex, hyperliquid=hl)
+    thalex.instruments_by_intent[("BTC", "put", 14, 55000.0)] = "BTC-25APR26-55000-P"
+    thalex.instruments_by_intent[("BTC", "put", 14, 50000.0)] = "BTC-25APR26-50000-P"
+
+    decision = parse_decision({
+        "venue": "thalex",
+        "asset": "BTC",
+        "action": "sell",
+        "strategy": "credit_put_spread",
+        "underlying": "BTC",
+        "tenor_days": 14,
+        "vol_view": "short_vol",
+        "legs": [
+            {"kind": "put", "side": "sell", "target_strike": 55000, "contracts": 0.05},
+            {"kind": "put", "side": "buy", "target_strike": 50000, "contracts": 0.05},
+        ],
+        "rationale": "premium sale below support",
+    })
+    result = await executor.execute(decision, open_positions_count=0)
+
+    assert result.ok is True
+    methods = [c.method for c in thalex.calls]
+    assert methods == ["sell", "buy"]
+    assert hl.calls == []  # no perp hedge for credit spreads
+
+
+@pytest.mark.asyncio
+async def test_credit_call_spread_executes_two_call_legs():
+    """Sell near call + buy further OTM call = defined-risk credit call spread."""
+    thalex = FakeThalex()
+    hl = FakeHyperliquid()
+    executor = OptionsExecutor(thalex=thalex, hyperliquid=hl)
+    thalex.instruments_by_intent[("BTC", "call", 14, 65000.0)] = "BTC-25APR26-65000-C"
+    thalex.instruments_by_intent[("BTC", "call", 14, 70000.0)] = "BTC-25APR26-70000-C"
+
+    decision = parse_decision({
+        "venue": "thalex",
+        "asset": "BTC",
+        "action": "sell",
+        "strategy": "credit_call_spread",
+        "underlying": "BTC",
+        "tenor_days": 14,
+        "legs": [
+            {"kind": "call", "side": "sell", "target_strike": 65000, "contracts": 0.05},
+            {"kind": "call", "side": "buy", "target_strike": 70000, "contracts": 0.05},
+        ],
+        "rationale": "selling upside premium",
+    })
+    result = await executor.execute(decision, open_positions_count=0)
+
+    assert result.ok is True
+    methods = [c.method for c in thalex.calls]
+    assert methods == ["sell", "buy"]
+
+
+@pytest.mark.asyncio
+async def test_iron_condor_executes_four_legs_two_sides():
+    """Iron condor = sell put spread + sell call spread, defined risk both sides."""
+    thalex = FakeThalex()
+    hl = FakeHyperliquid()
+    executor = OptionsExecutor(thalex=thalex, hyperliquid=hl)
+    thalex.instruments_by_intent[("BTC", "put", 14, 55000.0)] = "BTC-25APR26-55000-P"
+    thalex.instruments_by_intent[("BTC", "put", 14, 50000.0)] = "BTC-25APR26-50000-P"
+    thalex.instruments_by_intent[("BTC", "call", 14, 65000.0)] = "BTC-25APR26-65000-C"
+    thalex.instruments_by_intent[("BTC", "call", 14, 70000.0)] = "BTC-25APR26-70000-C"
+
+    decision = parse_decision({
+        "venue": "thalex",
+        "asset": "BTC",
+        "action": "sell",
+        "strategy": "iron_condor",
+        "underlying": "BTC",
+        "tenor_days": 14,
+        "vol_view": "short_vol",
+        "legs": [
+            {"kind": "put", "side": "sell", "target_strike": 55000, "contracts": 0.05},
+            {"kind": "put", "side": "buy", "target_strike": 50000, "contracts": 0.05},
+            {"kind": "call", "side": "sell", "target_strike": 65000, "contracts": 0.05},
+            {"kind": "call", "side": "buy", "target_strike": 70000, "contracts": 0.05},
+        ],
+        "rationale": "vol crush, defined risk both sides",
+    })
+    result = await executor.execute(decision, open_positions_count=0)
+
+    assert result.ok is True
+    assert len(thalex.calls) == 4
+    sells = [c for c in thalex.calls if c.method == "sell"]
+    buys = [c for c in thalex.calls if c.method == "buy"]
+    assert len(sells) == 2
+    assert len(buys) == 2
+    assert hl.calls == []  # iron condor is self-contained, no perp hedge
+
+
+@pytest.mark.asyncio
+async def test_iron_condor_requires_at_least_two_legs():
     thalex = FakeThalex()
     hl = FakeHyperliquid()
     executor = OptionsExecutor(thalex=thalex, hyperliquid=hl)
@@ -266,20 +337,48 @@ async def test_credit_spread_places_two_legs_in_correct_directions():
         "venue": "thalex",
         "asset": "BTC",
         "action": "sell",
-        "strategy": "credit_spread",
+        "strategy": "iron_condor",
         "underlying": "BTC",
         "tenor_days": 14,
+        "legs": [],
+        "rationale": "x",
+    })
+    result = await executor.execute(decision, open_positions_count=0)
+    assert result.ok is False
+    assert "legs" in result.reason.lower()
+
+
+@pytest.mark.asyncio
+async def test_calendar_spread_uses_per_leg_tenor_days():
+    """Calendar spread legs override decision-level tenor with their own tenor_days."""
+    thalex = FakeThalex()
+    hl = FakeHyperliquid()
+    executor = OptionsExecutor(thalex=thalex, hyperliquid=hl)
+    # Different instruments per tenor
+    thalex.instruments_by_intent[("BTC", "call", 7, 60000.0)] = "BTC-WEEKLY-60000-C"
+    thalex.instruments_by_intent[("BTC", "call", 30, 60000.0)] = "BTC-MONTHLY-60000-C"
+
+    decision = parse_decision({
+        "venue": "thalex",
+        "asset": "BTC",
+        "action": "buy",
+        "strategy": "vol_arb",
+        "underlying": "BTC",
+        "entry_kind": "calendar",
         "legs": [
-            {"kind": "put", "side": "sell", "target_strike": 55000, "contracts": 0.1},
-            {"kind": "put", "side": "buy", "target_strike": 50000, "contracts": 0.1},
+            {"kind": "call", "side": "sell", "target_strike": 60000, "contracts": 0.05, "tenor_days": 7},
+            {"kind": "call", "side": "buy", "target_strike": 60000, "contracts": 0.05, "tenor_days": 30},
         ],
-        "rationale": "defined risk premium sale",
+        "rationale": "term structure dislocation",
     })
     result = await executor.execute(decision, open_positions_count=0)
 
     assert result.ok is True
-    methods = [c.method for c in thalex.calls]
-    assert methods == ["sell", "buy"]
+    assert len(thalex.calls) == 2
+    # Each leg should resolve to a different instrument because tenors differ.
+    instrument_names = {c.asset for c in thalex.calls}
+    assert "BTC-WEEKLY-60000-C" in instrument_names
+    assert "BTC-MONTHLY-60000-C" in instrument_names
 
 
 @pytest.mark.asyncio

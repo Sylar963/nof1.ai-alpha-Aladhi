@@ -66,12 +66,20 @@ class OptionsExecutor:
         if not decision.strategy:
             return ExecutionResult(ok=False, reason="missing strategy")
 
-        if decision.strategy == "credit_put":
-            return await self._execute_single_leg(decision, open_positions_count, side_override="sell")
         if decision.strategy in {"long_call_delta_hedged", "long_put_delta_hedged"}:
             return await self._execute_delta_hedged(decision, open_positions_count)
-        if decision.strategy == "credit_spread":
-            return await self._execute_spread(decision, open_positions_count)
+
+        # All multi-leg defined-risk plays go through the same path: each leg
+        # is resolved to its own instrument and submitted in order. Iron condor
+        # is just a 4-leg credit spread (two verticals, one each side).
+        if decision.strategy in {
+            "credit_put_spread",
+            "credit_call_spread",
+            "iron_condor",
+            "vol_arb",
+        }:
+            return await self._execute_multi_leg(decision, open_positions_count)
+
         return ExecutionResult(ok=False, reason=f"unknown strategy {decision.strategy}")
 
     # ------------------------------------------------------------------
@@ -144,13 +152,23 @@ class OptionsExecutor:
 
         return ExecutionResult(ok=True, thalex_orders=[thalex_order], hyperliquid_orders=hl_orders)
 
-    async def _execute_spread(
+    async def _execute_multi_leg(
         self,
         decision: TradeDecision,
         open_positions_count: int,
     ) -> ExecutionResult:
+        """Execute any multi-leg defined-risk strategy (credit spreads, iron
+        condors, vol arb, calendar spreads).
+
+        Each leg is resolved independently — when ``leg.tenor_days`` is set it
+        overrides the decision-level tenor (calendar/diagonal spreads). Risk
+        caps are applied per-leg before any orders are submitted.
+        """
         if not decision.legs:
-            return ExecutionResult(ok=False, reason="credit_spread requires legs[]")
+            return ExecutionResult(
+                ok=False,
+                reason=f"{decision.strategy} requires legs[] to be non-empty",
+            )
 
         # Risk caps apply per-leg
         for leg in decision.legs:
@@ -167,7 +185,8 @@ class OptionsExecutor:
             intent = OptionIntent(
                 underlying=decision.underlying or decision.asset,
                 kind=leg.kind,
-                tenor_days=decision.tenor_days or 14,
+                # Per-leg tenor wins; decision-level is the fallback
+                tenor_days=leg.tenor_days or decision.tenor_days or 14,
                 target_strike=leg.target_strike,
                 target_delta=leg.target_delta,
             )

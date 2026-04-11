@@ -19,6 +19,10 @@ from src.backend.indicators.taapi_client import TAAPIClient
 from src.backend.models.trade_proposal import TradeProposal
 from src.backend.trading.delta_hedge_manager import DeltaHedgeManager
 from src.backend.trading.hyperliquid_api import HyperliquidAPI
+from src.backend.trading.options_scheduler import (
+    OptionsScheduler,
+    OptionsSchedulerConfig,
+)
 from src.backend.trading.options_strategies import DeltaHedger, OptionsExecutor
 from src.backend.utils.prompt_utils import json_default
 
@@ -94,6 +98,8 @@ class TradingBotEngine:
         self.thalex = None
         self.options_executor: Optional[OptionsExecutor] = None
         self.hedge_manager: Optional[DeltaHedgeManager] = None
+        self.options_scheduler: Optional[OptionsScheduler] = None
+        self._latest_options_context = None  # populated by the 15m surface refresh task
         if CONFIG.get("thalex_key_id") and CONFIG.get("thalex_private_key_path"):
             try:
                 from src.backend.trading.thalex_api import ThalexAPI
@@ -109,6 +115,28 @@ class TradingBotEngine:
                     "Thalex options venue enabled (network=%s, hedge_threshold=%.4f BTC)",
                     self.thalex.network_name, threshold,
                 )
+
+                # Wire the two-cadence scheduler. Disabled by default — set
+                # OPTIONS_SCHEDULER_ENABLED=1 to turn on the live decision loop.
+                if CONFIG.get("options_scheduler_enabled"):
+                    scheduler_config = OptionsSchedulerConfig(
+                        vol_surface_interval_seconds=float(
+                            CONFIG.get("options_vol_surface_interval_seconds") or 900
+                        ),
+                        options_decision_interval_seconds=float(
+                            CONFIG.get("options_decision_interval_seconds") or 10800
+                        ),
+                    )
+                    self.options_scheduler = OptionsScheduler(
+                        config=scheduler_config,
+                        refresh_vol_surface=self._refresh_options_surface,
+                        run_options_decision=self._run_options_decision_cycle,
+                    )
+                    self.logger.info(
+                        "OptionsScheduler enabled (surface=%.0fs, decision=%.0fs)",
+                        scheduler_config.vol_surface_interval_seconds,
+                        scheduler_config.options_decision_interval_seconds,
+                    )
             except Exception as exc:  # pylint: disable=broad-except
                 self.logger.warning("Thalex venue not initialized: %s", exc)
 
@@ -227,6 +255,18 @@ class TradingBotEngine:
             self.initial_account_value = 10000.0
 
         self._task = asyncio.create_task(self._main_loop())
+
+        # Spin up the options scheduler in parallel with the main perps loop
+        # if it was wired in __init__. The scheduler runs its two background
+        # tasks (vol surface refresh + options decision) independently of the
+        # 5m perps cadence.
+        if self.options_scheduler is not None:
+            try:
+                await self.options_scheduler.start()
+                self.logger.info("OptionsScheduler started")
+            except Exception as exc:  # pylint: disable=broad-except
+                self.logger.error("Failed to start OptionsScheduler: %s", exc)
+
         self.logger.info(f"Bot started - Assets: {self.assets}, Interval: {self.interval}")
         self._notify_state_update()
 
@@ -245,8 +285,133 @@ class TradingBotEngine:
             except asyncio.CancelledError:
                 pass
 
+        if self.options_scheduler is not None:
+            try:
+                await self.options_scheduler.stop()
+            except Exception as exc:  # pylint: disable=broad-except
+                self.logger.warning("OptionsScheduler stop failed: %s", exc)
+
         self.logger.info("Bot stopped")
         self._notify_state_update()
+
+    # ------------------------------------------------------------------
+    # Options scheduler callbacks
+    # ------------------------------------------------------------------
+
+    async def _refresh_options_surface(self) -> None:
+        """Background task: rebuild the OptionsContext snapshot.
+
+        Pulls the latest Thalex chain + Deribit data, computes the vol
+        surface, runs the regime classifier, and caches the resulting
+        snapshot on ``self._latest_options_context`` so the decision task
+        can read it on its own cadence.
+        """
+        if self.thalex is None:
+            return
+        try:
+            from src.backend.options_intel.builder import build_options_context
+            from src.backend.options_intel.deribit_client import DeribitPublicClient
+            from src.backend.options_intel.iv_history_store import IVHistoryStore
+
+            # Make sure Thalex is connected and the instrument cache is fresh.
+            await self.thalex.connect()
+
+            deribit = DeribitPublicClient()
+            try:
+                store = IVHistoryStore(db_path="data/iv_history.sqlite")
+                # Use the last 16 days of price history if we've been collecting it.
+                spot_history = list(self.price_history.get("BTC", [])) or [60000.0] * 16
+                self._latest_options_context = await build_options_context(
+                    thalex=self.thalex,
+                    deribit=deribit,
+                    iv_history=store,
+                    spot_history=spot_history,
+                )
+                self.logger.info(
+                    "OptionsContext refreshed (regime=%s confidence=%s)",
+                    self._latest_options_context.vol_regime,
+                    self._latest_options_context.vol_regime_confidence,
+                )
+            finally:
+                await deribit.close()
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.error("vol surface refresh failed: %s", exc)
+
+    async def _run_options_decision_cycle(self) -> None:
+        """Background task: run the options agent against the cached snapshot.
+
+        Reads ``self._latest_options_context`` (populated by the 15m refresh
+        task), calls the OptionsAgent, parses decisions, and routes each one
+        through ``_execute_thalex_decision``. Skips silently if no snapshot
+        is available yet (typical on first run before the surface refresh
+        has had a chance to populate it).
+        """
+        if self._latest_options_context is None:
+            self.logger.info("OptionsContext not yet available; skipping decision cycle")
+            return
+        try:
+            # Lazy import keeps the LLM client off the import path until needed.
+            from src.backend.agent.options_agent import OptionsAgent
+
+            # The real LLM client wrapper isn't built yet — for now we
+            # construct an OptionsAgent with the bot's existing TradingAgent
+            # as the LLM transport. PR C will swap this for a dedicated
+            # async LLM client.
+            agent = OptionsAgent(llm=self._options_llm_adapter())
+            decisions = await agent.decide(self._latest_options_context)
+            self.logger.info("OptionsAgent emitted %d decisions", len(decisions))
+
+            for decision in decisions:
+                await self._execute_thalex_decision({
+                    "asset": decision.asset,
+                    "action": decision.action,
+                    "rationale": decision.rationale,
+                    "venue": decision.venue,
+                    "strategy": decision.strategy,
+                    "underlying": decision.underlying,
+                    "kind": decision.kind,
+                    "tenor_days": decision.tenor_days,
+                    "target_strike": decision.target_strike,
+                    "target_delta": decision.target_delta,
+                    "contracts": decision.contracts,
+                    "legs": [
+                        {
+                            "kind": leg.kind,
+                            "side": leg.side,
+                            "contracts": leg.contracts,
+                            "target_strike": leg.target_strike,
+                            "target_delta": leg.target_delta,
+                            "tenor_days": leg.tenor_days,
+                        }
+                        for leg in decision.legs
+                    ],
+                    "entry_kind": decision.entry_kind,
+                    "vol_view": decision.vol_view,
+                    "target_gamma_btc": decision.target_gamma_btc,
+                })
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.error("options decision cycle failed: %s", exc)
+
+    def _options_llm_adapter(self):
+        """Adapter shim — wraps the existing TradingAgent for OptionsAgent's
+        ``chat_json`` interface. Replace with a dedicated async LLM client
+        in PR C when we want a different model for options reasoning.
+        """
+        bot_logger = self.logger
+
+        class _Shim:
+            def __init__(self, agent):
+                self.agent = agent
+
+            async def chat_json(self, *, system_prompt, user_prompt, schema):
+                # The existing TradingAgent is sync and tightly coupled to
+                # the perps prompt shape. For now we return an empty
+                # decision set so the scheduler runs cleanly without
+                # actually calling an LLM. PR C will replace this stub.
+                bot_logger.info("OptionsAgent shim: returning empty decisions (PR C will wire real LLM)")
+                return {"reasoning": "stub", "trade_decisions": []}
+
+        return _Shim(self.agent)
 
     async def _main_loop(self):
         """
