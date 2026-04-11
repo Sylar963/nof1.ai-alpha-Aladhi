@@ -76,9 +76,9 @@ async def aggregate_portfolio_greeks(
             greeks = await greeks_source.get_greeks(instrument_name)
         except Exception as exc:  # pylint: disable=broad-except
             logger.warning("portfolio aggregator: get_greeks failed for %s: %s", instrument_name, exc)
-            continue
+            greeks = {}
         if not isinstance(greeks, dict):
-            continue
+            greeks = {}
 
         side = (raw.get("side") or "long").lower()
         signed_size = size if side == "long" else -size

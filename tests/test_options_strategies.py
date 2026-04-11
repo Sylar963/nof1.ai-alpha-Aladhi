@@ -230,6 +230,133 @@ async def test_lookup_delta_falls_through_to_get_greeks_when_cache_empty():
 
 
 @pytest.mark.asyncio
+async def test_long_call_with_target_gamma_btc_distributes_across_default_tenors():
+    """When target_gamma_btc is set on a long_call_delta_hedged decision,
+    the executor must expand it into multiple Thalex legs across the default
+    tenor list (7/14/30/60 days) using the sizing helper."""
+    thalex = FakeThalex()
+    hl = FakeHyperliquid()
+    executor = OptionsExecutor(thalex=thalex, hyperliquid=hl)
+
+    # Seed the fake adapter so the sizing helper has an ATM contract per tenor.
+    # We use a single shared instrument name + delta for simplicity; the
+    # executor will request a buy on each tenor's resolved instrument.
+    for tenor in (7, 14, 30, 60):
+        thalex.instruments_by_intent[("BTC", "call", tenor, 60000.0)] = f"BTC-{tenor}D-60000-C"
+        thalex.delta_per_position[f"BTC-{tenor}D-60000-C"] = 0.5
+
+    decision = parse_decision({
+        "venue": "thalex",
+        "asset": "BTC",
+        "action": "buy",
+        "strategy": "long_call_delta_hedged",
+        "underlying": "BTC",
+        "kind": "call",
+        "tenor_days": 30,  # used as initial intent for preflight
+        "target_strike": 60000,
+        "target_gamma_btc": 0.004,
+        "rationale": "build long gamma across the curve",
+    })
+    result = await executor.execute(decision, open_positions_count=0)
+
+    assert result.ok is True
+    # 4 default tenors → 4 Thalex buys + 4 perp hedges
+    assert len(thalex.calls) == 4
+    assert all(c.method == "buy" for c in thalex.calls)
+    instrument_names = {c.asset for c in thalex.calls}
+    assert instrument_names == {"BTC-7D-60000-C", "BTC-14D-60000-C", "BTC-30D-60000-C", "BTC-60D-60000-C"}
+    # One perp short per leg (long call → short BTC perp)
+    assert len(hl.calls) == 4
+    assert all(c.method == "sell" for c in hl.calls)
+
+
+@pytest.mark.asyncio
+async def test_target_gamma_btc_long_put_uses_long_perp_hedge():
+    """Long puts hedge by going long the perp."""
+    thalex = FakeThalex()
+    hl = FakeHyperliquid()
+    executor = OptionsExecutor(thalex=thalex, hyperliquid=hl)
+
+    for tenor in (7, 14, 30, 60):
+        thalex.instruments_by_intent[("BTC", "put", tenor, 55000.0)] = f"BTC-{tenor}D-55000-P"
+        thalex.delta_per_position[f"BTC-{tenor}D-55000-P"] = -0.4
+
+    decision = parse_decision({
+        "venue": "thalex",
+        "asset": "BTC",
+        "action": "buy",
+        "strategy": "long_put_delta_hedged",
+        "underlying": "BTC",
+        "kind": "put",
+        "tenor_days": 30,
+        "target_strike": 55000,
+        "target_gamma_btc": 0.004,
+        "rationale": "downside hedge",
+    })
+    result = await executor.execute(decision, open_positions_count=0)
+
+    assert result.ok is True
+    assert len(thalex.calls) == 4
+    assert len(hl.calls) == 4
+    assert all(c.method == "buy" for c in hl.calls)
+
+
+@pytest.mark.asyncio
+async def test_target_gamma_btc_falls_back_to_single_tenor_when_zero():
+    """target_gamma_btc=0 must NOT trigger the multi-tenor path — fall through
+    to the existing single-tenor delta-hedged execution."""
+    thalex = FakeThalex()
+    hl = FakeHyperliquid()
+    executor = OptionsExecutor(thalex=thalex, hyperliquid=hl)
+    thalex.delta_per_position["BTC-10MAY26-65000-C"] = 0.5
+
+    decision = parse_decision({
+        "venue": "thalex",
+        "asset": "BTC",
+        "action": "buy",
+        "strategy": "long_call_delta_hedged",
+        "underlying": "BTC",
+        "kind": "call",
+        "tenor_days": 30,
+        "target_strike": 65000,
+        "contracts": 0.05,
+        "target_gamma_btc": 0,  # explicit zero
+        "rationale": "single tenor",
+    })
+    result = await executor.execute(decision, open_positions_count=0)
+    assert result.ok is True
+    # Single Thalex buy + single perp hedge
+    assert len(thalex.calls) == 1
+    assert len(hl.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_target_gamma_btc_respects_max_open_positions_cap():
+    """The multi-tenor expansion still has to respect max_open_positions."""
+    thalex = FakeThalex()
+    hl = FakeHyperliquid()
+    executor = OptionsExecutor(thalex=thalex, hyperliquid=hl)
+    for tenor in (7, 14, 30, 60):
+        thalex.instruments_by_intent[("BTC", "call", tenor, 60000.0)] = f"BTC-{tenor}D-60000-C"
+
+    decision = parse_decision({
+        "venue": "thalex",
+        "asset": "BTC",
+        "action": "buy",
+        "strategy": "long_call_delta_hedged",
+        "underlying": "BTC",
+        "kind": "call",
+        "tenor_days": 30,
+        "target_strike": 60000,
+        "target_gamma_btc": 0.004,
+        "rationale": "x",
+    })
+    result = await executor.execute(decision, open_positions_count=3)
+    assert result.ok is False
+    assert "max_open_positions" in result.reason
+
+
+@pytest.mark.asyncio
 async def test_credit_put_spread_executes_two_legs_in_correct_directions():
     """Sell near put + buy further OTM put = defined-risk credit put spread."""
     thalex = FakeThalex()

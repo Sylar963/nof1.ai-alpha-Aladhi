@@ -342,25 +342,55 @@ class TradingBotEngine:
                 # Pull a longer 30-day series so the Keltner channel (EMA20 +
                 # ATR14) has enough data to populate.
                 keltner_closes = await self._fetch_btc_daily_closes(deribit, days=30)
+                if not keltner_closes or len(set(keltner_closes)) == 1:
+                    daily_closes_for_keltner = None
+                else:
+                    daily_closes_for_keltner = keltner_closes
                 # First-hour minute data for the opening-range signal.
                 intraday_minutes = await self._fetch_btc_first_hour_minutes(deribit)
-                self._latest_options_context = await build_options_context(
-                    thalex=self.thalex,
-                    deribit=deribit,
-                    iv_history=store,
-                    spot_history=spot_history,
-                    use_interpolation=True,
-                    intraday_minute_prices=intraday_minutes,
-                    daily_closes_for_keltner=keltner_closes,
-                )
+
+                # Recent options trade history from the bot's main DB. Lazily
+                # opened in a scoped session so the connection is released
+                # before the surface refresh returns. Failures degrade to an
+                # empty history list rather than blanking the whole snapshot.
+                db_session = None
+                db_session_ctx = None
+                try:
+                    from src.database.db_manager import get_db_manager
+                    db_session_ctx = get_db_manager().session_scope()
+                    db_session = db_session_ctx.__enter__()
+                except Exception as exc:  # pylint: disable=broad-except
+                    self.logger.warning("options trade-history session unavailable: %s", exc)
+                    db_session = None
+                    db_session_ctx = None
+
+                try:
+                    self._latest_options_context = await build_options_context(
+                        thalex=self.thalex,
+                        deribit=deribit,
+                        iv_history=store,
+                        spot_history=spot_history,
+                        use_interpolation=True,
+                        intraday_minute_prices=intraday_minutes,
+                        daily_closes_for_keltner=daily_closes_for_keltner,
+                        db_session=db_session,
+                    )
+                finally:
+                    if db_session_ctx is not None:
+                        try:
+                            db_session_ctx.__exit__(None, None, None)
+                        except Exception as exc:  # pylint: disable=broad-except
+                            self.logger.debug("db session close failed: %s", exc)
+
                 self.logger.info(
                     "OptionsContext refreshed (regime=%s confidence=%s, spot_history=%d closes, "
-                    "intraday=%d minutes, positions=%d)",
+                    "intraday=%d minutes, positions=%d, history=%d)",
                     self._latest_options_context.vol_regime,
                     self._latest_options_context.vol_regime_confidence,
                     len(spot_history),
                     len(intraday_minutes),
                     self._latest_options_context.open_position_count,
+                    len(self._latest_options_context.recent_options_trades),
                 )
             finally:
                 await deribit.close()

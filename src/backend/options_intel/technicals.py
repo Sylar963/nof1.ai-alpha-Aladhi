@@ -69,7 +69,19 @@ def compute_opening_range(
     end = start + minutes * 60
 
     in_window: list[float] = []
-    for ts, price in intraday_prices:
+    for row in intraday_prices:
+        if row is None:
+            continue
+        try:
+            if len(row) != 2:
+                continue
+        except TypeError:
+            continue
+        try:
+            ts = row[0]
+            price = row[1]
+        except (TypeError, IndexError):
+            continue
         if ts is None or price is None:
             continue
         try:
