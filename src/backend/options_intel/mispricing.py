@@ -16,6 +16,7 @@ Deribit IV from the closest two expiries; the entry point lives here as the
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
@@ -98,20 +99,36 @@ def scan_mispricings(
     deribit_chain: list[dict],
     top_n: int = 5,
     min_edge_bps: float = 0.0,
+    use_interpolation: bool = False,
 ) -> MispricingScanReport:
-    """Compute the largest Thalex - Deribit IV gaps after exact-match alignment.
+    """Compute the largest Thalex - Deribit IV gaps after alignment.
 
     Args:
         thalex_chain: Thalex option instruments with ``mark_iv`` populated.
         deribit_chain: Deribit option instruments (book summary shape works).
         top_n: how many of the largest |IV diff| entries to return.
         min_edge_bps: drop entries whose absolute edge is below this threshold.
+        use_interpolation: when True, fill in synthetic Deribit IVs for any
+            Thalex tenor Deribit doesn't list directly, by linear-in-variance
+            interpolation between the two bracketing Deribit expiries. PR C
+            default is False — match exactly to keep the surface conservative.
 
     Returns:
         :class:`MispricingScanReport` with the ranked top list, plus
         match/skip counters for visibility.
     """
     deribit_index = _index_deribit(deribit_chain)
+
+    if use_interpolation:
+        thalex_target_expiries = _collect_thalex_expiries(thalex_chain)
+        for target_expiry in thalex_target_expiries:
+            if any(key[0] == target_expiry for key in deribit_index):
+                continue  # already covered exactly
+            synthetic = interpolate_deribit_surface(deribit_chain, target_expiry=target_expiry)
+            for record in synthetic:
+                # Re-index with the (target_expiry, strike, kind) key.
+                deribit_index[(target_expiry, record["strike"], record["option_type"])] = record
+
     matched = 0
     skipped = 0
     candidates: list[dict] = []
@@ -166,13 +183,99 @@ def interpolate_deribit_surface(
     deribit_chain: list[dict],
     target_expiry: int,
 ) -> list[dict]:
-    """Future-coverage stub: interpolate Deribit IVs to a Thalex tenor that
-    Deribit doesn't list directly.
+    """Linear-in-variance interpolation between two bracketing Deribit expiries.
 
-    PR A returns an empty list. PR C will implement linear-in-variance
-    interpolation between the two closest Deribit expiries so unmatched Thalex
-    instruments still get a synthetic Deribit IV for mispricing scoring. The
-    function signature is fixed now so the rest of the pipeline can call it
-    without changes when the implementation lands.
+    For each strike that exists in BOTH the nearest expiry below and the
+    nearest expiry above ``target_expiry``, compute a synthetic IV at the
+    target tenor using the standard practitioner formula:
+
+        var(T) = (1 - w) * var(T1) + w * var(T2)
+        iv(T)  = sqrt(var(T))
+        where w = (T - T1) / (T2 - T1)
+
+    Returns a list of synthetic instrument records (one per strike per
+    kind) shaped like Deribit book summary entries so the mispricing
+    scanner can consume them via the same alignment path.
+
+    Returns an empty list when:
+    - There are not at least one expiry below AND one expiry above the target.
+    - No strikes are present in both bracketing expiries.
+    - Any required IV is missing or non-positive.
     """
-    return []
+    # Normalize the target the same way we normalize chain expiries (midnight
+    # UTC of the date) so weight math is consistent regardless of whether the
+    # caller passed an intra-day timestamp.
+    normalized_target = _normalize_expiry_seconds({"expiry_timestamp": int(target_expiry)})
+    if normalized_target is None:
+        return []
+
+    by_expiry: dict[int, list[dict]] = {}
+    for record in deribit_chain:
+        if not isinstance(record, dict):
+            continue
+        expiry = _normalize_expiry_seconds(record)
+        if expiry is None:
+            continue
+        by_expiry.setdefault(expiry, []).append(record)
+
+    expiries_below = sorted([e for e in by_expiry if e < normalized_target])
+    expiries_above = sorted([e for e in by_expiry if e > normalized_target])
+    if not expiries_below or not expiries_above:
+        return []
+
+    t1 = expiries_below[-1]  # closest below
+    t2 = expiries_above[0]   # closest above
+    if t2 == t1:
+        return []
+    weight = (normalized_target - t1) / (t2 - t1)
+
+    near_index: dict[tuple, dict] = {}
+    far_index: dict[tuple, dict] = {}
+    for record in by_expiry[t1]:
+        kind = _kind_of(record)
+        strike = _strike_of(record)
+        if kind is None or strike is None:
+            continue
+        near_index[(strike, kind)] = record
+    for record in by_expiry[t2]:
+        kind = _kind_of(record)
+        strike = _strike_of(record)
+        if kind is None or strike is None:
+            continue
+        far_index[(strike, kind)] = record
+
+    interpolated: list[dict] = []
+    for key in near_index.keys() & far_index.keys():
+        near_iv = _iv_of(near_index[key])
+        far_iv = _iv_of(far_index[key])
+        if near_iv is None or far_iv is None or near_iv <= 0 or far_iv <= 0:
+            continue
+        var_t1 = near_iv * near_iv
+        var_t2 = far_iv * far_iv
+        var_target = (1.0 - weight) * var_t1 + weight * var_t2
+        if var_target <= 0:
+            continue
+        iv_target = math.sqrt(var_target)
+        strike, kind = key
+        interpolated.append({
+            "instrument_name": f"INTERPOLATED-{int(normalized_target)}-{int(strike)}-{kind[0].upper()}",
+            "kind": "option",
+            "option_type": kind,
+            "strike": strike,
+            "mark_iv": iv_target,
+            "expiration_timestamp": int(normalized_target) * 1000,
+            "interpolated_from": [t1, t2],
+        })
+    return interpolated
+
+
+def _collect_thalex_expiries(thalex_chain: list[dict]) -> set[int]:
+    """Set of unique normalized expiries (in seconds) found in a Thalex chain."""
+    expiries: set[int] = set()
+    for record in thalex_chain:
+        if not isinstance(record, dict):
+            continue
+        expiry = _normalize_expiry_seconds(record)
+        if expiry is not None:
+            expiries.add(expiry)
+    return expiries

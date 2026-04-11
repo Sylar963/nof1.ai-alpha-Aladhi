@@ -304,7 +304,9 @@ class TradingBotEngine:
         Pulls the latest Thalex chain + Deribit data, computes the vol
         surface, runs the regime classifier, and caches the resulting
         snapshot on ``self._latest_options_context`` so the decision task
-        can read it on its own cadence.
+        can read it on its own cadence. Spot history is fetched from
+        Deribit's mark price history endpoint so the realized vol calc has
+        real BTC daily closes instead of a placeholder.
         """
         if self.thalex is None:
             return
@@ -319,23 +321,52 @@ class TradingBotEngine:
             deribit = DeribitPublicClient()
             try:
                 store = IVHistoryStore(db_path="data/iv_history.sqlite")
-                # Use the last 16 days of price history if we've been collecting it.
-                spot_history = list(self.price_history.get("BTC", [])) or [60000.0] * 16
+                spot_history = await self._fetch_btc_daily_closes(deribit, days=16)
                 self._latest_options_context = await build_options_context(
                     thalex=self.thalex,
                     deribit=deribit,
                     iv_history=store,
                     spot_history=spot_history,
+                    use_interpolation=True,
                 )
                 self.logger.info(
-                    "OptionsContext refreshed (regime=%s confidence=%s)",
+                    "OptionsContext refreshed (regime=%s confidence=%s, spot_history=%d closes)",
                     self._latest_options_context.vol_regime,
                     self._latest_options_context.vol_regime_confidence,
+                    len(spot_history),
                 )
             finally:
                 await deribit.close()
         except Exception as exc:  # pylint: disable=broad-except
             self.logger.error("vol surface refresh failed: %s", exc)
+
+    async def _fetch_btc_daily_closes(self, deribit, days: int = 16) -> List[float]:
+        """Fetch ``days`` daily BTC mark prices from Deribit for realized-vol calc.
+
+        Falls back to the bot's intraday ``price_history`` deque, then to a
+        flat 60k placeholder, when Deribit is unreachable. The placeholder is
+        intentional — a flat series gives RV ≈ 0, which the regime classifier
+        treats as 'unknown' rather than emitting bad signal.
+        """
+        try:
+            now_ms = int(datetime.now(UTC).timestamp() * 1000)
+            start_ms = now_ms - (days * 86_400_000)
+            closes = await deribit.get_mark_price_history(
+                instrument_name="BTC-PERPETUAL",
+                start_timestamp_ms=start_ms,
+                end_timestamp_ms=now_ms,
+                resolution_seconds=86400,
+            )
+            if closes:
+                return closes
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.warning("Deribit mark price history fetch failed: %s", exc)
+
+        # Fallbacks: bot's intraday history, then a flat placeholder.
+        intraday = list(self.price_history.get("BTC", []))
+        if intraday:
+            return intraday[-days:]
+        return [60000.0] * days
 
     async def _run_options_decision_cycle(self) -> None:
         """Background task: run the options agent against the cached snapshot.
@@ -393,25 +424,27 @@ class TradingBotEngine:
             self.logger.error("options decision cycle failed: %s", exc)
 
     def _options_llm_adapter(self):
-        """Adapter shim — wraps the existing TradingAgent for OptionsAgent's
-        ``chat_json`` interface. Replace with a dedicated async LLM client
-        in PR C when we want a different model for options reasoning.
+        """Build the LLM client passed to OptionsAgent.
+
+        Returns the real :class:`AsyncOpenRouterClient` when an OpenRouter
+        API key is configured, falling back to an empty-decision shim when
+        the key is missing so the scheduler still runs cleanly without
+        crashing on a no-op cycle.
         """
+        if CONFIG.get("openrouter_api_key"):
+            from src.backend.llm_client import AsyncOpenRouterClient
+            return AsyncOpenRouterClient()
+
         bot_logger = self.logger
 
         class _Shim:
-            def __init__(self, agent):
-                self.agent = agent
-
             async def chat_json(self, *, system_prompt, user_prompt, schema):
-                # The existing TradingAgent is sync and tightly coupled to
-                # the perps prompt shape. For now we return an empty
-                # decision set so the scheduler runs cleanly without
-                # actually calling an LLM. PR C will replace this stub.
-                bot_logger.info("OptionsAgent shim: returning empty decisions (PR C will wire real LLM)")
-                return {"reasoning": "stub", "trade_decisions": []}
+                bot_logger.warning(
+                    "OPENROUTER_API_KEY missing — OptionsAgent returning empty decisions"
+                )
+                return {"reasoning": "shim", "trade_decisions": []}
 
-        return _Shim(self.agent)
+        return _Shim()
 
     async def _main_loop(self):
         """

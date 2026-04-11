@@ -145,6 +145,52 @@ class DeribitPublicClient:
         self._cache_put(cache_key, summaries)
         return summaries
 
+    async def get_mark_price_history(
+        self,
+        instrument_name: str,
+        start_timestamp_ms: int,
+        end_timestamp_ms: int,
+        resolution_seconds: int = 86400,
+    ) -> list[float]:
+        """Return a list of close prices for ``instrument_name`` between two timestamps.
+
+        Wraps Deribit's ``public/get_mark_price_history`` endpoint. Used by
+        the regime classifier to populate the trailing realized-vol window
+        for BTC. Resolution defaults to one day (86400 seconds) so 16 calls
+        gives ~16 daily closes — exactly what the RV calc needs.
+
+        Returns an empty list when the response is missing or malformed.
+        """
+        cache_key = (
+            "mark_price_history",
+            instrument_name,
+            start_timestamp_ms,
+            end_timestamp_ms,
+            resolution_seconds,
+        )
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
+
+        params = {
+            "instrument_name": instrument_name,
+            "start_timestamp": str(start_timestamp_ms),
+            "end_timestamp": str(end_timestamp_ms),
+            "resolution": str(resolution_seconds),
+        }
+        payload = await self._get("/public/get_mark_price_history", params=params)
+        result = payload.get("result") if isinstance(payload, dict) else None
+        closes: list[float] = []
+        if isinstance(result, list):
+            for row in result:
+                if isinstance(row, list) and len(row) >= 2:
+                    try:
+                        closes.append(float(row[1]))
+                    except (TypeError, ValueError):
+                        continue
+        self._cache_put(cache_key, closes)
+        return closes
+
     async def get_index_price(self, index_name: str = "btc_usd") -> float:
         """Return the current index spot price (e.g. ``btc_usd``)."""
         cache_key = ("index_price", index_name)
