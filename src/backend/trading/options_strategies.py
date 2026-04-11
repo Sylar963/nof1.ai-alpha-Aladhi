@@ -17,12 +17,16 @@ a configurable threshold (default 0.05 BTC equivalent).
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Optional
 
 from src.backend.agent.decision_schema import TradeDecision
 from src.backend.trading.exchange_adapter import ExchangeAdapter
 from src.backend.trading.options import OptionIntent
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -126,8 +130,8 @@ class OptionsExecutor:
 
         thalex_order = await self.thalex.place_buy_order(instrument_name, contracts)
 
-        # Determine hedge direction + size from the (possibly cached) delta.
-        delta_per_contract = self._lookup_delta(instrument_name, decision.kind or "call")
+        # Determine hedge direction + size from the live delta (or fallback).
+        delta_per_contract = await self._lookup_delta(instrument_name, decision.kind or "call")
         hedge_size = abs(contracts * delta_per_contract)
         hl_orders = []
         if hedge_size > 0:
@@ -182,22 +186,49 @@ class OptionsExecutor:
     # Helpers
     # ------------------------------------------------------------------
 
-    def _lookup_delta(self, instrument_name: str, kind: str) -> float:
-        """Best-effort delta lookup. Falls back to a 0.5 / -0.5 default for ATM options.
+    async def _lookup_delta(self, instrument_name: str, kind: str) -> float:
+        """Best-effort delta lookup with three layers of fallback.
 
-        Real implementations enrich the Thalex adapter with a ticker call that
-        returns greeks; the test fakes seed `delta_per_position` directly.
+        1. Test-fake escape hatch: if the adapter exposes a
+           ``delta_per_position`` mapping, use it (lets unit tests inject
+           deterministic deltas without touching ``get_greeks``).
+        2. Live ticker via the adapter: ``await thalex.get_greeks(...)``.
+           This is the production path on Thalex.
+        3. ATM default: ±0.5 with a loud warning so the operator notices
+           that the live path failed.
         """
         delta_map = getattr(self.thalex, "delta_per_position", {}) or {}
         if instrument_name in delta_map:
             return float(delta_map[instrument_name])
+
+        if hasattr(self.thalex, "get_greeks"):
+            try:
+                greeks = await self.thalex.get_greeks(instrument_name)
+                if isinstance(greeks, dict) and "delta" in greeks:
+                    return float(greeks["delta"])
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.warning("get_greeks failed for %s: %s", instrument_name, exc)
+
+        logger.warning("Delta unknown for %s — using ATM default", instrument_name)
         return 0.5 if kind == "call" else -0.5
 
 
 class DeltaHedger:
-    """Computes when (and how much) to rebalance the perp delta hedge."""
+    """Computes when (and how much) to rebalance the perp delta hedge.
 
-    def __init__(self, threshold: float = 0.05) -> None:
+    Threshold-based gamma scalping: the rebalance trade only fires when the
+    drift between target and current perp delta exceeds ``threshold`` BTC.
+    Below the threshold the drift is left alone — when the underlying
+    mean-reverts, the option's delta returns to where it started and no
+    perp churn ever happened. Above the threshold, the rebalance trade
+    re-hedges at the new (worse) level; subsequent rebalance-to-target
+    trades automatically capture the pullback by buying low / selling high.
+
+    Default threshold is 0.02 BTC: small enough to capture pullbacks during
+    normal BTC moves, large enough that quiet markets don't churn perp fees.
+    """
+
+    def __init__(self, threshold: float = 0.02) -> None:
         self.threshold = threshold
 
     def compute_rebalance(self, target_delta: float, current_perp_delta: float) -> HedgeAction:

@@ -52,11 +52,15 @@ class FakeThalex(ExchangeAdapter):
         self.instruments_by_intent: dict[tuple, str] = {}
         self.positions: list[PositionSnapshot] = []
         self.delta_per_position: dict[str, float] = {}
+        self.greeks_by_instrument: dict[str, dict] = {}  # used by get_greeks fallthrough
         self.risk_caps = RiskCaps(
             max_contracts_per_trade=0.1,
             max_open_positions=3,
             allowed_underlyings=["BTC"],
         )
+
+    async def get_greeks(self, instrument_name):
+        return self.greeks_by_instrument.get(instrument_name, {})
 
     async def resolve_intent(self, intent):
         key = (intent.underlying, intent.kind, intent.tenor_days, intent.target_strike)
@@ -225,6 +229,34 @@ async def test_long_put_delta_hedged_places_thalex_buy_and_hyperliquid_long():
 
 
 @pytest.mark.asyncio
+async def test_lookup_delta_falls_through_to_get_greeks_when_cache_empty():
+    """When delta_per_position has no entry, the executor must call get_greeks."""
+    thalex = FakeThalex()
+    hl = FakeHyperliquid()
+    executor = OptionsExecutor(thalex=thalex, hyperliquid=hl)
+    # No delta_per_position seed; get_greeks returns the live delta instead.
+    thalex.greeks_by_instrument["BTC-10MAY26-65000-C"] = {"delta": 0.42}
+
+    decision = parse_decision({
+        "venue": "thalex",
+        "asset": "BTC",
+        "action": "buy",
+        "strategy": "long_call_delta_hedged",
+        "underlying": "BTC",
+        "kind": "call",
+        "tenor_days": 30,
+        "target_strike": 65000,
+        "contracts": 0.05,
+        "rationale": "use real greeks",
+    })
+    result = await executor.execute(decision, open_positions_count=0)
+
+    assert result.ok is True
+    # Hedge size = 0.05 × 0.42 = 0.021
+    assert hl.calls[0].amount == pytest.approx(0.021)
+
+
+@pytest.mark.asyncio
 async def test_credit_spread_places_two_legs_in_correct_directions():
     thalex = FakeThalex()
     hl = FakeHyperliquid()
@@ -333,3 +365,25 @@ def test_delta_hedger_handles_long_drift():
     # Need to buy 0.10 BTC to flatten the short
     assert action.side == "buy"
     assert action.contracts_to_trade == pytest.approx(0.10)
+
+
+def test_delta_hedger_default_threshold_is_002_btc():
+    """Default threshold is 0.02 BTC drift — small enough to capture pullbacks
+    but loose enough that quiet markets don't churn perp fees."""
+    assert DeltaHedger().threshold == pytest.approx(0.02)
+
+
+def test_delta_hedger_default_threshold_fires_at_0025_drift():
+    """A 0.025 BTC drift breaches the new default and must trigger a rebalance."""
+    hedger = DeltaHedger()  # uses default 0.02
+    action = hedger.compute_rebalance(target_delta=-0.025, current_perp_delta=0.0)
+    assert action.side == "sell"
+    assert action.contracts_to_trade == pytest.approx(0.025)
+
+
+def test_delta_hedger_default_threshold_holds_at_0015_drift():
+    """A 0.015 BTC drift sits below the new default and must be a no-op."""
+    hedger = DeltaHedger()  # uses default 0.02
+    action = hedger.compute_rebalance(target_delta=-0.015, current_perp_delta=0.0)
+    assert action.side == "noop"
+    assert action.contracts_to_trade == pytest.approx(0.0)

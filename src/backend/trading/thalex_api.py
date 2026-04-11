@@ -25,6 +25,7 @@ import itertools
 import json
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -47,11 +48,102 @@ from src.backend.trading.options import (
 logger = logging.getLogger(__name__)
 
 
+# Greeks field paths the defensive parser tries, in order. The Thalex SDK
+# does not document the exact ticker response shape, so this list covers the
+# three plausible layouts (top-level, nested under "greeks", nested under
+# the singular "greek"). If a future probe of the live response surfaces a
+# new path, append it here — get_greeks needs no other changes.
+_GREEKS_FIELD_PATHS: tuple[tuple[str, ...], ...] = (
+    (),                # top level: result["delta"]
+    ("greeks",),       # Deribit-style: result["greeks"]["delta"]
+    ("greek",),        # singular variant
+    ("data",),         # some venues wrap everything under "data"
+)
+_GREEKS_KEYS: tuple[str, ...] = ("delta", "gamma", "vega", "theta", "mark_iv")
+_GREEKS_TTL_SECONDS: float = 5.0
+
+
 def _parse_underlyings(raw: str) -> list[str]:
     """Split a comma-separated underlyings string into a clean list."""
     if not raw:
         return ["BTC"]
     return [item.strip().upper() for item in raw.split(",") if item.strip()]
+
+
+def _clean_env_value(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    cleaned = value.strip()
+    if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in {"'", '"'}:
+        cleaned = cleaned[1:-1].strip()
+    return cleaned or None
+
+
+def _expand_path(value: Optional[str]) -> Optional[Path]:
+    if not value:
+        return None
+    expanded = os.path.expandvars(value)
+    return Path(expanded).expanduser()
+
+
+def _normalize_private_key(raw: str) -> str:
+    cleaned = raw.lstrip("\ufeff").strip()
+    cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
+    if "\\n" in cleaned and "\n" not in cleaned:
+        cleaned = cleaned.replace("\\n", "\n")
+    if not cleaned.endswith("\n"):
+        cleaned += "\n"
+    return cleaned
+
+
+def _instrument_from_channel(channel: str) -> Optional[str]:
+    """Extract the option instrument name from a Thalex ticker channel string.
+
+    Channel formats observed across exchanges of this style:
+      ``ticker.BTC-10MAY26-65000-C``
+      ``ticker.BTC-10MAY26-65000-C.raw``
+      ``ticker:BTC-10MAY26-65000-C``
+    Returns None if no instrument can be parsed.
+    """
+    if not isinstance(channel, str) or not channel:
+        return None
+    parts = channel.replace(":", ".").split(".")
+    if len(parts) < 2 or parts[0] != "ticker":
+        return None
+    candidate = parts[1]
+    return candidate or None
+
+
+def _extract_greeks(payload: Any) -> dict:
+    """Pull greek fields out of a ticker payload regardless of nesting layout.
+
+    Tries each path in :data:`_GREEKS_FIELD_PATHS` and merges any keys it
+    finds. Numeric coercion is best-effort; values that don't parse as floats
+    are silently dropped so a malformed sub-field doesn't poison the rest.
+    """
+    if not isinstance(payload, dict):
+        return {}
+    found: dict = {}
+    for path in _GREEKS_FIELD_PATHS:
+        node: Any = payload
+        for segment in path:
+            if not isinstance(node, dict):
+                node = None
+                break
+            node = node.get(segment)
+        if not isinstance(node, dict):
+            continue
+        for key in _GREEKS_KEYS:
+            if key in found:
+                continue
+            value = node.get(key)
+            if value is None:
+                continue
+            try:
+                found[key] = float(value)
+            except (TypeError, ValueError):
+                continue
+    return found
 
 
 class ThalexAPI(ExchangeAdapter):
@@ -67,23 +159,28 @@ class ThalexAPI(ExchangeAdapter):
         account: Optional[str] = None,
         risk_caps: Optional[RiskCaps] = None,
     ) -> None:
-        self.network_name = (
+        raw_network = (
             network
             or os.getenv("THALEX_NETWORK")
             or CONFIG.get("thalex_network")
             or "test"
-        ).lower()
+        )
+        self.network_name = (_clean_env_value(raw_network) or "test").lower()
         if self.network_name not in {"test", "prod"}:
             raise ValueError(
                 f"THALEX_NETWORK must be 'test' or 'prod', got {self.network_name!r}"
             )
-        self.key_id = key_id or os.getenv("THALEX_KEY_ID") or CONFIG.get("thalex_key_id")
-        self.private_key_path = (
+        self.key_id = _clean_env_value(
+            key_id or os.getenv("THALEX_KEY_ID") or CONFIG.get("thalex_key_id")
+        )
+        self.private_key_path = _clean_env_value(
             private_key_path
             or os.getenv("THALEX_PRIVATE_KEY_PATH")
             or CONFIG.get("thalex_private_key_path")
         )
-        self.account = account or os.getenv("THALEX_ACCOUNT") or CONFIG.get("thalex_account")
+        self.account = _clean_env_value(
+            account or os.getenv("THALEX_ACCOUNT") or CONFIG.get("thalex_account")
+        )
         self.risk_caps = risk_caps or RiskCaps(
             max_contracts_per_trade=float(
                 os.getenv("THALEX_MAX_CONTRACTS_PER_TRADE")
@@ -106,6 +203,10 @@ class ThalexAPI(ExchangeAdapter):
         self._pending: dict[int, asyncio.Future] = {}
         self._receiver_task: Optional[asyncio.Task] = None
         self._instruments_cache: list[dict] = []
+        self._greeks_cache: dict[str, tuple[float, dict]] = {}
+        # Async subscriptions: instrument_name → callback. The receive loop
+        # routes channel notifications here in _dispatch.
+        self._ticker_subscribers: dict[str, Any] = {}
         self._lock = asyncio.Lock()
         self.connected: bool = False
 
@@ -124,7 +225,8 @@ class ThalexAPI(ExchangeAdapter):
 
             if not self.key_id:
                 raise RuntimeError("THALEX_KEY_ID is not set")
-            if not self.private_key_path or not Path(self.private_key_path).exists():
+            key_path = _expand_path(self.private_key_path)
+            if not key_path or not key_path.exists():
                 raise RuntimeError(
                     f"THALEX_PRIVATE_KEY_PATH not set or file missing: {self.private_key_path}"
                 )
@@ -135,13 +237,14 @@ class ThalexAPI(ExchangeAdapter):
 
             self._receiver_task = asyncio.create_task(self._receiver_loop())
 
-            private_key = Path(self.private_key_path).read_text()
+            private_key_raw = key_path.read_text(encoding="utf-8")
+            private_key = _normalize_private_key(private_key_raw)
             login_id = self._next_id()
             login_future = self._make_future(login_id)
             await self._client.login(
                 key_id=self.key_id,
                 private_key=private_key,
-                account=self.account,
+                account=self.account or None,
                 id=login_id,
             )
             await asyncio.wait_for(login_future, timeout=10.0)
@@ -202,7 +305,16 @@ class ThalexAPI(ExchangeAdapter):
             self._pending.clear()
 
     def _dispatch(self, message: dict) -> None:
-        """Resolve a pending future or log an async event."""
+        """Resolve a pending future, route a subscription update, or log an event.
+
+        Three message classes:
+          1. RPC reply with matching ``id`` → resolve the pending future.
+          2. JSON-RPC notification (``method == 'subscription'``) carrying a
+             ``ticker.{instrument_name}`` channel → invoke the registered
+             subscriber callback as a fire-and-forget task so the receive
+             loop never blocks waiting on the callback.
+          3. Anything else → log at debug.
+        """
         if not isinstance(message, dict):
             return
         msg_id = message.get("id")
@@ -213,10 +325,52 @@ class ThalexAPI(ExchangeAdapter):
             else:
                 fut.set_result(message.get("result"))
             return
-        # Async event (subscription update, fill, etc.)
+
+        if message.get("method") == "subscription":
+            params = message.get("params") or {}
+            channel = params.get("channel") or ""
+            payload = params.get("notification")
+            instrument_name = _instrument_from_channel(channel)
+            if instrument_name and instrument_name in self._ticker_subscribers:
+                callback = self._ticker_subscribers[instrument_name]
+                try:
+                    asyncio.get_running_loop().create_task(callback(payload))
+                except RuntimeError:
+                    # No running loop (e.g. test calling _dispatch synchronously
+                    # outside an event-loop context). Schedule via asyncio.run.
+                    pass
+                return
+
         method = message.get("method") or message.get("channel")
         if method:
             logger.debug("Thalex async event %s: %s", method, message)
+
+    async def subscribe_ticker(self, instrument_name: str, callback) -> None:
+        """Subscribe to live ticker updates for an option instrument.
+
+        The callback is invoked on every notification with the parsed
+        notification payload. Callbacks run on the receive loop's task, so
+        they MUST be non-blocking — spawn ``asyncio.create_task`` for any I/O.
+        """
+        self._ticker_subscribers[instrument_name] = callback
+        if self._client is None:
+            return
+        channel = f"ticker.{instrument_name}.raw"
+        try:
+            await self._request(self._client.public_subscribe, channels=[channel])
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("Thalex subscribe %s failed: %s", channel, exc)
+
+    async def unsubscribe_ticker(self, instrument_name: str) -> None:
+        """Cancel a previously registered ticker subscription."""
+        self._ticker_subscribers.pop(instrument_name, None)
+        if self._client is None:
+            return
+        channel = f"ticker.{instrument_name}.raw"
+        try:
+            await self._request(self._client.public_unsubscribe, channels=[channel])
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.debug("Thalex unsubscribe %s failed: %s", channel, exc)
 
     async def _request(self, sender, **kwargs):
         """Generic request helper used by every public RPC wrapper.
@@ -385,6 +539,28 @@ class ThalexAPI(ExchangeAdapter):
                 if value is not None:
                     return float(value)
         return 0.0
+
+    async def get_greeks(self, instrument_name: str) -> dict:
+        """Return ``{delta, gamma, vega, theta, mark_iv}`` for an option instrument.
+
+        The Thalex SDK does not document the ticker response shape, so this
+        parser tries multiple plausible field paths and returns whatever it
+        finds. Unrecognized payloads return an empty dict — callers must be
+        ready to fall back rather than expecting an exception.
+
+        Results are cached per-instrument for ``_GREEKS_TTL_SECONDS`` seconds
+        so the event-driven hedger can call this in a tight loop without
+        spamming the WebSocket.
+        """
+        cached = self._greeks_cache.get(instrument_name)
+        now = time.monotonic()
+        if cached is not None and (now - cached[0]) < _GREEKS_TTL_SECONDS:
+            return cached[1]
+
+        result = await self._request(self._client.ticker, instrument_name=instrument_name)
+        parsed = _extract_greeks(result)
+        self._greeks_cache[instrument_name] = (now, parsed)
+        return parsed
 
     # ------------------------------------------------------------------
     # Helpers

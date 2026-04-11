@@ -198,6 +198,8 @@ def create_settings(bot_service: BotService, state_manager: StateManager):
                         taapi_status = ui.label('TAAPI: 🔴 Not Connected').classes('text-sm')
                         hyperliquid_status = ui.label('Hyperliquid: 🔴 Not Connected').classes('text-sm')
                         openrouter_status = ui.label('OpenRouter: 🔴 Not Connected').classes('text-sm')
+                        thalex_status = ui.label('Thalex: 🔴 Not Connected').classes('text-sm')
+                    thalex_error = ui.label('').classes('text-xs text-red-300')
 
                     ui.separator()
 
@@ -290,6 +292,14 @@ def create_settings(bot_service: BotService, state_manager: StateManager):
                                 os.environ['HYPERLIQUID_PRIVATE_KEY'] = hyperliquid_input.value
                             if openrouter_input.value:
                                 os.environ['OPENROUTER_API_KEY'] = openrouter_input.value
+                            if thalex_network.value:
+                                os.environ['THALEX_NETWORK'] = thalex_network.value
+                            if thalex_key_id_input.value:
+                                os.environ['THALEX_KEY_ID'] = thalex_key_id_input.value
+                            if thalex_pem_input.value:
+                                os.environ['THALEX_PRIVATE_KEY_PATH'] = thalex_pem_input.value
+                            if thalex_account_input.value:
+                                os.environ['THALEX_ACCOUNT'] = thalex_account_input.value
 
                             # Test connections via bot service
                             results = await bot_service.test_api_connections()
@@ -298,6 +308,12 @@ def create_settings(bot_service: BotService, state_manager: StateManager):
                             taapi_status.text = f"TAAPI: {'🟢 Connected' if results.get('TAAPI', False) else '🔴 Failed'}"
                             hyperliquid_status.text = f"Hyperliquid: {'🟢 Connected' if results.get('Hyperliquid', False) else '🔴 Failed'}"
                             openrouter_status.text = f"OpenRouter: {'🟢 Connected' if results.get('OpenRouter', False) else '🔴 Failed'}"
+                            thalex_status.text = f"Thalex: {'🟢 Connected' if results.get('Thalex', False) else '🔴 Failed'}"
+                            errors = results.get('errors')
+                            if isinstance(errors, dict) and errors.get('Thalex'):
+                                thalex_error.text = f"Thalex error: {errors.get('Thalex')}"
+                            else:
+                                thalex_error.text = ''
 
                             # Show summary notification
                             connected_count = sum(1 for v in results.values() if v)
