@@ -17,9 +17,10 @@ a configurable threshold (default 0.05 BTC equivalent).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Optional
+from typing import Awaitable, Callable, Optional, TypeVar
 
 from src.backend.agent.decision_schema import TradeDecision
 from src.backend.trading.exchange_adapter import ExchangeAdapter
@@ -31,8 +32,60 @@ from src.backend.trading.options import OptionIntent
 # decision builds curve exposure rather than concentrating in one tenor.
 _DEFAULT_GAMMA_TENORS: tuple[int, ...] = (7, 14, 30, 60)
 
+# Exponential-backoff retry config for adapter calls in the multi-tenor
+# submit path. Aligned with HyperliquidAPI._retry's defaults so the whole
+# project uses one set of numbers for transient failure handling.
+_RETRY_MAX_ATTEMPTS: int = 3
+_RETRY_BACKOFF_BASE_SECONDS: float = 0.5
+
 
 logger = logging.getLogger(__name__)
+
+
+_T = TypeVar("_T")
+
+
+async def _retry_async(
+    coro_factory: Callable[[], Awaitable[_T]],
+    *,
+    max_attempts: int = _RETRY_MAX_ATTEMPTS,
+    backoff_base: float = _RETRY_BACKOFF_BASE_SECONDS,
+    description: str = "adapter call",
+) -> _T:
+    """Run an async coroutine factory with exponential-backoff retry.
+
+    Used by the multi-tenor submit path so a single transient adapter
+    hiccup doesn't unwind a whole curve build. The factory is invoked
+    fresh on every attempt (so any internal state from a failed attempt
+    is discarded).
+
+    Sleep schedule: ``backoff_base × 2**attempt`` between attempts. With
+    the defaults (``base=0.5s``, ``max_attempts=3``) that's 0.5s, 1.0s
+    between attempts — bounded so a hung loop can't deadlock the surface
+    refresh task.
+
+    Raises whatever the underlying coroutine raised on the final attempt.
+    """
+    last_exc: Optional[BaseException] = None
+    for attempt in range(max_attempts):
+        try:
+            return await coro_factory()
+        except Exception as exc:  # pylint: disable=broad-except
+            last_exc = exc
+            if attempt < max_attempts - 1:
+                logger.warning(
+                    "%s failed (attempt %d/%d): %s — retrying",
+                    description, attempt + 1, max_attempts, exc,
+                )
+                await asyncio.sleep(backoff_base * (2 ** attempt))
+            else:
+                logger.error(
+                    "%s failed after %d attempts: %s",
+                    description, max_attempts, exc,
+                )
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError(f"{description} retry exited without result or exception")
 
 
 @dataclass
@@ -172,20 +225,24 @@ class OptionsExecutor:
     ) -> ExecutionResult:
         """Distribute a target gamma exposure across the default tenor ladder.
 
-        For each tenor in :data:`_DEFAULT_GAMMA_TENORS`:
-          1. Resolve the ATM (or target_strike) instrument via the Thalex
-             adapter's intent resolver.
-          2. Run risk preflight using a per-leg contract count of
-             ``target_gamma_btc / N`` (clamped to the per-trade cap upstream).
-          3. Submit the Thalex buy.
-          4. Look up the leg's delta and submit a perp hedge of size
-             ``contracts × |delta|`` in the appropriate direction.
+        Two distinct phases for safety:
 
-        The first preflight failure short-circuits the whole expansion so
-        we never end up with a half-built curve. The position-count cap is
-        checked **once** against the existing open count before submitting
-        any legs — the gamma build is treated as a single logical position
-        for cap purposes (not N positions).
+        **Stage phase** — resolve EVERY tenor's instrument via
+        ``self.thalex.resolve_intent`` upfront, *before* submitting any
+        orders. If any resolve returns ``None`` or raises, the whole
+        expansion aborts cleanly with zero orders sent. This makes a
+        half-built curve impossible.
+
+        **Submit phase** — once all tenors are staged, place each Thalex
+        buy + perp hedge with retry (:func:`_retry_async`, exponential
+        backoff via ``_RETRY_MAX_ATTEMPTS`` and ``_RETRY_BACKOFF_BASE_SECONDS``).
+        If a leg fails after retries, :meth:`_unwind_multi_tenor_legs`
+        submits compensating orders for the legs that already landed
+        (best-effort rollback to flat).
+
+        The position-count cap is checked **once** against the existing
+        open count before any leg lands — the gamma build is treated as
+        a single logical position for cap purposes (not N positions).
         """
         underlying = decision.underlying or decision.asset
         kind = decision.kind or "call"
@@ -200,8 +257,10 @@ class OptionsExecutor:
         if not ok:
             return ExecutionResult(ok=False, reason=reason)
 
-        thalex_orders = []
-        hl_orders = []
+        # ------------------------------------------------------------------
+        # STAGE PHASE — resolve all tenors before any submit happens.
+        # ------------------------------------------------------------------
+        staged_legs: list[tuple[int, str]] = []
         for tenor in tenors:
             intent = OptionIntent(
                 underlying=underlying,
@@ -210,33 +269,152 @@ class OptionsExecutor:
                 target_strike=decision.target_strike,
                 target_delta=decision.target_delta,
             )
-            instrument_name = await self.thalex.resolve_intent(intent)  # type: ignore[attr-defined]
+            try:
+                instrument_name = await self.thalex.resolve_intent(intent)  # type: ignore[attr-defined]
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.error(
+                    "multi-tenor resolve_intent raised for %s tenor=%d: %s",
+                    kind, tenor, exc,
+                )
+                return ExecutionResult(
+                    ok=False,
+                    reason=f"resolve_intent failed for {kind} tenor={tenor}: {exc}",
+                )
             if not instrument_name:
+                logger.error(
+                    "multi-tenor resolve_intent returned no instrument for %s tenor=%d",
+                    kind, tenor,
+                )
                 return ExecutionResult(
                     ok=False,
                     reason=f"no instrument for {kind} tenor={tenor}",
                 )
+            staged_legs.append((tenor, instrument_name))
 
-            order = await self.thalex.place_buy_order(instrument_name, per_leg_contracts)
-            thalex_orders.append(order)
+        # ------------------------------------------------------------------
+        # SUBMIT PHASE — orders go out only now, with retry + unwind.
+        # ------------------------------------------------------------------
+        submitted_thalex: list[tuple[str, float]] = []  # (instrument, contracts)
+        submitted_hl: list[tuple[str, float]] = []      # (side, size)
+        thalex_orders = []
+        hl_orders = []
 
+        for tenor, instrument_name in staged_legs:
+            # Submit Thalex leg with retry.
+            try:
+                thalex_order = await _retry_async(
+                    lambda iname=instrument_name: self.thalex.place_buy_order(
+                        iname, per_leg_contracts
+                    ),
+                    description=f"thalex buy {instrument_name}",
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.error(
+                    "thalex submit failed for %s after retries: %s — unwinding",
+                    instrument_name, exc,
+                )
+                await self._unwind_multi_tenor_legs(
+                    submitted_thalex, submitted_hl, underlying, kind,
+                )
+                return ExecutionResult(
+                    ok=False,
+                    reason=f"thalex submit failed for {instrument_name}: {exc}",
+                )
+            thalex_orders.append(thalex_order)
+            submitted_thalex.append((instrument_name, per_leg_contracts))
+
+            # Compute hedge size from live delta. Errors here fall back to
+            # ATM defaults inside _lookup_delta, so this call doesn't raise.
             delta_per_contract = await self._lookup_delta(instrument_name, kind)
             hedge_size = abs(per_leg_contracts * delta_per_contract)
-            if hedge_size > 0:
-                if kind == "call":
-                    hl_orders.append(
-                        await self.hyperliquid.place_sell_order(underlying, hedge_size)
+            if hedge_size <= 0:
+                continue
+
+            # Submit perp hedge with retry. Failures unwind both the
+            # already-submitted hedges AND all already-submitted thalex legs.
+            hedge_side = "sell" if kind == "call" else "buy"
+            try:
+                if hedge_side == "sell":
+                    hl_order = await _retry_async(
+                        lambda hs=hedge_size: self.hyperliquid.place_sell_order(
+                            underlying, hs
+                        ),
+                        description=f"hyperliquid sell {underlying} hedge",
                     )
                 else:
-                    hl_orders.append(
-                        await self.hyperliquid.place_buy_order(underlying, hedge_size)
+                    hl_order = await _retry_async(
+                        lambda hs=hedge_size: self.hyperliquid.place_buy_order(
+                            underlying, hs
+                        ),
+                        description=f"hyperliquid buy {underlying} hedge",
                     )
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.error(
+                    "hyperliquid hedge failed for %s after retries: %s — unwinding",
+                    underlying, exc,
+                )
+                await self._unwind_multi_tenor_legs(
+                    submitted_thalex, submitted_hl, underlying, kind,
+                )
+                return ExecutionResult(
+                    ok=False,
+                    reason=f"hyperliquid hedge failed for {underlying}: {exc}",
+                )
+            hl_orders.append(hl_order)
+            submitted_hl.append((hedge_side, hedge_size))
 
         return ExecutionResult(
             ok=True,
             thalex_orders=thalex_orders,
             hyperliquid_orders=hl_orders,
         )
+
+    async def _unwind_multi_tenor_legs(
+        self,
+        submitted_thalex: list[tuple[str, float]],
+        submitted_hl: list[tuple[str, float]],
+        underlying: str,
+        kind: str,
+    ) -> None:
+        """Best-effort compensating rollback for partially-submitted multi-tenor legs.
+
+        Called from :meth:`_execute_delta_hedged_multi_tenor` when a Thalex
+        submit or perp hedge fails after retries. For each successfully-
+        submitted leg we send the opposite-direction order to flatten:
+
+        - Long call/put bought on Thalex → submit ``place_sell_order`` for
+          the same instrument and contracts.
+        - Hyperliquid hedge sold (call hedge) → submit ``place_buy_order``
+          to close. Buy (put hedge) → ``place_sell_order``.
+
+        Each unwind is wrapped in its own try/except so a single failure
+        in the rollback path doesn't abort the rest of the unwind. The
+        unwind is best-effort by design: if it can't reach the venue, the
+        operator gets a loud log line and the position stays half-open
+        for manual intervention.
+        """
+        for instrument_name, contracts in submitted_thalex:
+            try:
+                await self.thalex.place_sell_order(instrument_name, contracts)
+                logger.info("unwind: closed thalex leg %s (%.4f contracts)", instrument_name, contracts)
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.warning(
+                    "unwind: thalex sell %s failed: %s — manual intervention may be needed",
+                    instrument_name, exc,
+                )
+
+        for side, size in submitted_hl:
+            try:
+                if side == "sell":
+                    await self.hyperliquid.place_buy_order(underlying, size)
+                else:
+                    await self.hyperliquid.place_sell_order(underlying, size)
+                logger.info("unwind: reversed hyperliquid hedge (%.4f %s)", size, underlying)
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.warning(
+                    "unwind: hyperliquid reverse %s failed: %s — manual intervention may be needed",
+                    underlying, exc,
+                )
 
     async def _execute_multi_leg(
         self,
