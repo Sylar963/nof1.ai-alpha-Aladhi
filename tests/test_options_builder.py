@@ -5,13 +5,16 @@ surface, regime, mispricing, and snapshot pipelines, and returns a single
 ``OptionsContext``. Tests use fake adapter / client objects so the full
 pipeline runs without network IO."""
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import pytest
 
 from src.backend.options_intel.builder import build_options_context
 from src.backend.options_intel.iv_history_store import IVHistoryStore
 from src.backend.options_intel.snapshot import OptionsContext
+
+
+_TEST_TODAY = date(2026, 4, 10)
 
 
 class FakeThalexAdapter:
@@ -113,6 +116,7 @@ async def test_build_options_context_returns_snapshot(thalex_chain, deribit_chai
         deribit=deribit,
         iv_history=store,
         spot_history=[60000.0] * 16,
+        today=_TEST_TODAY,
     )
 
     assert isinstance(ctx, OptionsContext)
@@ -132,6 +136,7 @@ async def test_build_persists_straddle_anchor_to_iv_history(thalex_chain, deribi
         deribit=deribit,
         iv_history=store,
         spot_history=[60000.0] * 16,
+        today=_TEST_TODAY,
     )
 
     rows = store.read_recent(tenor_days=15, limit=5)
@@ -151,6 +156,7 @@ async def test_build_includes_top_mispricings(thalex_chain, deribit_chain, tmp_p
         deribit=deribit,
         iv_history=store,
         spot_history=[60000.0] * 16,
+        today=_TEST_TODAY,
     )
 
     assert isinstance(ctx.top_mispricings_vs_deribit, list)
@@ -171,6 +177,7 @@ async def test_build_tolerates_empty_thalex_chain(deribit_chain, tmp_path):
         deribit=deribit,
         iv_history=store,
         spot_history=[60000.0] * 16,
+        today=_TEST_TODAY,
     )
 
     assert ctx.atm_iv_by_tenor == {}

@@ -13,7 +13,7 @@ test with fakes and lets the bot engine wire the real instances at runtime.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Optional
 
 from src.backend.options_intel.iv_history_store import IVHistoryRow, IVHistoryStore
@@ -32,6 +32,7 @@ async def build_options_context(
     iv_history: IVHistoryStore,
     spot_history: list[float],
     *,
+    today: Optional[date] = None,
     persist_anchor: bool = True,
     top_mispricings: int = 5,
     min_edge_bps: float = 100.0,
@@ -66,7 +67,7 @@ async def build_options_context(
     except Exception as exc:  # pylint: disable=broad-except
         logger.warning("Deribit book summary fetch failed: %s", exc)
 
-    surface = build_vol_surface(thalex_chain, spot=spot)
+    surface = build_vol_surface(thalex_chain, spot=spot, today=today)
 
     # Persist a 15-day anchor on each refresh so the regime classifier has
     # something to look back at after a few days of running.
