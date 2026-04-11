@@ -17,8 +17,9 @@ from src.backend.agent.decision_schema import DecisionParseError, parse_decision
 from src.backend.config_loader import CONFIG
 from src.backend.indicators.taapi_client import TAAPIClient
 from src.backend.models.trade_proposal import TradeProposal
+from src.backend.trading.delta_hedge_manager import DeltaHedgeManager
 from src.backend.trading.hyperliquid_api import HyperliquidAPI
-from src.backend.trading.options_strategies import OptionsExecutor
+from src.backend.trading.options_strategies import DeltaHedger, OptionsExecutor
 from src.backend.utils.prompt_utils import json_default
 
 
@@ -92,12 +93,22 @@ class TradingBotEngine:
         # config doesn't break Hyperliquid-only deployments.
         self.thalex = None
         self.options_executor: Optional[OptionsExecutor] = None
+        self.hedge_manager: Optional[DeltaHedgeManager] = None
         if CONFIG.get("thalex_key_id") and CONFIG.get("thalex_private_key_path"):
             try:
                 from src.backend.trading.thalex_api import ThalexAPI
                 self.thalex = ThalexAPI()
                 self.options_executor = OptionsExecutor(thalex=self.thalex, hyperliquid=self.hyperliquid)
-                self.logger.info("Thalex options venue enabled (network=%s)", self.thalex.network_name)
+                threshold = float(CONFIG.get("thalex_delta_threshold") or 0.02)
+                self.hedge_manager = DeltaHedgeManager(
+                    thalex=self.thalex,
+                    hyperliquid=self.hyperliquid,
+                    hedger=DeltaHedger(threshold=threshold),
+                )
+                self.logger.info(
+                    "Thalex options venue enabled (network=%s, hedge_threshold=%.4f BTC)",
+                    self.thalex.network_name, threshold,
+                )
             except Exception as exc:  # pylint: disable=broad-except
                 self.logger.warning("Thalex venue not initialized: %s", exc)
 
@@ -156,15 +167,41 @@ class TradingBotEngine:
                 len(result.thalex_orders),
                 len(result.hyperliquid_orders),
             )
+            instrument_name = ""
+            if result.thalex_orders:
+                first = result.thalex_orders[0]
+                instrument_name = getattr(first, "instrument_name", None) or getattr(first, "asset", "") or ""
             self.active_trades.append({
                 "venue": "thalex",
                 "asset": decision.asset,
+                "instrument_name": instrument_name,
                 "strategy": decision.strategy,
                 "rationale": decision.rationale,
                 "thalex_orders": [o.order_id for o in result.thalex_orders],
                 "hyperliquid_orders": [o.order_id for o in result.hyperliquid_orders],
                 "opened_at": datetime.now(UTC).isoformat(),
             })
+
+            # Wire the position into the event-driven delta hedger so that
+            # subsequent ticker pushes can rebalance the perp leg on threshold
+            # breach. Only delta-hedged strategies need this — credit_put and
+            # credit_spread carry their own defined risk.
+            if (
+                self.hedge_manager is not None
+                and instrument_name
+                and decision.strategy in {"long_call_delta_hedged", "long_put_delta_hedged"}
+                and decision.contracts
+                and decision.kind
+            ):
+                try:
+                    await self.hedge_manager.add_position(
+                        instrument_name=instrument_name,
+                        contracts=float(decision.contracts),
+                        kind=decision.kind,
+                        underlying=decision.underlying or decision.asset,
+                    )
+                except Exception as exc:  # pylint: disable=broad-except
+                    self.logger.warning("DeltaHedgeManager add_position failed: %s", exc)
         else:
             self.logger.warning("Thalex decision rejected: %s", result.reason)
 

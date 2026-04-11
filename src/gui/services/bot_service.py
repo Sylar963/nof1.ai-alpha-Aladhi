@@ -5,6 +5,7 @@ Bot Service - Manages bot lifecycle and provides data access for GUI
 import asyncio
 import json
 import logging
+import os
 from pathlib import Path
 from typing import List, Dict, Optional
 from datetime import datetime
@@ -218,48 +219,6 @@ class BotService:
         if self.bot_engine:
             return self.bot_engine.get_assets()
         return self.config['assets']
-
-    async def test_api_connections(self) -> Dict[str, bool]:
-        """
-        Test API connections for TAAPI, Hyperliquid, OpenRouter.
-
-        Returns:
-            Dict with API names as keys and connection status as values
-        """
-        results = {}
-
-        try:
-            # Test TAAPI
-            from src.backend.indicators.taapi_client import TAAPIClient
-            taapi = TAAPIClient()
-            try:
-                test_result = taapi.fetch_value("rsi", "BTC/USDT", "5m", params={"period": 14})
-                results['TAAPI'] = test_result is not None
-            except Exception:
-                results['TAAPI'] = False
-
-            # Test Hyperliquid
-            from src.backend.trading.hyperliquid_api import HyperliquidAPI
-            hyperliquid = HyperliquidAPI()
-            try:
-                price = await hyperliquid.get_current_price("BTC")
-                results['Hyperliquid'] = price is not None and price > 0
-            except Exception:
-                results['Hyperliquid'] = False
-
-            # Test OpenRouter (via agent)
-            from src.backend.agent.decision_maker import TradingAgent
-            agent = TradingAgent()
-            try:
-                # Simple test call (won't actually trade)
-                results['OpenRouter'] = True  # If initialization succeeded
-            except Exception:
-                results['OpenRouter'] = False
-
-        except Exception as e:
-            self.logger.error(f"Error testing connections: {e}")
-
-        return results
 
     async def refresh_market_data(self) -> bool:
         """
@@ -596,61 +555,83 @@ class BotService:
         except Exception as e:
             self.logger.error(f"Failed to load configuration file: {e}")
 
-    async def test_api_connections(self) -> Dict[str, bool]:
+    async def test_api_connections(self) -> Dict[str, object]:
         """Test API connections to all services"""
-        results = {
-            'taapi': False,
-            'hyperliquid': False,
-            'openrouter': False,
+        results: Dict[str, object] = {
+            "TAAPI": False,
+            "Hyperliquid": False,
+            "OpenRouter": False,
+            "Thalex": False,
         }
+        errors: Dict[str, str] = {}
 
         try:
             # Test TAAPI
-            taapi_key = CONFIG.get('taapi_api_key', '')
-            if taapi_key and taapi_key != 'your_taapi_key_here':
-                # Simple test: try to get EMA for BTC
+            taapi_key = CONFIG.get("taapi_api_key", "")
+            if taapi_key and taapi_key != "your_taapi_key_here":
                 import aiohttp
                 async with aiohttp.ClientSession() as session:
                     try:
                         async with session.get(
-                            f'https://api.taapi.io/ema?secret={taapi_key}&exchange=binance&symbol=BTC/USDT&interval=4h&period=14',
-                            timeout=aiohttp.ClientTimeout(total=5)
+                            f"https://api.taapi.io/ema?secret={taapi_key}&exchange=binance&symbol=BTC/USDT&interval=4h&period=14",
+                            timeout=aiohttp.ClientTimeout(total=5),
                         ) as resp:
                             if resp.status == 200:
-                                results['taapi'] = True
+                                results["TAAPI"] = True
                     except Exception as e:
                         self.logger.debug(f"TAAPI test failed: {e}")
+                        errors["TAAPI"] = str(e)
 
             # Test Hyperliquid
-            hl_key = CONFIG.get('hyperliquid_private_key', '')
-            if hl_key and hl_key != 'your_private_key_here':
+            hl_key = CONFIG.get("hyperliquid_private_key", "")
+            if hl_key and hl_key != "your_private_key_here":
                 try:
                     from src.backend.trading.hyperliquid_api import HyperliquidAPI
                     hl = HyperliquidAPI()
-                    # Try to get user state
                     state = await hl.get_user_state()
                     if state:
-                        results['hyperliquid'] = True
+                        results["Hyperliquid"] = True
                 except Exception as e:
                     self.logger.debug(f"Hyperliquid test failed: {e}")
+                    errors["Hyperliquid"] = str(e)
 
             # Test OpenRouter
-            or_key = CONFIG.get('openrouter_api_key', '')
-            if or_key and or_key != 'your_openrouter_key_here':
+            or_key = CONFIG.get("openrouter_api_key", "")
+            if or_key and or_key != "your_openrouter_key_here":
                 import aiohttp
                 async with aiohttp.ClientSession() as session:
                     try:
                         async with session.post(
-                            'https://openrouter.ai/api/v1/auth/key',
-                            headers={'Authorization': f'Bearer {or_key}'},
-                            timeout=aiohttp.ClientTimeout(total=5)
+                            "https://openrouter.ai/api/v1/auth/key",
+                            headers={"Authorization": f"Bearer {or_key}"},
+                            timeout=aiohttp.ClientTimeout(total=5),
                         ) as resp:
-                            if resp.status in [200, 401]:  # 401 means key exists but might be invalid
-                                results['openrouter'] = True
+                            if resp.status in [200, 401]:
+                                results["OpenRouter"] = True
                     except Exception as e:
                         self.logger.debug(f"OpenRouter test failed: {e}")
+                        errors["OpenRouter"] = str(e)
+
+            # Test Thalex
+            thalex_key_id = (os.getenv("THALEX_KEY_ID") or CONFIG.get("thalex_key_id") or "").strip()
+            thalex_pem_path = (os.getenv("THALEX_PRIVATE_KEY_PATH") or CONFIG.get("thalex_private_key_path") or "").strip()
+            if thalex_key_id and thalex_pem_path:
+                try:
+                    from src.backend.trading.thalex_api import ThalexAPI
+                    import asyncio as _asyncio
+
+                    thalex = ThalexAPI()
+                    await _asyncio.wait_for(thalex.connect(), timeout=12.0)
+                    results["Thalex"] = True
+                    await thalex.disconnect()
+                except Exception as e:
+                    self.logger.debug(f"Thalex test failed: {e}")
+                    errors["Thalex"] = str(e)
 
         except Exception as e:
             self.logger.error(f"Error testing API connections: {e}")
+            errors["_global"] = str(e)
+
+        results["errors"] = errors
 
         return results
