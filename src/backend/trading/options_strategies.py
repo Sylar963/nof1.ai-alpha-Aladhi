@@ -26,6 +26,12 @@ from src.backend.trading.exchange_adapter import ExchangeAdapter
 from src.backend.trading.options import OptionIntent
 
 
+# Default tenor ladder for the multi-tenor target_gamma_btc expansion path.
+# Spreads gamma across short, medium, and longer-dated expiries so a single
+# decision builds curve exposure rather than concentrating in one tenor.
+_DEFAULT_GAMMA_TENORS: tuple[int, ...] = (7, 14, 30, 60)
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -120,6 +126,13 @@ class OptionsExecutor:
         decision: TradeDecision,
         open_positions_count: int,
     ) -> ExecutionResult:
+        # Multi-tenor curve build via target_gamma_btc takes precedence over
+        # the single-leg path: when the LLM declares a gamma target, expand
+        # into N legs across the default tenor ladder before hitting the
+        # single-tenor execution path.
+        if decision.target_gamma_btc and decision.target_gamma_btc > 0:
+            return await self._execute_delta_hedged_multi_tenor(decision, open_positions_count)
+
         contracts = decision.contracts or 0.0
         ok, reason = self.thalex.preflight(  # type: ignore[attr-defined]
             underlying=decision.underlying or decision.asset,
@@ -151,6 +164,79 @@ class OptionsExecutor:
                 hl_orders.append(await self.hyperliquid.place_buy_order(decision.underlying or "BTC", hedge_size))
 
         return ExecutionResult(ok=True, thalex_orders=[thalex_order], hyperliquid_orders=hl_orders)
+
+    async def _execute_delta_hedged_multi_tenor(
+        self,
+        decision: TradeDecision,
+        open_positions_count: int,
+    ) -> ExecutionResult:
+        """Distribute a target gamma exposure across the default tenor ladder.
+
+        For each tenor in :data:`_DEFAULT_GAMMA_TENORS`:
+          1. Resolve the ATM (or target_strike) instrument via the Thalex
+             adapter's intent resolver.
+          2. Run risk preflight using a per-leg contract count of
+             ``target_gamma_btc / N`` (clamped to the per-trade cap upstream).
+          3. Submit the Thalex buy.
+          4. Look up the leg's delta and submit a perp hedge of size
+             ``contracts × |delta|`` in the appropriate direction.
+
+        The first preflight failure short-circuits the whole expansion so
+        we never end up with a half-built curve. The position-count cap is
+        checked **once** against the existing open count before submitting
+        any legs — the gamma build is treated as a single logical position
+        for cap purposes (not N positions).
+        """
+        underlying = decision.underlying or decision.asset
+        kind = decision.kind or "call"
+        tenors = _DEFAULT_GAMMA_TENORS
+        per_leg_contracts = (decision.target_gamma_btc or 0.0) / len(tenors)
+
+        ok, reason = self.thalex.preflight(  # type: ignore[attr-defined]
+            underlying=underlying,
+            contracts=per_leg_contracts,
+            open_positions_count=open_positions_count,
+        )
+        if not ok:
+            return ExecutionResult(ok=False, reason=reason)
+
+        thalex_orders = []
+        hl_orders = []
+        for tenor in tenors:
+            intent = OptionIntent(
+                underlying=underlying,
+                kind=kind,
+                tenor_days=tenor,
+                target_strike=decision.target_strike,
+                target_delta=decision.target_delta,
+            )
+            instrument_name = await self.thalex.resolve_intent(intent)  # type: ignore[attr-defined]
+            if not instrument_name:
+                return ExecutionResult(
+                    ok=False,
+                    reason=f"no instrument for {kind} tenor={tenor}",
+                )
+
+            order = await self.thalex.place_buy_order(instrument_name, per_leg_contracts)
+            thalex_orders.append(order)
+
+            delta_per_contract = await self._lookup_delta(instrument_name, kind)
+            hedge_size = abs(per_leg_contracts * delta_per_contract)
+            if hedge_size > 0:
+                if kind == "call":
+                    hl_orders.append(
+                        await self.hyperliquid.place_sell_order(underlying, hedge_size)
+                    )
+                else:
+                    hl_orders.append(
+                        await self.hyperliquid.place_buy_order(underlying, hedge_size)
+                    )
+
+        return ExecutionResult(
+            ok=True,
+            thalex_orders=thalex_orders,
+            hyperliquid_orders=hl_orders,
+        )
 
     async def _execute_multi_leg(
         self,

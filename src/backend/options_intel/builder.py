@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 from datetime import date, datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
 from src.backend.options_intel.iv_history_store import IVHistoryRow, IVHistoryStore
 from src.backend.options_intel.mispricing import scan_mispricings
@@ -25,6 +25,7 @@ from src.backend.options_intel.technicals import (
     compute_keltner_channel,
     compute_opening_range,
 )
+from src.backend.options_intel.trade_history import fetch_recent_options_trades
 from src.backend.options_intel.vol_surface import build_vol_surface
 
 
@@ -44,6 +45,8 @@ async def build_options_context(
     use_interpolation: bool = False,
     intraday_minute_prices: Optional[list[tuple[int, float]]] = None,
     daily_closes_for_keltner: Optional[list[float]] = None,
+    db_session: Any = None,
+    recent_trades_limit: int = 5,
 ) -> OptionsContext:
     """Run the full options-intel pipeline and return a snapshot.
 
@@ -153,6 +156,13 @@ async def build_options_context(
         today=today_for_signals,
     )
 
+    # Recent options trade history — last N closed Thalex trades pulled from
+    # the bot's existing Trade table when a session is supplied. Skipped
+    # silently when no session is wired (PR A/B/C tests don't need it).
+    recent_options_trades: list[dict] = []
+    if db_session is not None:
+        recent_options_trades = fetch_recent_options_trades(db_session, limit=recent_trades_limit)
+
     return OptionsContext(
         timestamp_utc=datetime.now(timezone.utc).isoformat(),
         spot=float(spot),
@@ -179,7 +189,7 @@ async def build_options_context(
         max_contracts_per_trade=0.1,
         max_open_positions=3,
         open_position_count=len(portfolio["open_positions"]),
-        recent_options_trades=[],
+        recent_options_trades=recent_options_trades,
     )
 
 
@@ -200,7 +210,25 @@ def _extract_positions(user_state) -> list[dict]:
     out: list[dict] = []
     for entry in raw:
         if isinstance(entry, dict):
-            out.append(entry)
+            normalized = dict(entry)
+            instrument_name = (
+                entry.get("instrument_name")
+                or entry.get("instrument")
+                or entry.get("asset")
+            )
+            if "size" in entry:
+                size = entry.get("size")
+            elif "position" in entry:
+                size = entry.get("position")
+            elif "amount" in entry:
+                size = entry.get("amount")
+            else:
+                size = 0.0
+            side = entry.get("side") or "long"
+            normalized["instrument_name"] = instrument_name
+            normalized["size"] = size
+            normalized["side"] = side
+            out.append(normalized)
             continue
         # PositionSnapshot dataclass — convert to the dict the aggregator expects
         out.append({

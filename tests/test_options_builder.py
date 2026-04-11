@@ -235,7 +235,7 @@ async def test_build_populates_opening_range_when_intraday_supplied(thalex_chain
 
     assert ctx.opening_range["high"] == 60500.0
     assert ctx.opening_range["low"] == 59800.0
-    assert ctx.opening_range["position"] in {"above", "inside", "below"}
+    assert ctx.opening_range["position"] == "inside"
 
 
 @pytest.mark.asyncio

@@ -122,7 +122,7 @@ async def test_aggregate_multi_position_sums_correctly():
 
 @pytest.mark.asyncio
 async def test_aggregate_handles_get_greeks_failure_gracefully():
-    """If get_greeks raises for one instrument, that position is dropped from totals."""
+    """If get_greeks raises for one instrument, that position keeps static data."""
 
     class _FlakyGreeks:
         def __init__(self):
@@ -140,10 +140,10 @@ async def test_aggregate_handles_get_greeks_failure_gracefully():
         {"instrument_name": "BTC-25APR26-50000-P", "size": 0.10, "side": "long"},
     ]
     result = await aggregate_portfolio_greeks(positions, source, today=_TODAY)
-    # The successful position contributes; the failing one is silently skipped
+    # The successful position contributes; the failing one keeps static data
     # so a single ticker hiccup doesn't blank the whole portfolio view.
     assert result["portfolio_greeks"]["delta"] == pytest.approx(0.05 * 0.42)
-    assert len(result["open_positions"]) == 1
+    assert len(result["open_positions"]) == 2
 
 
 @pytest.mark.asyncio
