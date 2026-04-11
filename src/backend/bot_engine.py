@@ -14,6 +14,7 @@ from typing import Dict, List, Optional, Callable, Any
 
 from src.backend.agent.decision_maker import TradingAgent
 from src.backend.agent.decision_schema import DecisionParseError, parse_decision
+from src.backend.agent.options_llm_lifecycle import OptionsLLMLifecycle
 from src.backend.config_loader import CONFIG
 from src.backend.indicators.taapi_client import TAAPIClient
 from src.backend.models.trade_proposal import TradeProposal
@@ -99,6 +100,7 @@ class TradingBotEngine:
         self.options_executor: Optional[OptionsExecutor] = None
         self.hedge_manager: Optional[DeltaHedgeManager] = None
         self.options_scheduler: Optional[OptionsScheduler] = None
+        self.options_llm_lifecycle: Optional[OptionsLLMLifecycle] = None
         self._latest_options_context = None  # populated by the 15m surface refresh task
         if CONFIG.get("thalex_key_id") and CONFIG.get("thalex_private_key_path"):
             try:
@@ -114,6 +116,13 @@ class TradingBotEngine:
                 self.logger.info(
                     "Thalex options venue enabled (network=%s, hedge_threshold=%.4f BTC)",
                     self.thalex.network_name, threshold,
+                )
+
+                # Cache one LLM client for the bot's lifetime so we don't
+                # leak an aiohttp session every 3-hour decision cycle.
+                self.options_llm_lifecycle = OptionsLLMLifecycle(
+                    api_key=CONFIG.get("openrouter_api_key"),
+                    logger=self.logger,
                 )
 
                 # Wire the two-cadence scheduler. Disabled by default — set
@@ -291,6 +300,14 @@ class TradingBotEngine:
             except Exception as exc:  # pylint: disable=broad-except
                 self.logger.warning("OptionsScheduler stop failed: %s", exc)
 
+        # Release the cached aiohttp session inside the LLM client. close()
+        # is idempotent and exception-safe so this is always cheap.
+        if self.options_llm_lifecycle is not None:
+            try:
+                await self.options_llm_lifecycle.close()
+            except Exception as exc:  # pylint: disable=broad-except
+                self.logger.warning("OptionsLLMLifecycle close failed: %s", exc)
+
         self.logger.info("Bot stopped")
         self._notify_state_update()
 
@@ -424,27 +441,26 @@ class TradingBotEngine:
             self.logger.error("options decision cycle failed: %s", exc)
 
     def _options_llm_adapter(self):
-        """Build the LLM client passed to OptionsAgent.
+        """Return the cached LLM client (or shim) used by OptionsAgent.
 
-        Returns the real :class:`AsyncOpenRouterClient` when an OpenRouter
-        API key is configured, falling back to an empty-decision shim when
-        the key is missing so the scheduler still runs cleanly without
-        crashing on a no-op cycle.
+        The lifecycle wrapper owns a single client instance for the bot's
+        whole lifetime so the underlying aiohttp session is reused across
+        every 3-hour decision cycle. The session is released by
+        :py:meth:`stop` via ``options_llm_lifecycle.close()``.
+
+        When the lifecycle wasn't constructed (Thalex not configured) we
+        fall back to a one-shot shim instance so callers always get a
+        usable ``chat_json`` interface.
         """
-        if CONFIG.get("openrouter_api_key"):
-            from src.backend.llm_client import AsyncOpenRouterClient
-            return AsyncOpenRouterClient()
+        if self.options_llm_lifecycle is not None:
+            return self.options_llm_lifecycle.get()
 
-        bot_logger = self.logger
+        # Defensive fallback: if the lifecycle wasn't built (e.g. Thalex
+        # disabled but the scheduler somehow ran), return an in-place shim.
+        # This branch should not normally be reached.
+        from src.backend.agent.options_llm_lifecycle import _ShimLLM
 
-        class _Shim:
-            async def chat_json(self, *, system_prompt, user_prompt, schema):
-                bot_logger.warning(
-                    "OPENROUTER_API_KEY missing — OptionsAgent returning empty decisions"
-                )
-                return {"reasoning": "shim", "trade_decisions": []}
-
-        return _Shim()
+        return _ShimLLM(self.logger)
 
     async def _main_loop(self):
         """
