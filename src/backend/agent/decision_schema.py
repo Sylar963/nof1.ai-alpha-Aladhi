@@ -24,13 +24,28 @@ from src.backend.trading.options import OptionIntent
 
 VALID_VENUES = {"hyperliquid", "thalex"}
 VALID_ACTIONS = {"buy", "sell", "hold"}
+
+# Defined-risk strategies only. Single-leg short premium plays (`credit_put`,
+# `credit_call`) are intentionally absent — every short-vol position must be
+# wrapped as a vertical spread or an iron condor for capped downside.
 VALID_STRATEGIES = {
-    "credit_put",
-    "credit_spread",
+    "credit_put_spread",
+    "credit_call_spread",
+    "iron_condor",
     "long_call_delta_hedged",
     "long_put_delta_hedged",
+    "vol_arb",
 }
 VALID_KINDS = {"call", "put"}
+VALID_VOL_VIEWS = {"short_vol", "long_vol", "neutral"}
+VALID_ENTRY_KINDS = {
+    "outright",
+    "vertical",
+    "calendar",
+    "diagonal",
+    "iron_condor",
+    "vol_arb",
+}
 
 
 class DecisionParseError(ValueError):
@@ -39,13 +54,19 @@ class DecisionParseError(ValueError):
 
 @dataclass
 class OptionsLeg:
-    """A single leg inside a multi-leg options strategy (e.g. credit spread)."""
+    """A single leg inside a multi-leg options strategy (e.g. iron condor).
+
+    ``tenor_days`` is optional — when set, this leg overrides the
+    decision-level tenor (used for calendar/diagonal spreads where each leg
+    has a different expiry).
+    """
 
     kind: str  # "call" | "put"
     side: str  # "buy" | "sell"
     contracts: float
     target_strike: Optional[float] = None
     target_delta: Optional[float] = None
+    tenor_days: Optional[int] = None
 
 
 @dataclass
@@ -72,6 +93,11 @@ class TradeDecision:
     target_delta: Optional[float] = None
     contracts: Optional[float] = None
     legs: list[OptionsLeg] = field(default_factory=list)
+
+    # PR B additions: hedge-fund-grade options metadata
+    entry_kind: Optional[str] = None  # outright|vertical|calendar|diagonal|iron_condor|vol_arb
+    vol_view: Optional[str] = None  # short_vol|long_vol|neutral
+    target_gamma_btc: Optional[float] = None  # for multi-tenor auto-distribute sizing
 
     def to_option_intent(self) -> Optional[OptionIntent]:
         """Build an OptionIntent for single-leg options decisions, else None."""
@@ -113,6 +139,7 @@ def _coerce_legs(raw_legs) -> list[OptionsLeg]:
                 contracts=contracts,
                 target_strike=_optional_float(raw.get("target_strike")),
                 target_delta=_optional_float(raw.get("target_delta")),
+                tenor_days=_optional_int(raw.get("tenor_days")),
             )
         )
     return out
@@ -167,6 +194,18 @@ def parse_decision(payload: dict) -> TradeDecision:
     if kind is not None and kind not in VALID_KINDS:
         raise DecisionParseError(f"kind must be one of {VALID_KINDS} or null, got {kind!r}")
 
+    vol_view = payload.get("vol_view")
+    if vol_view is not None and vol_view not in VALID_VOL_VIEWS:
+        raise DecisionParseError(
+            f"vol_view must be one of {VALID_VOL_VIEWS} or null, got {vol_view!r}"
+        )
+
+    entry_kind = payload.get("entry_kind")
+    if entry_kind is not None and entry_kind not in VALID_ENTRY_KINDS:
+        raise DecisionParseError(
+            f"entry_kind must be one of {VALID_ENTRY_KINDS} or null, got {entry_kind!r}"
+        )
+
     return TradeDecision(
         asset=asset,
         action=action,
@@ -184,4 +223,7 @@ def parse_decision(payload: dict) -> TradeDecision:
         target_delta=_optional_float(payload.get("target_delta")),
         contracts=_optional_float(payload.get("contracts")),
         legs=_coerce_legs(payload.get("legs")),
+        entry_kind=entry_kind,
+        vol_view=vol_view,
+        target_gamma_btc=_optional_float(payload.get("target_gamma_btc")),
     )
