@@ -138,3 +138,26 @@ async def test_dispatch_ignores_unknown_channel(adapter):
     })
     # No exception, no state change — just verify the call returned cleanly.
     assert "ETH-10MAY26-3000-C" not in adapter._ticker_subscribers
+
+
+@pytest.mark.asyncio
+async def test_resubscribe_tickers_retries_transient_failures(adapter, monkeypatch):
+    attempts = []
+
+    async def _sleep(_seconds):
+        return None
+
+    async def _request(sender=None, **kwargs):
+        attempts.append({"sender": sender, **kwargs})
+        if len(attempts) == 1:
+            raise RuntimeError("transient")
+        return {"status": "ok"}
+
+    adapter._ticker_subscribers["BTC-10MAY26-65000-C"] = lambda payload: None
+    adapter._request = _request
+    monkeypatch.setattr("src.backend.trading.thalex_api.asyncio.sleep", _sleep)
+
+    await adapter._resubscribe_tickers()
+
+    assert len(attempts) == 2
+    assert attempts[-1]["channels"] == ["ticker.BTC-10MAY26-65000-C.raw"]

@@ -238,7 +238,14 @@ class TAAPIClient:
             return None
         return round(notional / volume_total, 4)
 
-    def fetch_asset_indicators(self, asset, current_spot=None):
+    def _pause_for_rate_limit(self, request_pause=None) -> None:
+        """Let the caller enforce TAAPI pacing without blocking the event loop."""
+        if request_pause is None:
+            return
+        logging.info("Waiting 15s for TAAPI rate limit (Free plan: 1 req/15s)...")
+        request_pause()
+
+    def fetch_asset_indicators(self, asset, current_spot=None, request_pause=None):
         """
         Fetch the curated perps indicator set for an asset.
 
@@ -250,7 +257,7 @@ class TAAPIClient:
         and the same anchored VWAP.
         
         IMPORTANT: Free plan has 1 request per 15 seconds limit.
-        This method adds 15s delay between requests to respect rate limits.
+        The caller may inject a pause callback to pace each TAAPI HTTP call.
         
         Caching: Results are cached for 60 seconds by default to reduce API calls.
 
@@ -310,6 +317,7 @@ class TAAPIClient:
         now = datetime.now(timezone.utc)
         start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
         end = start + timedelta(hours=1)
+        self._pause_for_rate_limit(request_pause)
         opening_range_candles = self.fetch_candles(
             symbol,
             "5m",
@@ -320,6 +328,7 @@ class TAAPIClient:
         )
         result["5m"]["opening_range"] = self._build_opening_range(opening_range_candles, current_spot=current_spot)
 
+        self._pause_for_rate_limit(request_pause)
         avwap_candles = self.fetch_candles(
             symbol,
             "1d",
@@ -331,10 +340,6 @@ class TAAPIClient:
         )
         avwap = self._compute_avwap(avwap_candles)
         result["5m"]["avwap"] = avwap
-
-        # Wait 15 seconds to respect Free plan rate limit (1 request per 15 seconds)
-        logging.info(f"Waiting 15s for TAAPI rate limit (Free plan: 1 req/15s)...")
-        time.sleep(15)
 
         indicators_long = [
             {"id": "sma99", "indicator": "sma", "period": 99, "results": 5},
@@ -348,6 +353,7 @@ class TAAPIClient:
             },
         ]
 
+        self._pause_for_rate_limit(request_pause)
         bulk_long = self.fetch_bulk_indicators(symbol, interval, indicators_long)
 
         # Extract values and series
