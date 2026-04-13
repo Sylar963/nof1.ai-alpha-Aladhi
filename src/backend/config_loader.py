@@ -97,6 +97,11 @@ CONFIG = {
     # BTC delta drift (signed) before the perp hedge re-trades. Threshold-only —
     # the loop polls for free, only fires a perp order when |drift| > this.
     "thalex_delta_threshold": float(_get_env("THALEX_DELTA_THRESHOLD", "0.02") or 0.02),
+    # Slow safety poll that reconciles the live options book against the live
+    # Hyperliquid hedge even if ticker pushes were missed.
+    "thalex_hedge_reconcile_interval_seconds": _get_int(
+        "THALEX_HEDGE_RECONCILE_INTERVAL_SECONDS", 15
+    ),
     # LLM via OpenRouter
     "openrouter_api_key": _get_env("OPENROUTER_API_KEY"),
     "openrouter_base_url": _get_env("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),

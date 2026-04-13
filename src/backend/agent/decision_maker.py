@@ -46,11 +46,13 @@ class TradingAgent:
             "- Each decision MUST include a 'venue' field: either 'hyperliquid' (perps) or 'thalex' (BTC options only for v1).\n"
             "- Default venue is 'hyperliquid' when omitted.\n"
             "- Use 'thalex' when you want directional or premium-selling exposure expressed via OPTIONS rather than perps.\n"
-            "OPTIONS STRATEGIES (thalex venue):\n"
-            "- 'credit_put': sell an OTM put to collect premium below support. action='sell'. Provide: strategy, underlying, kind='put', tenor_days, target_strike, contracts.\n"
-            "- 'credit_spread': defined-risk premium sale with two legs. action='sell'. Provide: strategy, underlying, tenor_days, legs=[{kind, side, target_strike, contracts}, ...].\n"
+            "OPTIONS STRATEGIES (thalex venue, defined-risk only):\n"
+            "- 'credit_put_spread': sell a put spread below support. action='sell'. Provide: strategy, underlying, tenor_days, legs=[{kind, side, target_strike, contracts}, ...].\n"
+            "- 'credit_call_spread': sell a call spread above resistance. action='sell'. Provide: strategy, underlying, tenor_days, legs=[{kind, side, target_strike, contracts}, ...].\n"
+            "- 'iron_condor': sell both a put spread and a call spread for a defined-risk short-vol trade. action='sell'. Provide: strategy, underlying, tenor_days, legs=[{kind, side, target_strike, contracts}, ...].\n"
             "- 'long_call_delta_hedged': buy a call and the bot auto-hedges delta on Hyperliquid perp. action='buy'. Provide: strategy, underlying, kind='call', tenor_days, target_strike, contracts.\n"
             "- 'long_put_delta_hedged': buy a put and the bot auto-hedges delta on Hyperliquid perp. action='buy'. Provide: strategy, underlying, kind='put', tenor_days, target_strike, contracts.\n"
+            "- 'vol_arb': express an options relative-value trade with legs=[...]. action can be 'buy' or 'sell' depending on the package.\n"
             "RISK CAPS (hard limits — orders that violate are rejected):\n"
             "- max_contracts_per_trade=0.1, max_open_positions=3, allowed underlyings=BTC.\n"
             "POSITION SIZING:\n"
@@ -64,22 +66,23 @@ class TradingAgent:
         system_prompt += (
             "You will receive market + account context for SEVERAL assets, including:\n"
             f"- assets = {json.dumps(assets)}\n"
-            "- per-asset intraday (5m) and higher-timeframe (4h) metrics\n"
+            "- per-asset intraday (5m) metrics centered on SMA99, Keltner(130,4), AVWAP anchored at 2026-01-01 00:00 UTC, and opening range\n"
+            "- per-asset higher-timeframe metrics centered on SMA99, Keltner(130,4), and the same anchored AVWAP\n"
             "- Active Trades with Exit Plans\n"
             "- Recent Trading History\n\n"
             "Always use the 'current time' provided in the user message to evaluate any time-based conditions, such as cooldown expirations or timed exit plans.\n\n"
             "Your goal: make decisive, first-principles decisions per asset that minimize churn while capturing edge.\n\n"
             "Aggressively pursue setups where calculated risk is outweighed by expected edge; size positions so downside is controlled while upside remains meaningful.\n\n"
             "Core policy (low-churn, position-aware)\n"
-            "1) Respect prior plans: If an active trade has an exit_plan with explicit invalidation (e.g., “close if 4h close above EMA50”), DO NOT close or flip early unless that invalidation (or a stronger one) has occurred.\n"
+            "1) Respect prior plans: If an active trade has an exit_plan with explicit invalidation (e.g., “close if price loses 4h SMA99” or “close if 5m re-enters the opening range”), DO NOT close or flip early unless that invalidation (or a stronger one) has occurred.\n"
             "2) Hysteresis: Require stronger evidence to CHANGE a decision than to keep it. Only flip direction if BOTH:\n"
-            "   a) Higher-timeframe structure supports the new direction (e.g., 4h EMA20 vs EMA50 and/or MACD regime), AND\n"
-            "   b) Intraday structure confirms with a decisive break beyond ~0.5×ATR (recent) and momentum alignment (MACD or RSI slope).\n"
+            "   a) Higher-timeframe structure supports the new direction (e.g., price relative to SMA99, anchored AVWAP, and Keltner position), AND\n"
+            "   b) Intraday structure confirms with opening-range behavior plus anchored AVWAP / Keltner alignment.\n"
             "   Otherwise, prefer HOLD or adjust TP/SL.\n"
             "3) Cooldown: After opening, adding, reducing, or flipping, impose a self-cooldown of at least 3 bars of the decision timeframe (e.g., 3×5m = 15m) before another direction change, unless a hard invalidation occurs. Encode this in exit_plan (e.g., “cooldown_bars:3 until 2025-10-19T15:55Z”). You must honor your own cooldowns on future cycles.\n"
-            "4) Funding is a tilt, not a trigger: Do NOT open/close/flip solely due to funding unless expected funding over your intended holding horizon meaningfully exceeds expected edge (e.g., > ~0.25×ATR). Consider that funding accrues discretely and slowly relative to 5m bars.\n"
-            "5) Overbought/oversold ≠ reversal by itself: Treat RSI extremes as risk-of-pullback. You need structure + momentum confirmation to bet against trend. Prefer tightening stops or taking partial profits over instant flips.\n"
-            "6) Prefer adjustments over exits: If the thesis weakens but is not invalidated, first consider: tighten stop (e.g., to a recent swing or ATR multiple), trail TP, or reduce size. Flip only on hard invalidation + fresh confluence.\n\n"
+            "4) Funding is a tilt, not a trigger: Do NOT open/close/flip solely due to funding unless expected funding over your intended holding horizon meaningfully exceeds the technical edge. Consider that funding accrues discretely and slowly relative to 5m bars.\n"
+            "5) Extension alone is not reversal: price pressing a Keltner extreme is not enough by itself. You still need opening-range and VWAP confirmation to fade or flip.\n"
+            "6) Prefer adjustments over exits: If the thesis weakens but is not invalidated, first consider: tighten stop to a recent structure level, trail TP, or reduce size. Flip only on hard invalidation + fresh confluence.\n\n"
             "Decision discipline (per asset)\n"
             "- Choose one: buy / sell / hold.\n"
             "- Proactively harvest profits when price action presents a clear, high-quality opportunity that aligns with your thesis.\n"
@@ -91,14 +94,14 @@ class TradingAgent:
             "- exit_plan must include at least ONE explicit invalidation trigger and may include cooldown guidance you will follow later.\n\n"
             "Leverage policy (perpetual futures)\n"
             "- YOU CAN USE LEVERAGE, ATLEAST 3X LEVERAGE TO GET BETTER RETURN, KEEP IT WITHIN 10X IN TOTAL\n"
-            "- In high volatility (elevated ATR) or during funding spikes, reduce or avoid leverage.\n"
+            "- In high volatility (very wide Keltner envelope) or during funding spikes, reduce or avoid leverage.\n"
             "- Treat allocation_usd as notional exposure; keep it consistent with safe leverage and available margin.\n\n"
             "Tool usage\n"
             "- Aggressively leverage fetch_taapi_indicator whenever an additional datapoint could sharpen your thesis; keep parameters minimal (indicator, symbol like \"BTC/USDT\", interval \"5m\"/\"4h\", optional period).\n"
             "- Incorporate tool findings into your reasoning, but NEVER paste raw tool responses into the final JSON—summarize the insight instead.\n"
             "- Use tools to upgrade your analysis; lack of confidence is a cue to query them before deciding."
             "Reasoning recipe (first principles)\n"
-            "- Structure (trend, EMAs slope/cross, HH/HL vs LH/LL), Momentum (MACD regime, RSI slope), Liquidity/volatility (ATR, volume), Positioning tilt (funding, OI).\n"
+            "- Structure (price vs SMA99, anchored AVWAP, Keltner location, opening-range acceptance/rejection), Liquidity/volatility (Keltner width), Positioning tilt (funding, OI).\n"
             "- Favor alignment across 4h and 5m. Counter-trend scalps require stronger intraday confirmation and tighter risk.\n\n"
             "Output contract\n"
             "- Output a STRICT JSON object with exactly two properties in this order:\n"
@@ -106,7 +109,7 @@ class TradingAgent:
             "  • trade_decisions: array ordered to match the provided assets list.\n"
             "- Each item REQUIRES {asset, action, rationale}.\n"
             "- For Hyperliquid (default venue) ALSO provide: allocation_usd, tp_price, sl_price, exit_plan.\n"
-            "- For Thalex options ALSO provide: venue='thalex', strategy, underlying, tenor_days, contracts, AND either (kind, target_strike) for single-leg OR legs[] for multi-leg spreads.\n"
+            "- For Thalex options ALSO provide: venue='thalex', strategy, underlying, tenor_days and either (contracts plus kind/target_strike) for single-leg trades OR legs[] for multi-leg trades.\n"
             "- Do not emit Markdown or any extra properties.\n"
         )
         user_prompt = context
@@ -180,13 +183,37 @@ class TradingAgent:
                                 "properties": {
                                     "asset": {"type": "string", "enum": assets_list},
                                     "action": {"type": "string", "enum": ["buy", "sell", "hold"]},
+                                    "venue": {"type": ["string", "null"], "enum": ["hyperliquid", "thalex", None]},
                                     "allocation_usd": {"type": "number"},
                                     "tp_price": {"type": ["number", "null"]},
                                     "sl_price": {"type": ["number", "null"]},
                                     "exit_plan": {"type": "string"},
+                                    "strategy": {
+                                        "type": ["string", "null"],
+                                        "enum": [
+                                            "credit_put_spread",
+                                            "credit_call_spread",
+                                            "iron_condor",
+                                            "long_call_delta_hedged",
+                                            "long_put_delta_hedged",
+                                            "vol_arb",
+                                            None,
+                                        ],
+                                    },
+                                    "underlying": {"type": ["string", "null"]},
+                                    "kind": {"type": ["string", "null"], "enum": ["call", "put", None]},
+                                    "tenor_days": {"type": ["integer", "null"]},
+                                    "target_strike": {"type": ["number", "null"]},
+                                    "target_delta": {"type": ["number", "null"]},
+                                    "contracts": {"type": ["number", "null"]},
+                                    "legs": {"type": ["array", "null"], "items": {"type": "object"}},
                                     "rationale": {"type": "string"},
                                 },
-                                "required": ["asset", "action", "allocation_usd", "tp_price", "sl_price", "exit_plan", "rationale"],
+                                "required": [
+                                    "asset", "action", "venue", "allocation_usd", "tp_price", "sl_price",
+                                    "exit_plan", "strategy", "underlying", "kind", "tenor_days",
+                                    "target_strike", "target_delta", "contracts", "legs", "rationale",
+                                ],
                                 "additionalProperties": False,
                             },
                             "minItems": 1,
@@ -269,10 +296,12 @@ class TradingAgent:
                 "strategy": {
                     "type": ["string", "null"],
                     "enum": [
-                        "credit_put",
-                        "credit_spread",
+                        "credit_put_spread",
+                        "credit_call_spread",
+                        "iron_condor",
                         "long_call_delta_hedged",
                         "long_put_delta_hedged",
+                        "vol_arb",
                         None,
                     ],
                 },

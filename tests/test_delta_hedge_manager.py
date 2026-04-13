@@ -1,23 +1,11 @@
-"""Tests for the DeltaHedgeManager: subscribe-on-open, rebalance-on-tick,
-unsubscribe-on-close lifecycle.
+"""Tests for the portfolio-driven DeltaHedgeManager."""
 
-These tests use fake adapters that record subscriptions, fire synthetic ticker
-notifications, and observe perp orders. No event-loop hacks needed — the
-manager's ``_on_ticker`` handler is awaited directly to simulate a single
-push from the receive loop."""
-
-import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import pytest
 
-from src.backend.trading.exchange_adapter import (
-    AccountState,
-    ExchangeAdapter,
-    OrderResult,
-    PositionSnapshot,
-)
 from src.backend.trading.delta_hedge_manager import DeltaHedgeManager
+from src.backend.trading.exchange_adapter import AccountState, ExchangeAdapter, OrderResult, PositionSnapshot
 from src.backend.trading.options_strategies import DeltaHedger
 
 
@@ -34,6 +22,8 @@ class FakeThalexForHedge(ExchangeAdapter):
         self.subscribed: list[str] = []
         self.unsubscribed: list[str] = []
         self.callbacks: dict[str, callable] = {}
+        self.positions: list[PositionSnapshot] = []
+        self.greeks_by_instrument: dict[str, dict] = {}
 
     async def subscribe_ticker(self, instrument_name, callback):
         self.subscribed.append(instrument_name)
@@ -43,21 +33,34 @@ class FakeThalexForHedge(ExchangeAdapter):
         self.unsubscribed.append(instrument_name)
         self.callbacks.pop(instrument_name, None)
 
-    # ExchangeAdapter abstract method stubs (unused in these tests)
+    def cache_greeks_snapshot(self, instrument_name, payload):
+        greeks = payload.get("greeks") or payload.get("greek") or payload.get("data") or payload
+        if isinstance(greeks, dict) and greeks.get("delta") is not None:
+            self.greeks_by_instrument[instrument_name] = {"delta": float(greeks["delta"])}
+
+    async def get_greeks(self, instrument_name):
+        return self.greeks_by_instrument.get(instrument_name, {})
+
     async def place_buy_order(self, asset, amount, slippage=0.01):
         return OrderResult(venue=self.venue, order_id="x", asset=asset, side="buy", amount=amount, status="ok")
+
     async def place_sell_order(self, asset, amount, slippage=0.01):
         return OrderResult(venue=self.venue, order_id="x", asset=asset, side="sell", amount=amount, status="ok")
+
     async def place_take_profit(self, asset, is_buy, amount, tp_price):
         return OrderResult(venue=self.venue, order_id="", asset=asset, side="tp", amount=amount, status="not_supported")
+
     async def place_stop_loss(self, asset, is_buy, amount, sl_price):
         return OrderResult(venue=self.venue, order_id="", asset=asset, side="sl", amount=amount, status="not_supported")
+
     async def cancel_order(self, asset, order_id): return {"status": "ok"}
     async def cancel_all_orders(self, asset): return {"status": "ok"}
     async def get_open_orders(self): return []
     async def get_recent_fills(self, limit=50): return []
+
     async def get_user_state(self):
-        return AccountState(venue=self.venue, balance=0.0, total_value=0.0, positions=[])
+        return AccountState(venue=self.venue, balance=0.0, total_value=0.0, positions=list(self.positions))
+
     async def get_current_price(self, asset): return 0.0
 
 
@@ -66,7 +69,7 @@ class FakeHyperliquidForHedge(ExchangeAdapter):
 
     def __init__(self, perp_size: float = 0.0):
         self.calls: list[_PerpOrder] = []
-        self.perp_size = perp_size  # signed: positive=long, negative=short
+        self.perp_size = perp_size
         self.btc_price = 60000.0
 
     async def place_buy_order(self, asset, amount, slippage=0.01):
@@ -81,8 +84,10 @@ class FakeHyperliquidForHedge(ExchangeAdapter):
 
     async def place_take_profit(self, asset, is_buy, amount, tp_price):
         return OrderResult(venue=self.venue, order_id="", asset=asset, side="tp", amount=amount, status="ok")
+
     async def place_stop_loss(self, asset, is_buy, amount, sl_price):
         return OrderResult(venue=self.venue, order_id="", asset=asset, side="sl", amount=amount, status="ok")
+
     async def cancel_order(self, asset, order_id): return {"status": "ok"}
     async def cancel_all_orders(self, asset): return {"status": "ok"}
     async def get_open_orders(self): return []
@@ -91,23 +96,34 @@ class FakeHyperliquidForHedge(ExchangeAdapter):
     async def get_user_state(self):
         positions = []
         if self.perp_size != 0:
-            positions.append(PositionSnapshot(
-                venue="hyperliquid",
-                asset="BTC",
-                side="long" if self.perp_size > 0 else "short",
-                size=abs(self.perp_size),
-                entry_price=self.btc_price,
-                current_price=self.btc_price,
-                unrealized_pnl=0.0,
-            ))
+            positions.append(
+                PositionSnapshot(
+                    venue="hyperliquid",
+                    asset="BTC",
+                    side="long" if self.perp_size > 0 else "short",
+                    size=abs(self.perp_size),
+                    entry_price=self.btc_price,
+                    current_price=self.btc_price,
+                    unrealized_pnl=0.0,
+                )
+            )
         return AccountState(venue="hyperliquid", balance=10000, total_value=10000, positions=positions)
 
     async def get_current_price(self, asset): return self.btc_price
 
 
-# ---------------------------------------------------------------------------
-# Lifecycle: add / remove
-# ---------------------------------------------------------------------------
+def _option_position(*, instrument_name: str, side: str = "long", size: float = 0.05, delta=None):
+    return PositionSnapshot(
+        venue="thalex",
+        asset="BTC",
+        instrument_name=instrument_name,
+        side=side,
+        size=size,
+        entry_price=1000.0,
+        current_price=1000.0,
+        unrealized_pnl=0.0,
+        delta=delta,
+    )
 
 
 @pytest.mark.asyncio
@@ -140,44 +156,47 @@ async def test_remove_position_unsubscribes():
     assert "BTC-10MAY26-65000-C" not in thalex.callbacks
 
 
-# ---------------------------------------------------------------------------
-# Rebalance triggers
-# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_reconcile_subscribes_live_positions_and_hedges_net_delta():
+    thalex = FakeThalexForHedge()
+    thalex.positions = [_option_position(instrument_name="BTC-10MAY26-65000-C", delta=0.5)]
+    hl = FakeHyperliquidForHedge(perp_size=0.0)
+    manager = DeltaHedgeManager(thalex=thalex, hyperliquid=hl, hedger=DeltaHedger(threshold=0.02))
+
+    await manager.reconcile()
+
+    assert thalex.subscribed == ["BTC-10MAY26-65000-C"]
+    assert len(hl.calls) == 1
+    assert hl.calls[0].side == "sell"
+    assert hl.calls[0].amount == pytest.approx(0.025)
 
 
 @pytest.mark.asyncio
 async def test_ticker_push_above_threshold_fires_perp_rebalance():
-    """A delta change that breaches 0.02 BTC drift must trigger a perp trade."""
     thalex = FakeThalexForHedge()
-    # Initial perp hedge: short 0.025 BTC (matching 0.05 contracts × 0.5 ATM delta)
+    thalex.positions = [_option_position(instrument_name="BTC-10MAY26-65000-C", delta=None)]
+    thalex.greeks_by_instrument["BTC-10MAY26-65000-C"] = {"delta": 0.5}
     hl = FakeHyperliquidForHedge(perp_size=-0.025)
     manager = DeltaHedgeManager(thalex=thalex, hyperliquid=hl, hedger=DeltaHedger(threshold=0.02))
 
-    await manager.add_position("BTC-10MAY26-65000-C", contracts=0.05, kind="call", underlying="BTC")
-
-    # Underlying rallied → option delta jumped from 0.5 to 0.8.
-    # Target perp = -contracts × delta = -0.05 × 0.8 = -0.04
-    # Drift = -0.04 - (-0.025) = -0.015 → still below threshold
-    # Push another tick where delta = 0.9 → target = -0.045, drift = -0.020 → at threshold (no fire)
-    # Push delta = 1.0 → target = -0.05, drift = -0.025 → breach
+    await manager.reconcile()
     callback = thalex.callbacks["BTC-10MAY26-65000-C"]
     await callback({"greeks": {"delta": 1.0}})
 
     assert len(hl.calls) == 1
-    assert hl.calls[0].side == "sell"  # need MORE short to match deeper delta
+    assert hl.calls[0].side == "sell"
     assert hl.calls[0].amount == pytest.approx(0.025)
 
 
 @pytest.mark.asyncio
 async def test_ticker_push_below_threshold_is_a_noop():
-    """A small delta wiggle (< 0.02 BTC) must NOT trigger a perp trade."""
     thalex = FakeThalexForHedge()
+    thalex.positions = [_option_position(instrument_name="BTC-10MAY26-65000-C", delta=None)]
+    thalex.greeks_by_instrument["BTC-10MAY26-65000-C"] = {"delta": 0.5}
     hl = FakeHyperliquidForHedge(perp_size=-0.025)
     manager = DeltaHedgeManager(thalex=thalex, hyperliquid=hl, hedger=DeltaHedger(threshold=0.02))
 
-    await manager.add_position("BTC-10MAY26-65000-C", contracts=0.05, kind="call", underlying="BTC")
-
-    # delta moved from 0.5 to 0.6 → target = -0.03, drift = -0.005 → below threshold
+    await manager.reconcile()
     callback = thalex.callbacks["BTC-10MAY26-65000-C"]
     await callback({"greeks": {"delta": 0.6}})
 
@@ -186,34 +205,123 @@ async def test_ticker_push_below_threshold_is_a_noop():
 
 @pytest.mark.asyncio
 async def test_pullback_unwinds_excess_hedge():
-    """After a delta surge fires a rebalance, a delta reversion must close the excess."""
     thalex = FakeThalexForHedge()
+    thalex.positions = [_option_position(instrument_name="BTC-10MAY26-65000-C", delta=None)]
+    thalex.greeks_by_instrument["BTC-10MAY26-65000-C"] = {"delta": 0.5}
     hl = FakeHyperliquidForHedge(perp_size=-0.025)
     manager = DeltaHedgeManager(thalex=thalex, hyperliquid=hl, hedger=DeltaHedger(threshold=0.02))
 
-    await manager.add_position("BTC-10MAY26-65000-C", contracts=0.05, kind="call", underlying="BTC")
+    await manager.reconcile()
     callback = thalex.callbacks["BTC-10MAY26-65000-C"]
 
-    # Surge: delta → 1.0, fire short to bring perp from -0.025 to -0.05
     await callback({"greeks": {"delta": 1.0}})
     assert hl.perp_size == pytest.approx(-0.05)
 
-    # Reversion: delta → 0.5, target = -0.025, drift = +0.025 → fire BUY 0.025
     await callback({"greeks": {"delta": 0.5}})
     assert len(hl.calls) == 2
     assert hl.calls[1].side == "buy"
     assert hl.calls[1].amount == pytest.approx(0.025)
-    # Net: shorted 0.025 high, bought 0.025 low — pullback captured.
     assert hl.perp_size == pytest.approx(-0.025)
 
 
 @pytest.mark.asyncio
+async def test_spread_rebalances_only_residual_net_delta():
+    thalex = FakeThalexForHedge()
+    thalex.positions = [
+        _option_position(instrument_name="BTC-10MAY26-65000-C", side="long", size=0.1, delta=0.6),
+        _option_position(instrument_name="BTC-10MAY26-70000-C", side="short", size=0.05, delta=0.4),
+    ]
+    hl = FakeHyperliquidForHedge(perp_size=0.0)
+    manager = DeltaHedgeManager(thalex=thalex, hyperliquid=hl, hedger=DeltaHedger(threshold=0.02))
+
+    await manager.reconcile()
+
+    assert set(thalex.subscribed) == {"BTC-10MAY26-65000-C", "BTC-10MAY26-70000-C"}
+    assert len(hl.calls) == 1
+    assert hl.calls[0].side == "sell"
+    assert hl.calls[0].amount == pytest.approx(0.04)
+
+
+@pytest.mark.asyncio
+async def test_multi_tenor_book_subscribes_all_legs_and_hedges_once_net():
+    thalex = FakeThalexForHedge()
+    thalex.positions = [
+        _option_position(instrument_name="BTC-17APR26-60000-C", delta=0.5),
+        _option_position(instrument_name="BTC-24APR26-60000-C", delta=0.4),
+        _option_position(instrument_name="BTC-10MAY26-60000-C", delta=0.3),
+        _option_position(instrument_name="BTC-09JUN26-60000-C", delta=0.2),
+    ]
+    hl = FakeHyperliquidForHedge(perp_size=0.0)
+    manager = DeltaHedgeManager(thalex=thalex, hyperliquid=hl, hedger=DeltaHedger(threshold=0.02))
+
+    await manager.reconcile()
+
+    assert set(thalex.subscribed) == {
+        "BTC-17APR26-60000-C",
+        "BTC-24APR26-60000-C",
+        "BTC-10MAY26-60000-C",
+        "BTC-09JUN26-60000-C",
+    }
+    assert len(hl.calls) == 1
+    assert hl.calls[0].side == "sell"
+    assert hl.calls[0].amount == pytest.approx(0.07)
+
+
+@pytest.mark.asyncio
+async def test_missing_greeks_degrades_underlying_and_skips_rebalance():
+    thalex = FakeThalexForHedge()
+    thalex.positions = [_option_position(instrument_name="BTC-10MAY26-65000-C", delta=None)]
+    hl = FakeHyperliquidForHedge(perp_size=0.0)
+    manager = DeltaHedgeManager(thalex=thalex, hyperliquid=hl, hedger=DeltaHedger(threshold=0.02))
+
+    await manager.reconcile()
+
+    assert hl.calls == []
+    assert "BTC" in manager.degraded_underlyings
+
+
+@pytest.mark.asyncio
+async def test_status_snapshot_exposes_underlying_metrics():
+    thalex = FakeThalexForHedge()
+    thalex.positions = [_option_position(instrument_name="BTC-10MAY26-65000-C", delta=0.5)]
+    hl = FakeHyperliquidForHedge(perp_size=0.0)
+    manager = DeltaHedgeManager(thalex=thalex, hyperliquid=hl, hedger=DeltaHedger(threshold=0.02))
+
+    await manager.reconcile()
+    snapshot = manager.get_status_snapshot()
+
+    assert snapshot["health"] == "healthy"
+    assert snapshot["tracked_underlyings"] == 1
+    assert snapshot["metrics"][0]["underlying"] == "BTC"
+    assert snapshot["metrics"][0]["target_perp_delta"] == pytest.approx(-0.025)
+    assert snapshot["metrics"][0]["current_perp_delta"] == pytest.approx(-0.025)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_unsubscribes_closed_positions_and_flattens_hedge():
+    thalex = FakeThalexForHedge()
+    thalex.positions = [_option_position(instrument_name="BTC-10MAY26-65000-C", delta=0.5)]
+    hl = FakeHyperliquidForHedge(perp_size=0.0)
+    manager = DeltaHedgeManager(thalex=thalex, hyperliquid=hl, hedger=DeltaHedger(threshold=0.02))
+
+    await manager.reconcile()
+    assert hl.perp_size == pytest.approx(-0.025)
+
+    thalex.positions = []
+    await manager.reconcile()
+
+    assert "BTC-10MAY26-65000-C" in thalex.unsubscribed
+    assert len(hl.calls) == 2
+    assert hl.calls[1].side == "buy"
+    assert hl.calls[1].amount == pytest.approx(0.025)
+
+
+@pytest.mark.asyncio
 async def test_callback_for_unknown_instrument_is_ignored():
-    """Manager must not crash if a stale notification arrives for a removed position."""
     thalex = FakeThalexForHedge()
     hl = FakeHyperliquidForHedge()
     manager = DeltaHedgeManager(thalex=thalex, hyperliquid=hl, hedger=DeltaHedger())
 
-    # Direct invocation of _on_ticker with no registered position
     await manager._on_ticker("BTC-NONEXISTENT", {"greeks": {"delta": 0.5}})
+
     assert hl.calls == []
