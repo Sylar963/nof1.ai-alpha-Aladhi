@@ -20,11 +20,8 @@ class BotService:
     def __init__(self):
         self.bot_engine: Optional[TradingBotEngine] = None
         self.state_manager = None  # Set externally after creation
-        self.equity_history: List[Dict] = []
-        self.recent_events: List[Dict] = []
-        self._last_hedge_health: Optional[str] = None
-        self._last_degraded_underlyings: Dict[str, str] = {}
         self.logger = logging.getLogger(__name__)
+        self._reset_session_trackers()
 
         # Configuration
         self.config = {
@@ -82,6 +79,8 @@ class BotService:
                 on_error=self._on_error
             )
 
+            self._reset_session_trackers()
+
             # Start the bot
             await self.bot_engine.start()
 
@@ -90,6 +89,13 @@ class BotService:
         except Exception as e:
             self.logger.error(f"Failed to start bot: {e}", exc_info=True)
             raise
+
+    def _reset_session_trackers(self):
+        """Clear per-run GUI state so a fresh session starts cleanly."""
+        self.equity_history = []
+        self.recent_events = []
+        self._last_hedge_health = None
+        self._last_degraded_underlyings = {}
 
     async def stop(self):
         """Stop the trading bot"""

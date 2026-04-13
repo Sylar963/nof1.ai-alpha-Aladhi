@@ -145,3 +145,54 @@ def test_bot_service_emits_hedge_degraded_and_recovered_events():
     assert any("Delta hedge health degraded" in message for message in messages)
     assert any("Hedge degraded for BTC" in message for message in messages)
     assert any("Hedge recovered for BTC" in message for message in messages)
+
+
+@pytest.mark.asyncio
+async def test_bot_service_start_resets_session_trackers(monkeypatch):
+    from src.gui.services import bot_service as bot_service_module
+
+    class FakeEngine:
+        def __init__(self, assets, interval, on_state_update, on_trade_executed, on_error):
+            self.assets = assets
+            self.interval = interval
+            self.on_state_update = on_state_update
+            self.on_trade_executed = on_trade_executed
+            self.on_error = on_error
+            self.is_running = False
+
+        async def start(self):
+            self.is_running = True
+
+    service = BotService()
+    service.equity_history = [{"time": "old", "value": 1.0}]
+    service.recent_events = [{"time": "old", "message": "stale", "level": "info"}]
+    service._last_hedge_health = "degraded"
+    service._last_degraded_underlyings = {"BTC": "missing live delta"}
+
+    monkeypatch.setitem(bot_service_module.CONFIG, "taapi_api_key", "taapi")
+    monkeypatch.setitem(bot_service_module.CONFIG, "openrouter_api_key", "openrouter")
+    monkeypatch.setitem(bot_service_module.CONFIG, "hyperliquid_private_key", "secret")
+    monkeypatch.setitem(bot_service_module.CONFIG, "mnemonic", None)
+    monkeypatch.setitem(bot_service_module.CONFIG, "thalex_key_id", None)
+    monkeypatch.setitem(bot_service_module.CONFIG, "thalex_private_key_path", None)
+    monkeypatch.setattr(bot_service_module, "TradingBotEngine", FakeEngine)
+
+    await service.start(assets=["BTC"], interval="5m")
+
+    assert service.equity_history == []
+    assert service.recent_events == []
+    assert service._last_hedge_health is None
+    assert service._last_degraded_underlyings == {}
+
+
+def test_handle_execution_failure_emits_error_callback():
+    errors = []
+    engine = TradingBotEngine.__new__(TradingBotEngine)
+    engine.logger = SimpleNamespace(error=lambda *a, **k: None)
+    engine.state = SimpleNamespace(error=None)
+    engine.on_error = errors.append
+
+    TradingBotEngine._handle_execution_failure(engine, "Thalex", "BTC", "risk cap")
+
+    assert engine.state.error == "Thalex execution failed for BTC: risk cap"
+    assert errors == ["Thalex execution failed for BTC: risk cap"]

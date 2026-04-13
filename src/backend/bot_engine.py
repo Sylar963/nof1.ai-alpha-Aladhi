@@ -281,6 +281,14 @@ class TradingBotEngine:
             self.logger.warning("Thalex decision rejected: %s", result.reason)
             return False, result.reason
 
+    def _handle_execution_failure(self, venue: str, asset: str, reason: str) -> None:
+        """Propagate an execution failure through the bot's normal error path."""
+        message = f"{venue} execution failed for {asset}: {reason or 'unknown reason'}"
+        self.logger.error(message)
+        self.state.error = message
+        if self.on_error:
+            self.on_error(message)
+
     async def start(self):
         """Start the trading bot"""
         if self.is_running:
@@ -731,10 +739,20 @@ class TradingBotEngine:
                             oi = await self.hyperliquid.get_open_interest(asset)
                             funding = await self.hyperliquid.get_funding_rate(asset)
 
-                            # Fetch all indicators using bulk endpoint (2 requests instead of 10)
-                            # Note: fetch_asset_indicators() already includes 15s delay between 5m and interval requests
-                            # Uses caching to avoid redundant API calls
-                            indicators = self.taapi.fetch_asset_indicators(asset, current_spot=current_price)
+                            # Fetch the curated TAAPI bundle off the event loop so
+                            # sync requests + pacing do not stall hedge audits or shutdown.
+                            loop = asyncio.get_running_loop()
+
+                            def _pause_for_taapi_rate_limit() -> None:
+                                future = asyncio.run_coroutine_threadsafe(asyncio.sleep(15), loop)
+                                future.result()
+
+                            indicators = await asyncio.to_thread(
+                                self.taapi.fetch_asset_indicators,
+                                asset,
+                                current_spot=current_price,
+                                request_pause=_pause_for_taapi_rate_limit,
+                            )
                             
                             # Add delay between assets to respect TAAPI rate limit (1 req/15s)
                             # Only wait if this is not the last asset
@@ -903,7 +921,9 @@ class TradingBotEngine:
                                 except Exception as exc:  # pylint: disable=broad-except
                                     self.logger.error("Error creating Thalex proposal for %s: %s", asset, exc)
                                 continue
-                            await self._execute_thalex_decision(decision)
+                            ok, reason = await self._execute_thalex_decision(decision)
+                            if not ok:
+                                self._handle_execution_failure("Thalex", asset, reason)
                             continue
 
                         action = decision.get('action')

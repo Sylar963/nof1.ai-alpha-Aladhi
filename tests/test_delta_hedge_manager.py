@@ -24,6 +24,7 @@ class FakeThalexForHedge(ExchangeAdapter):
         self.callbacks: dict[str, callable] = {}
         self.positions: list[PositionSnapshot] = []
         self.greeks_by_instrument: dict[str, dict] = {}
+        self.fail_user_state = False
 
     async def subscribe_ticker(self, instrument_name, callback):
         self.subscribed.append(instrument_name)
@@ -59,6 +60,8 @@ class FakeThalexForHedge(ExchangeAdapter):
     async def get_recent_fills(self, limit=50): return []
 
     async def get_user_state(self):
+        if self.fail_user_state:
+            raise RuntimeError("temporary thalex outage")
         return AccountState(venue=self.venue, balance=0.0, total_value=0.0, positions=list(self.positions))
 
     async def get_current_price(self, asset): return 0.0
@@ -314,6 +317,24 @@ async def test_reconcile_unsubscribes_closed_positions_and_flattens_hedge():
     assert len(hl.calls) == 2
     assert hl.calls[1].side == "buy"
     assert hl.calls[1].amount == pytest.approx(0.025)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_keeps_subscriptions_and_hedge_when_position_state_is_unknown():
+    thalex = FakeThalexForHedge()
+    thalex.positions = [_option_position(instrument_name="BTC-10MAY26-65000-C", delta=0.5)]
+    hl = FakeHyperliquidForHedge(perp_size=0.0)
+    manager = DeltaHedgeManager(thalex=thalex, hyperliquid=hl, hedger=DeltaHedger(threshold=0.02))
+
+    await manager.reconcile()
+    assert hl.perp_size == pytest.approx(-0.025)
+
+    thalex.fail_user_state = True
+    await manager.reconcile()
+
+    assert thalex.unsubscribed == []
+    assert hl.perp_size == pytest.approx(-0.025)
+    assert len(hl.calls) == 1
 
 
 @pytest.mark.asyncio

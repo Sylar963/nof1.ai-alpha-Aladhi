@@ -213,6 +213,10 @@ def create_market(bot_service: BotService, state_manager: StateManager):
         """Update market data and indicators from real bot data"""
         state = state_manager.get_state()
         selected_asset = asset_select.value
+        selected_interval = str(interval_select.value or '5m')
+        valid_intervals = {'1m', '5m', '15m', '1h', '4h', '1d'}
+        if selected_interval not in valid_intervals:
+            selected_interval = '5m'
         hedge_metric = next(
             (m for m in (getattr(state, 'hedge_metrics', []) or []) if m.get('underlying') == selected_asset),
             None,
@@ -240,6 +244,10 @@ def create_market(bot_service: BotService, state_manager: StateManager):
             open_interest_label.set_text('--')
             hedge_status_label.set_text('NO DATA')
             hedge_status_desc.set_text('Waiting for market and hedge data from bot...')
+            hedge_target_label.set_text('Target: --')
+            hedge_current_label.set_text('Current: --')
+            hedge_residual_label.set_text('Residual: --')
+            hedge_last_label.set_text('Last rebalance: --')
             return
 
         # Update price cards with real data
@@ -259,23 +267,35 @@ def create_market(bot_service: BotService, state_manager: StateManager):
         
         volume_24h_label.set_text('--')  # Not available in current data
         
-        # Update indicators - use 5m data from market_data
-        intraday = market_data.get('intraday', {})
-        long_term = market_data.get('long_term', {})
+        # Update indicators from the selected interval, with the alternate
+        # cadence as a fallback when a metric only exists on one payload.
+        intraday = market_data.get('intraday') or {}
+        long_term = market_data.get('long_term') or {}
+        long_term_interval = str(long_term.get('interval') or '4h')
+
+        if selected_interval in {'1m', '5m', '15m'}:
+            selected_frame = intraday
+            alternate_frame = long_term
+        elif selected_interval == long_term_interval or selected_interval in {'1h', '4h', '1d'}:
+            selected_frame = long_term or intraday
+            alternate_frame = intraday
+        else:
+            selected_frame = intraday
+            alternate_frame = long_term
+
+        sma99_selected = selected_frame.get('sma99')
+        sma99_alt = alternate_frame.get('sma99')
+        avwap = selected_frame.get('avwap') or alternate_frame.get('avwap')
+        opening_range = selected_frame.get('opening_range') or intraday.get('opening_range', {})
+        keltner = selected_frame.get('keltner') or alternate_frame.get('keltner', {})
         
-        sma99_5m = intraday.get('sma99')
-        sma99_lt = long_term.get('sma99')
-        avwap = intraday.get('avwap') or long_term.get('avwap')
-        opening_range = intraday.get('opening_range', {})
-        keltner = intraday.get('keltner', {})
-        
-        if sma99_5m:
-            ema20_label.set_text(f'${sma99_5m:,.2f}')
+        if sma99_selected:
+            ema20_label.set_text(f'${sma99_selected:,.2f}')
         else:
             ema20_label.set_text('--')
         
-        if sma99_lt:
-            ema50_label.set_text(f'${sma99_lt:,.2f}')
+        if sma99_alt:
+            ema50_label.set_text(f'${sma99_alt:,.2f}')
         else:
             ema50_label.set_text('--')
         
@@ -310,14 +330,14 @@ def create_market(bot_service: BotService, state_manager: StateManager):
         
         # Update sentiment based on indicators
         opening_range_position = opening_range.get('position')
-        if sma99_5m and avwap and current_price:
-            if current_price > sma99_5m and current_price > avwap and opening_range_position == 'above':
+        if sma99_selected and avwap and current_price:
+            if current_price > sma99_selected and current_price > avwap and opening_range_position == 'above':
                 sentiment_label.set_text('BULLISH')
                 sentiment_label.classes('text-3xl font-bold text-green-400')
                 sentiment_desc.set_text('Price above SMA99 and AVWAP, holding above opening range')
                 trend_icon.set_text('●')
                 trend_icon.classes('text-2xl text-green-400')
-            elif current_price < sma99_5m and current_price < avwap and opening_range_position == 'below':
+            elif current_price < sma99_selected and current_price < avwap and opening_range_position == 'below':
                 sentiment_label.set_text('BEARISH')
                 sentiment_label.classes('text-3xl font-bold text-red-400')
                 sentiment_desc.set_text('Price below SMA99 and AVWAP, holding below opening range')

@@ -215,14 +215,44 @@ class OptionsExecutor:
         hedge_size = abs(contracts * delta_per_contract)
         hl_orders = []
         if hedge_size > 0:
-            if (decision.kind or "call") == "call":
-                # long call ⇒ positive delta ⇒ hedge by SHORTING perp
-                hl_orders.append(await self.hyperliquid.place_sell_order(decision.underlying or "BTC", hedge_size))
-            else:
-                # long put ⇒ negative delta ⇒ hedge by going LONG perp
-                hl_orders.append(await self.hyperliquid.place_buy_order(decision.underlying or "BTC", hedge_size))
+            hedge_asset = decision.underlying or "BTC"
+            try:
+                if (decision.kind or "call") == "call":
+                    # long call ⇒ positive delta ⇒ hedge by SHORTING perp
+                    hl_orders.append(
+                        await _retry_async(
+                            lambda: self.hyperliquid.place_sell_order(hedge_asset, hedge_size),
+                            description=f"hyperliquid sell {hedge_asset} hedge",
+                        )
+                    )
+                else:
+                    # long put ⇒ negative delta ⇒ hedge by going LONG perp
+                    hl_orders.append(
+                        await _retry_async(
+                            lambda: self.hyperliquid.place_buy_order(hedge_asset, hedge_size),
+                            description=f"hyperliquid buy {hedge_asset} hedge",
+                        )
+                    )
+            except Exception as exc:  # pylint: disable=broad-except
+                await self._unwind_single_delta_hedged_leg(instrument_name, contracts)
+                return ExecutionResult(
+                    ok=False,
+                    reason=f"hyperliquid hedge failed for {hedge_asset}: {exc}",
+                )
 
         return ExecutionResult(ok=True, thalex_orders=[thalex_order], hyperliquid_orders=hl_orders)
+
+    async def _unwind_single_delta_hedged_leg(self, instrument_name: str, contracts: float) -> None:
+        """Best-effort rollback when the Thalex leg lands but the perp hedge fails."""
+        try:
+            await self.thalex.place_sell_order(instrument_name, contracts)
+            logger.info("unwind: closed single-leg Thalex position %s (%.4f contracts)", instrument_name, contracts)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning(
+                "unwind: thalex sell %s failed: %s — manual intervention may be needed",
+                instrument_name,
+                exc,
+            )
 
     async def _execute_delta_hedged_multi_tenor(
         self,

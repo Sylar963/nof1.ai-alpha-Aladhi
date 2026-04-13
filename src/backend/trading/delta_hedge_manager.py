@@ -57,6 +57,7 @@ class DeltaHedgeManager:
         self._underlying_locks: dict[str, asyncio.Lock] = {}
         self.degraded_underlyings: dict[str, str] = {}
         self._metrics_by_underlying: dict[str, dict[str, Any]] = {}
+        self._last_known_positions: dict[str, list[_OptionPosition]] = {}
 
     async def add_position(
         self,
@@ -89,6 +90,32 @@ class DeltaHedgeManager:
             await self._drop_subscription(instrument_name)
         self.degraded_underlyings.clear()
         self._metrics_by_underlying.clear()
+        self._last_known_positions.clear()
+
+    def _cache_positions(
+        self,
+        positions: list[_OptionPosition],
+        underlying: Optional[str] = None,
+    ) -> None:
+        if underlying is None:
+            grouped: dict[str, list[_OptionPosition]] = {}
+            for position in positions:
+                grouped.setdefault(position.underlying, []).append(position)
+            self._last_known_positions = grouped
+            return
+
+        key = underlying.upper()
+        self._last_known_positions[key] = [
+            position for position in positions if position.underlying == key
+        ]
+
+    def _cached_positions(self, underlying: Optional[str] = None) -> list[_OptionPosition]:
+        if underlying is None:
+            cached: list[_OptionPosition] = []
+            for bucket in self._last_known_positions.values():
+                cached.extend(bucket)
+            return cached
+        return list(self._last_known_positions.get(underlying.upper(), []))
 
     def get_status_snapshot(self) -> dict[str, Any]:
         """Return a UI-friendly snapshot of hedge health and metrics."""
@@ -122,20 +149,29 @@ class DeltaHedgeManager:
                 if underlying is None or name_underlying == underlying
             }
             positions = await self._load_option_positions(underlying=underlying)
-            await self._sync_subscriptions(positions, underlying=underlying)
+            live_state_known = positions is not None
+            if live_state_known:
+                self._cache_positions(positions, underlying=underlying)
+                await self._sync_subscriptions(positions, underlying=underlying)
+            else:
+                positions = self._cached_positions(underlying=underlying)
+                if not positions:
+                    logger.warning(
+                        "delta hedge reconcile: skipping %s because Thalex position state is unknown",
+                        underlying.upper() if underlying is not None else "all underlyings",
+                    )
+                    return []
 
             tracked_underlyings_after = {
                 name_underlying
                 for _, name_underlying in self._subscribed_instruments.items()
                 if underlying is None or name_underlying == underlying
             }
-            target_underlyings = (
-                tracked_underlyings_before
-                | tracked_underlyings_after
-                | {pos.underlying for pos in positions}
-            )
-            if underlying is not None:
-                target_underlyings.add(underlying)
+            target_underlyings = {pos.underlying for pos in positions}
+            if live_state_known:
+                target_underlyings |= tracked_underlyings_before | tracked_underlyings_after
+                if underlying is not None:
+                    target_underlyings.add(underlying)
 
             orders: list[OrderResult] = []
             for underlying_name in sorted(target_underlyings):
@@ -143,12 +179,15 @@ class DeltaHedgeManager:
                 orders.extend(await self._rebalance_underlying(underlying_name, bucket))
             return orders
 
-    async def _load_option_positions(self, underlying: Optional[str] = None) -> list[_OptionPosition]:
+    async def _load_option_positions(
+        self,
+        underlying: Optional[str] = None,
+    ) -> Optional[list[_OptionPosition]]:
         try:
             state = await self.thalex.get_user_state()
         except Exception as exc:  # pylint: disable=broad-except
-            logger.error("delta hedge reconcile: thalex get_user_state failed: %s", exc)
-            return []
+            logger.warning("delta hedge reconcile: thalex get_user_state failed: %s", exc)
+            return None
 
         raw_positions = []
         if isinstance(state, dict):

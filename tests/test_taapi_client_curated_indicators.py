@@ -39,6 +39,7 @@ def test_fetch_asset_indicators_returns_curated_bundle(monkeypatch):
     monkeypatch.setitem(config_loader.CONFIG, "interval", "4h")
     client = TAAPIClient(enable_cache=False)
     monkeypatch.setattr("src.backend.indicators.taapi_client.time.sleep", lambda _: None)
+    pauses = []
 
     def _fake_bulk(symbol, interval, indicators_config):
         if interval == "5m":
@@ -76,7 +77,11 @@ def test_fetch_asset_indicators_returns_curated_bundle(monkeypatch):
         ),
     )
 
-    result = client.fetch_asset_indicators("BTC", current_spot=60050.0)
+    result = client.fetch_asset_indicators(
+        "BTC",
+        current_spot=60050.0,
+        request_pause=lambda: pauses.append("wait"),
+    )
 
     assert result["5m"]["sma99"][-1] == 60020.0
     assert result["5m"]["avwap"] == 59250.0
@@ -88,3 +93,4 @@ def test_fetch_asset_indicators_returns_curated_bundle(monkeypatch):
     }
     assert result["4h"]["sma99"][-1] == 59200.0
     assert result["4h"]["avwap"] == 59250.0
+    assert pauses == ["wait", "wait", "wait"]

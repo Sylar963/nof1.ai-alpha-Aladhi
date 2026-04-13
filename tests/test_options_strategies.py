@@ -258,6 +258,37 @@ async def test_delta_hedged_execution_refuses_guessed_atm_delta():
 
 
 @pytest.mark.asyncio
+async def test_single_tenor_unwinds_thalex_leg_when_perp_hedge_fails():
+    thalex = FakeThalex()
+    hl = FakeHyperliquid()
+    executor = OptionsExecutor(thalex=thalex, hyperliquid=hl)
+    thalex.delta_per_position["BTC-10MAY26-65000-C"] = 0.5
+
+    async def _failing_sell(asset, amount, slippage=0.01):
+        raise RuntimeError("hyperliquid unavailable")
+
+    hl.place_sell_order = _failing_sell
+
+    decision = parse_decision({
+        "venue": "thalex",
+        "asset": "BTC",
+        "action": "buy",
+        "strategy": "long_call_delta_hedged",
+        "underlying": "BTC",
+        "kind": "call",
+        "tenor_days": 30,
+        "target_strike": 65000,
+        "contracts": 0.05,
+        "rationale": "vol cheap",
+    })
+    result = await executor.execute(decision, open_positions_count=0)
+
+    assert result.ok is False
+    assert "hyperliquid hedge failed for BTC" in result.reason
+    assert [call.method for call in thalex.calls] == ["buy", "sell"]
+
+
+@pytest.mark.asyncio
 async def test_long_call_with_target_gamma_btc_distributes_across_default_tenors():
     """When target_gamma_btc is set on a long_call_delta_hedged decision,
     the executor must expand it into multiple Thalex legs across the default

@@ -32,6 +32,15 @@ def _get_int(name: str, default: int | None = None) -> int | None:
         raise RuntimeError(f"Invalid integer for {name}: {raw}") from exc
 
 
+def _require_positive(name: str, value: float | int | None) -> float | int | None:
+    """Fail fast when a config value must be strictly positive."""
+    if value is None:
+        return value
+    if value <= 0:
+        raise ValueError(f"Config value '{name}' must be > 0, got {value}")
+    return value
+
+
 def _get_json(name: str, default: dict | None = None) -> dict | None:
     raw = os.getenv(name)
     if raw is None or raw.strip() == "":
@@ -96,11 +105,15 @@ CONFIG = {
     ),
     # BTC delta drift (signed) before the perp hedge re-trades. Threshold-only —
     # the loop polls for free, only fires a perp order when |drift| > this.
-    "thalex_delta_threshold": float(_get_env("THALEX_DELTA_THRESHOLD", "0.02") or 0.02),
+    "thalex_delta_threshold": _require_positive(
+        "thalex_delta_threshold",
+        float(_get_env("THALEX_DELTA_THRESHOLD", "0.02") or 0.02),
+    ),
     # Slow safety poll that reconciles the live options book against the live
     # Hyperliquid hedge even if ticker pushes were missed.
-    "thalex_hedge_reconcile_interval_seconds": _get_int(
-        "THALEX_HEDGE_RECONCILE_INTERVAL_SECONDS", 15
+    "thalex_hedge_reconcile_interval_seconds": _require_positive(
+        "thalex_hedge_reconcile_interval_seconds",
+        _get_int("THALEX_HEDGE_RECONCILE_INTERVAL_SECONDS", 15),
     ),
     # LLM via OpenRouter
     "openrouter_api_key": _get_env("OPENROUTER_API_KEY"),

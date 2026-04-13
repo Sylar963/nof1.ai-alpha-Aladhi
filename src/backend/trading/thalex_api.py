@@ -61,6 +61,8 @@ _GREEKS_FIELD_PATHS: tuple[tuple[str, ...], ...] = (
 )
 _GREEKS_KEYS: tuple[str, ...] = ("delta", "gamma", "vega", "theta", "mark_iv")
 _GREEKS_TTL_SECONDS: float = 5.0
+_RETRY_MAX_ATTEMPTS: int = 3
+_RETRY_BACKOFF_BASE_SECONDS: float = 0.5
 
 
 def _parse_underlyings(raw: str) -> list[str]:
@@ -391,6 +393,36 @@ class ThalexAPI(ExchangeAdapter):
             raise
         return await asyncio.wait_for(fut, timeout=15.0)
 
+    async def _request_with_retry(
+        self,
+        sender,
+        *,
+        max_attempts: int = _RETRY_MAX_ATTEMPTS,
+        backoff_base: float = _RETRY_BACKOFF_BASE_SECONDS,
+        description: str = "Thalex request",
+        **kwargs,
+    ):
+        last_exc: Optional[BaseException] = None
+        for attempt in range(max_attempts):
+            try:
+                return await self._request(sender, **kwargs)
+            except Exception as exc:  # pylint: disable=broad-except
+                last_exc = exc
+                if attempt < max_attempts - 1:
+                    logger.warning(
+                        "%s failed (attempt %d/%d): %s — retrying",
+                        description,
+                        attempt + 1,
+                        max_attempts,
+                        exc,
+                    )
+                    await asyncio.sleep(backoff_base * (2 ** attempt))
+                else:
+                    logger.error("%s failed after %d attempts: %s", description, max_attempts, exc)
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError(f"{description} retry exited without result or exception")
+
     async def _refresh_instruments_cache(self) -> None:
         try:
             result = await self._request(self._client.instruments)
@@ -406,9 +438,13 @@ class ThalexAPI(ExchangeAdapter):
         for instrument_name in list(self._ticker_subscribers):
             channel = f"ticker.{instrument_name}.raw"
             try:
-                await self._request(self._client.public_subscribe, channels=[channel])
+                await self._request_with_retry(
+                    self._client.public_subscribe,
+                    channels=[channel],
+                    description=f"restore Thalex subscription {channel}",
+                )
             except Exception as exc:  # pylint: disable=broad-except
-                logger.warning("Failed to restore Thalex subscription %s: %s", channel, exc)
+                logger.error("Failed to restore Thalex subscription %s: %s", channel, exc)
 
     # ------------------------------------------------------------------
     # Intent → instrument resolution
