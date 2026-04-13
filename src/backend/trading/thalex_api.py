@@ -253,6 +253,7 @@ class ThalexAPI(ExchangeAdapter):
             logger.info("Thalex connected on %s", self.network_name)
 
             await self._refresh_instruments_cache()
+            await self._resubscribe_tickers()
 
     async def disconnect(self) -> None:
         """Tear down the receive loop and close the WebSocket."""
@@ -332,6 +333,7 @@ class ThalexAPI(ExchangeAdapter):
             payload = params.get("notification")
             instrument_name = _instrument_from_channel(channel)
             if instrument_name and instrument_name in self._ticker_subscribers:
+                self.cache_greeks_snapshot(instrument_name, payload)
                 callback = self._ticker_subscribers[instrument_name]
                 try:
                     asyncio.get_running_loop().create_task(callback(payload))
@@ -396,6 +398,17 @@ class ThalexAPI(ExchangeAdapter):
                 self._instruments_cache = result
         except Exception as exc:  # pylint: disable=broad-except
             logger.warning("Failed to refresh Thalex instruments cache: %s", exc)
+
+    async def _resubscribe_tickers(self) -> None:
+        """Restore ticker subscriptions after a reconnect."""
+        if self._client is None or not self._ticker_subscribers:
+            return
+        for instrument_name in list(self._ticker_subscribers):
+            channel = f"ticker.{instrument_name}.raw"
+            try:
+                await self._request(self._client.public_subscribe, channels=[channel])
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.warning("Failed to restore Thalex subscription %s: %s", channel, exc)
 
     # ------------------------------------------------------------------
     # Intent → instrument resolution
@@ -560,6 +573,13 @@ class ThalexAPI(ExchangeAdapter):
         result = await self._request(self._client.ticker, instrument_name=instrument_name)
         parsed = _extract_greeks(result)
         self._greeks_cache[instrument_name] = (now, parsed)
+        return parsed
+
+    def cache_greeks_snapshot(self, instrument_name: str, payload: Any) -> dict:
+        """Seed the short-lived greeks cache from a subscription payload."""
+        parsed = _extract_greeks(payload)
+        if parsed:
+            self._greeks_cache[instrument_name] = (time.monotonic(), parsed)
         return parsed
 
     # ------------------------------------------------------------------

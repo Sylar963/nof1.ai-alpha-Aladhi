@@ -13,8 +13,8 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
 
     ui.label('Dashboard').classes('text-3xl font-bold mb-4 text-white')
 
-    # ===== METRICS CARDS (4 cards in grid) =====
-    with ui.grid(columns=4).classes('w-full gap-4 mb-6'):
+    # ===== METRICS CARDS =====
+    with ui.grid(columns=5).classes('w-full gap-4 mb-6'):
         # Card 1: Total Balance
         with ui.card().classes('metric-card'):
             balance_value = ui.label('$0.00').classes('text-4xl font-bold text-white')
@@ -34,6 +34,11 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
         with ui.card().classes('metric-card'):
             positions_value = ui.label('0').classes('text-4xl font-bold text-white')
             ui.label('Active Positions').classes('text-sm text-gray-200 mt-2')
+
+        # Card 5: Hedge Health
+        with ui.card().classes('metric-card'):
+            hedge_health_value = ui.label('IDLE').classes('text-4xl font-bold text-white')
+            hedge_health_summary = ui.label('No active hedge book').classes('text-sm text-gray-200 mt-2')
 
     # ===== CHARTS ROW =====
     with ui.row().classes('w-full gap-4 mb-6'):
@@ -91,6 +96,18 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
         
         with market_data_container:
             ui.label('No market data available').classes('text-gray-400 text-center py-4')
+
+    # ===== HEDGE MONITOR =====
+    with ui.card().classes('w-full p-4 mb-6'):
+        ui.label('Delta Hedge Monitor').classes('text-xl font-bold text-white mb-2')
+        hedge_alert_container = ui.column().classes('w-full gap-2 mb-4')
+        hedge_metrics_container = ui.column().classes('w-full gap-4')
+
+        with hedge_alert_container:
+            ui.label('No hedge alerts').classes('text-gray-400 text-sm')
+
+        with hedge_metrics_container:
+            ui.label('No hedge metrics available').classes('text-gray-400 text-center py-4')
 
     # ===== ACTIVITY FEED =====
     with ui.card().classes('w-full p-4 mb-6'):
@@ -233,6 +250,24 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
             sharpe_value.text = f'{state.sharpe_ratio:.2f}'
             positions_value.text = str(len(state.positions or []))
 
+            hedge_status = getattr(state, 'hedge_status', {}) or {}
+            hedge_metrics = getattr(state, 'hedge_metrics', []) or []
+            hedge_health = str(hedge_status.get('health', 'idle')).upper()
+            hedge_health_value.text = hedge_health
+            tracked = hedge_status.get('tracked_underlyings', 0)
+            active = hedge_status.get('active_underlyings', 0)
+            degraded = hedge_status.get('degraded_underlyings', {}) or {}
+            hedge_health_summary.text = f'{active} active / {tracked} tracked'
+            if hedge_health == 'HEALTHY':
+                hedge_health_value.classes(remove='text-red-500 text-yellow-400 text-gray-400', add='text-green-500')
+            elif hedge_health == 'DEGRADED':
+                hedge_health_value.classes(remove='text-green-500 text-gray-400', add='text-red-500')
+                hedge_health_summary.text = f'{len(degraded)} degraded underlying(s)'
+            elif hedge_health == 'UNAVAILABLE':
+                hedge_health_value.classes(remove='text-green-500 text-red-500', add='text-gray-400')
+            else:
+                hedge_health_value.classes(remove='text-green-500 text-red-500', add='text-gray-400')
+
             # Update equity curve chart
             equity_history = bot_service.get_equity_history()
             if equity_history:
@@ -266,27 +301,66 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
                             
                             # Intraday data
                             intraday = asset_data.get('intraday', {})
-                            ema20 = intraday.get('ema20', 0)
-                            rsi14 = intraday.get('rsi14', 0)
+                            sma99 = intraday.get('sma99', 0)
+                            avwap = intraday.get('avwap', 0)
                             
                             # Long-term data
                             lt = asset_data.get('long_term', {})
-                            lt_ema20 = lt.get('ema20', 0)
-                            lt_ema50 = lt.get('ema50', 0)
+                            lt_sma99 = lt.get('sma99', 0)
+                            lt_avwap = lt.get('avwap', 0)
                             
                             with ui.card().classes('p-4 bg-gradient-to-br from-gray-700 to-gray-800'):
                                 ui.label(asset).classes('text-2xl font-bold text-white mb-2')
                                 ui.label(f'${price:,.2f}').classes('text-xl text-green-400 mb-3')
                                 
                                 with ui.column().classes('gap-1 text-sm'):
-                                    ui.label(f'EMA20 (5m): {ema20:.2f}' if ema20 else 'EMA20: N/A').classes('text-gray-300')
-                                    ui.label(f'RSI14 (5m): {rsi14:.2f}' if rsi14 else 'RSI14: N/A').classes('text-gray-300')
+                                    ui.label(f'SMA99 (5m): {sma99:.2f}' if sma99 else 'SMA99 (5m): N/A').classes('text-gray-300')
+                                    ui.label(f'AVWAP 2026: {avwap:.2f}' if avwap else 'AVWAP 2026: N/A').classes('text-gray-300')
                                     ui.separator()
-                                    ui.label(f'EMA20 (4h): {lt_ema20:.2f}' if lt_ema20 else 'EMA20 (4h): N/A').classes('text-gray-400')
-                                    ui.label(f'EMA50 (4h): {lt_ema50:.2f}' if lt_ema50 else 'EMA50 (4h): N/A').classes('text-gray-400')
+                                    ui.label(f'SMA99 ({lt.get("interval", "HTF")}): {lt_sma99:.2f}' if lt_sma99 else f'SMA99 ({lt.get("interval", "HTF")}): N/A').classes('text-gray-400')
+                                    ui.label(f'AVWAP 2026: {lt_avwap:.2f}' if lt_avwap else 'AVWAP 2026: N/A').classes('text-gray-400')
             else:
                 with market_data_container:
                     ui.label('No market data available').classes('text-gray-400 text-center py-4')
+
+            hedge_alert_container.clear()
+            if degraded:
+                with hedge_alert_container:
+                    for underlying, reason in degraded.items():
+                        with ui.card().classes('w-full bg-red-900/40 border border-red-700 p-3'):
+                            ui.label(f'{underlying} hedge degraded').classes('text-red-300 font-semibold')
+                            ui.label(reason).classes('text-sm text-red-200')
+            else:
+                with hedge_alert_container:
+                    ui.label('No hedge alerts').classes('text-gray-400 text-sm')
+
+            hedge_metrics_container.clear()
+            if hedge_metrics:
+                with hedge_metrics_container:
+                    with ui.grid(columns=max(1, len(hedge_metrics))).classes('w-full gap-4'):
+                        for metric in hedge_metrics:
+                            underlying = metric.get('underlying', 'N/A')
+                            status = str(metric.get('status', 'unknown')).upper()
+                            residual = metric.get('residual_delta')
+                            target = metric.get('target_perp_delta')
+                            current = metric.get('current_perp_delta')
+                            threshold = metric.get('threshold')
+                            last_side = metric.get('last_rebalance_side') or 'none'
+                            last_size = metric.get('last_rebalance_size') or 0.0
+                            with ui.card().classes('p-4 bg-gradient-to-br from-gray-700 to-gray-800'):
+                                ui.label(underlying).classes('text-2xl font-bold text-white mb-2')
+                                ui.label(status).classes('text-sm font-semibold text-cyan-300 mb-3')
+                                with ui.column().classes('gap-1 text-sm'):
+                                    ui.label(f'Net option delta: {metric.get("net_option_delta", 0.0):+.4f}').classes('text-gray-300')
+                                    ui.label(f'Target perp delta: {target:+.4f}' if target is not None else 'Target perp delta: N/A').classes('text-gray-300')
+                                    ui.label(f'Current perp delta: {current:+.4f}' if current is not None else 'Current perp delta: N/A').classes('text-gray-300')
+                                    ui.label(f'Residual delta: {residual:+.4f}' if residual is not None else 'Residual delta: N/A').classes('text-gray-300')
+                                    ui.label(f'Threshold: {threshold:.4f}' if threshold is not None else 'Threshold: N/A').classes('text-gray-400')
+                                    ui.label(f'Open options: {metric.get("open_option_positions", 0)}').classes('text-gray-400')
+                                    ui.label(f'Last rebalance: {last_side} {last_size:.4f}').classes('text-gray-400')
+            else:
+                with hedge_metrics_container:
+                    ui.label('No hedge metrics available').classes('text-gray-400 text-center py-4')
 
             # Update activity log with recent events
             recent_events = bot_service.get_recent_events(limit=5)

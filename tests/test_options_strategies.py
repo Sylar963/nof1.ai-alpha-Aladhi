@@ -230,6 +230,34 @@ async def test_lookup_delta_falls_through_to_get_greeks_when_cache_empty():
 
 
 @pytest.mark.asyncio
+async def test_delta_hedged_execution_refuses_guessed_atm_delta():
+    """Missing live greeks must fail closed instead of using +/-0.5 guesses."""
+    thalex = FakeThalex()
+    hl = FakeHyperliquid()
+    executor = OptionsExecutor(thalex=thalex, hyperliquid=hl)
+    thalex.instruments_by_intent[("BTC", "call", 30, 65000.0)] = "BTC-10MAY26-65000-C"
+
+    decision = parse_decision({
+        "venue": "thalex",
+        "asset": "BTC",
+        "action": "buy",
+        "strategy": "long_call_delta_hedged",
+        "underlying": "BTC",
+        "kind": "call",
+        "tenor_days": 30,
+        "target_strike": 65000,
+        "contracts": 0.05,
+        "rationale": "must have live greeks",
+    })
+    result = await executor.execute(decision, open_positions_count=0)
+
+    assert result.ok is False
+    assert "missing live delta" in result.reason
+    assert thalex.calls == []
+    assert hl.calls == []
+
+
+@pytest.mark.asyncio
 async def test_long_call_with_target_gamma_btc_distributes_across_default_tenors():
     """When target_gamma_btc is set on a long_call_delta_hedged decision,
     the executor must expand it into multiple Thalex legs across the default
@@ -342,6 +370,7 @@ async def test_multi_tenor_aborts_when_one_tenor_fails_to_resolve_no_orders_subm
     # Wire 3 of 4 default tenors; tenor=14 deliberately missing.
     for tenor in (7, 30, 60):
         thalex.instruments_by_intent[("BTC", "call", tenor, 60000.0)] = f"BTC-{tenor}D-60000-C"
+        thalex.delta_per_position[f"BTC-{tenor}D-60000-C"] = 0.5
 
     # Override resolve_intent so the missing tenor returns None instead of
     # the FakeThalex's default fallback (which always returns SOMETHING).

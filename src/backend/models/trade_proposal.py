@@ -21,6 +21,7 @@ class TradeProposal:
     timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))
     
     # Asset and action
+    venue: str = "hyperliquid"
     asset: str = ""
     action: str = ""  # "buy" / "sell" / "close" / "hold"
     
@@ -86,6 +87,7 @@ class TradeProposal:
         return {
             'id': self.id,
             'timestamp': self.timestamp.isoformat(),
+            'venue': self.venue,
             'asset': self.asset,
             'action': self.action,
             'confidence': self.confidence,

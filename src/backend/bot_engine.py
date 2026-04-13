@@ -41,6 +41,8 @@ class BotState:
     open_orders: List[Dict] = field(default_factory=list)
     recent_fills: List[Dict] = field(default_factory=list)
     market_data: List[Dict] = field(default_factory=list)  # Market data for dashboard
+    hedge_status: Dict = field(default_factory=dict)
+    hedge_metrics: List[Dict] = field(default_factory=list)
     pending_proposals: List[Dict] = field(default_factory=list)  # Pending trade proposals (manual mode)
     last_reasoning: Dict = field(default_factory=dict)
     last_update: str = ""
@@ -100,6 +102,10 @@ class TradingBotEngine:
         self.options_executor: Optional[OptionsExecutor] = None
         self.hedge_manager: Optional[DeltaHedgeManager] = None
         self.options_scheduler: Optional[OptionsScheduler] = None
+        self._hedge_audit_task: Optional[asyncio.Task] = None
+        self._hedge_reconcile_interval_seconds = int(
+            CONFIG.get("thalex_hedge_reconcile_interval_seconds") or 15
+        )
         self.options_llm_lifecycle: Optional[OptionsLLMLifecycle] = None
         self._latest_options_context = None  # populated by the 15m surface refresh task
         if CONFIG.get("thalex_key_id") and CONFIG.get("thalex_private_key_path"):
@@ -172,7 +178,45 @@ class TradingBotEngine:
         self.diary_path = Path("data/diary.jsonl")
         self.diary_path.parent.mkdir(parents=True, exist_ok=True)
 
-    async def _execute_thalex_decision(self, decision_payload: Dict) -> None:
+    def _create_thalex_proposal(self, decision_payload: Dict) -> TradeProposal:
+        """Build a manual-approval proposal for a Thalex decision payload."""
+        decision = parse_decision(decision_payload)
+        size = float(decision.contracts or decision.target_gamma_btc or 0.0)
+        return TradeProposal(
+            venue="thalex",
+            asset=decision.asset,
+            action=decision.action,
+            confidence=float(decision_payload.get("confidence") or 75.0),
+            entry_price=0.0,
+            size=size,
+            allocation=0.0,
+            rationale=decision.rationale,
+            market_conditions={
+                "venue": "thalex",
+                "strategy": decision.strategy,
+                "underlying": decision.underlying,
+                "kind": decision.kind,
+                "tenor_days": decision.tenor_days,
+                "target_strike": decision.target_strike,
+                "target_delta": decision.target_delta,
+                "contracts": decision.contracts,
+                "target_gamma_btc": decision.target_gamma_btc,
+                "legs": [
+                    {
+                        "kind": leg.kind,
+                        "side": leg.side,
+                        "contracts": leg.contracts,
+                        "target_strike": leg.target_strike,
+                        "target_delta": leg.target_delta,
+                        "tenor_days": leg.tenor_days,
+                    }
+                    for leg in decision.legs
+                ],
+                "decision_payload": decision_payload,
+            },
+        )
+
+    async def _execute_thalex_decision(self, decision_payload: Dict) -> tuple[bool, str]:
         """Route a Thalex options decision through the OptionsExecutor.
 
         Skips silently with a logged warning when Thalex is not configured. The
@@ -180,29 +224,41 @@ class TradingBotEngine:
         resolution, leg orders, and the perp delta hedge.
         """
         if self.options_executor is None or self.thalex is None:
-            self.logger.warning("Thalex decision received but venue is not configured: %s", decision_payload)
-            return
+            message = f"Thalex venue is not configured: {decision_payload}"
+            self.logger.warning(message)
+            return False, message
         try:
             decision = parse_decision(decision_payload)
         except DecisionParseError as exc:
-            self.logger.error("Invalid Thalex decision payload: %s — %s", exc, decision_payload)
-            return
+            message = f"Invalid Thalex decision payload: {exc}"
+            self.logger.error("%s — %s", message, decision_payload)
+            return False, message
 
         try:
             # Ensure WS is connected before the first request.
             await self.thalex.connect()
         except Exception as exc:  # pylint: disable=broad-except
-            self.logger.error("Thalex connect failed: %s", exc)
-            return
+            message = f"Thalex connect failed: {exc}"
+            self.logger.error(message)
+            return False, message
 
         open_count = sum(1 for t in self.active_trades if (t.get('venue') or 'hyperliquid') == 'thalex')
         result = await self.options_executor.execute(decision, open_positions_count=open_count)
         if result.ok:
+            hedge_orders = []
+            if self.hedge_manager is not None:
+                try:
+                    hedge_orders = await self.hedge_manager.reconcile(
+                        underlying=(decision.underlying or decision.asset)
+                    )
+                except Exception as exc:  # pylint: disable=broad-except
+                    self.logger.warning("Delta hedge reconcile failed after %s: %s", decision.strategy, exc)
+
             self.logger.info(
                 "Thalex %s executed: thalex=%d hl=%d",
                 decision.strategy,
                 len(result.thalex_orders),
-                len(result.hyperliquid_orders),
+                len(result.hyperliquid_orders) + len(hedge_orders),
             )
             instrument_name = ""
             if result.thalex_orders:
@@ -215,32 +271,15 @@ class TradingBotEngine:
                 "strategy": decision.strategy,
                 "rationale": decision.rationale,
                 "thalex_orders": [o.order_id for o in result.thalex_orders],
-                "hyperliquid_orders": [o.order_id for o in result.hyperliquid_orders],
+                "hyperliquid_orders": [
+                    o.order_id for o in (result.hyperliquid_orders + hedge_orders)
+                ],
                 "opened_at": datetime.now(UTC).isoformat(),
             })
-
-            # Wire the position into the event-driven delta hedger so that
-            # subsequent ticker pushes can rebalance the perp leg on threshold
-            # breach. Only delta-hedged strategies need this — credit_put and
-            # credit_spread carry their own defined risk.
-            if (
-                self.hedge_manager is not None
-                and instrument_name
-                and decision.strategy in {"long_call_delta_hedged", "long_put_delta_hedged"}
-                and decision.contracts
-                and decision.kind
-            ):
-                try:
-                    await self.hedge_manager.add_position(
-                        instrument_name=instrument_name,
-                        contracts=float(decision.contracts),
-                        kind=decision.kind,
-                        underlying=decision.underlying or decision.asset,
-                    )
-                except Exception as exc:  # pylint: disable=broad-except
-                    self.logger.warning("DeltaHedgeManager add_position failed: %s", exc)
+            return True, ""
         else:
             self.logger.warning("Thalex decision rejected: %s", result.reason)
+            return False, result.reason
 
     async def start(self):
         """Start the trading bot"""
@@ -276,6 +315,13 @@ class TradingBotEngine:
             except Exception as exc:  # pylint: disable=broad-except
                 self.logger.error("Failed to start OptionsScheduler: %s", exc)
 
+        if self.hedge_manager is not None:
+            try:
+                await self.hedge_manager.reconcile()
+            except Exception as exc:  # pylint: disable=broad-except
+                self.logger.warning("Initial delta hedge reconcile failed: %s", exc)
+            self._hedge_audit_task = asyncio.create_task(self._hedge_audit_loop())
+
         self.logger.info(f"Bot started - Assets: {self.assets}, Interval: {self.interval}")
         self._notify_state_update()
 
@@ -294,11 +340,25 @@ class TradingBotEngine:
             except asyncio.CancelledError:
                 pass
 
+        if self._hedge_audit_task is not None:
+            self._hedge_audit_task.cancel()
+            try:
+                await self._hedge_audit_task
+            except asyncio.CancelledError:
+                pass
+            self._hedge_audit_task = None
+
         if self.options_scheduler is not None:
             try:
                 await self.options_scheduler.stop()
             except Exception as exc:  # pylint: disable=broad-except
                 self.logger.warning("OptionsScheduler stop failed: %s", exc)
+
+        if self.hedge_manager is not None:
+            try:
+                await self.hedge_manager.close()
+            except Exception as exc:  # pylint: disable=broad-except
+                self.logger.warning("DeltaHedgeManager close failed: %s", exc)
 
         # Release the cached aiohttp session inside the LLM client. close()
         # is idempotent and exception-safe so this is always cheap.
@@ -314,6 +374,15 @@ class TradingBotEngine:
     # ------------------------------------------------------------------
     # Options scheduler callbacks
     # ------------------------------------------------------------------
+
+    async def _hedge_audit_loop(self) -> None:
+        """Slow safety poll that reconciles the live options book and hedge."""
+        while self.is_running and self.hedge_manager is not None:
+            try:
+                await self.hedge_manager.reconcile()
+            except Exception as exc:  # pylint: disable=broad-except
+                self.logger.warning("Delta hedge audit reconcile failed: %s", exc)
+            await asyncio.sleep(self._hedge_reconcile_interval_seconds)
 
     async def _refresh_options_surface(self) -> None:
         """Background task: rebuild the OptionsContext snapshot.
@@ -665,7 +734,7 @@ class TradingBotEngine:
                             # Fetch all indicators using bulk endpoint (2 requests instead of 10)
                             # Note: fetch_asset_indicators() already includes 15s delay between 5m and interval requests
                             # Uses caching to avoid redundant API calls
-                            indicators = self.taapi.fetch_asset_indicators(asset)
+                            indicators = self.taapi.fetch_asset_indicators(asset, current_spot=current_price)
                             
                             # Add delay between assets to respect TAAPI rate limit (1 req/15s)
                             # Only wait if this is not the last asset
@@ -674,44 +743,74 @@ class TradingBotEngine:
                                 await asyncio.sleep(15)
                             
                             # Extract 5m indicators
-                            ema20_5m_series = indicators["5m"].get("ema20", [])
-                            macd_5m_series = indicators["5m"].get("macd", [])
-                            rsi7_5m_series = indicators["5m"].get("rsi7", [])
-                            rsi14_5m_series = indicators["5m"].get("rsi14", [])
+                            sma99_5m_series = indicators["5m"].get("sma99", [])
+                            avwap_5m = indicators["5m"].get("avwap")
+                            keltner_5m = indicators["5m"].get("keltner", {})
+                            opening_range = indicators["5m"].get("opening_range", {})
 
                             # Extract long-term indicators (interval from config: 1h, 4h, etc.)
-                            interval = CONFIG.get("interval", "1h")
+                            interval = CONFIG.get("interval", "4h")
                             lt_indicators = indicators.get(interval, {})
-                            lt_ema20 = lt_indicators.get("ema20")
-                            lt_ema50 = lt_indicators.get("ema50")
-                            lt_atr3 = lt_indicators.get("atr3")
-                            lt_atr14 = lt_indicators.get("atr14")
-                            lt_macd_series = lt_indicators.get("macd", [])
-                            lt_rsi_series = lt_indicators.get("rsi14", [])
+                            lt_sma99_series = lt_indicators.get("sma99", [])
+                            lt_avwap = lt_indicators.get("avwap")
+                            lt_keltner = lt_indicators.get("keltner", {})
+
+                            keltner_5m_middle = keltner_5m.get("middle", [])
+                            keltner_5m_upper = keltner_5m.get("upper", [])
+                            keltner_5m_lower = keltner_5m.get("lower", [])
+                            lt_keltner_middle = lt_keltner.get("middle", [])
+                            lt_keltner_upper = lt_keltner.get("upper", [])
+                            lt_keltner_lower = lt_keltner.get("lower", [])
+
+                            def _latest(series):
+                                return series[-1] if series else None
+
+                            def _keltner_snapshot(middle_series, upper_series, lower_series):
+                                middle = _latest(middle_series)
+                                upper = _latest(upper_series)
+                                lower = _latest(lower_series)
+                                position = "unknown"
+                                if all(v is not None for v in (upper, lower, current_price)):
+                                    if current_price > upper:
+                                        position = "above"
+                                    elif current_price < lower:
+                                        position = "below"
+                                    else:
+                                        position = "inside"
+                                return {
+                                    "middle": middle,
+                                    "upper": upper,
+                                    "lower": lower,
+                                    "position": position,
+                                }
 
                             # Build market data structure
                             market_sections.append({
                                 "asset": asset,
                                 "current_price": current_price,
                                 "intraday": {
-                                    "ema20": ema20_5m_series[-1] if ema20_5m_series else None,
-                                    "macd": macd_5m_series[-1] if macd_5m_series else None,
-                                    "rsi7": rsi7_5m_series[-1] if rsi7_5m_series else None,
-                                    "rsi14": rsi14_5m_series[-1] if rsi14_5m_series else None,
+                                    "sma99": _latest(sma99_5m_series),
+                                    "avwap": avwap_5m,
+                                    "keltner": _keltner_snapshot(keltner_5m_middle, keltner_5m_upper, keltner_5m_lower),
+                                    "opening_range": opening_range,
                                     "series": {
-                                        "ema20": ema20_5m_series,
-                                        "macd": macd_5m_series,
-                                        "rsi7": rsi7_5m_series,
-                                        "rsi14": rsi14_5m_series
+                                        "sma99": sma99_5m_series,
+                                        "keltner_middle": keltner_5m_middle,
+                                        "keltner_upper": keltner_5m_upper,
+                                        "keltner_lower": keltner_5m_lower,
                                     }
                                 },
                                 "long_term": {
-                                    "ema20": lt_ema20,
-                                    "ema50": lt_ema50,
-                                    "atr3": lt_atr3,
-                                    "atr14": lt_atr14,
-                                    "macd_series": lt_macd_series,
-                                    "rsi_series": lt_rsi_series
+                                    "interval": interval,
+                                    "sma99": _latest(lt_sma99_series),
+                                    "avwap": lt_avwap,
+                                    "keltner": _keltner_snapshot(lt_keltner_middle, lt_keltner_upper, lt_keltner_lower),
+                                    "series": {
+                                        "sma99": lt_sma99_series,
+                                        "keltner_middle": lt_keltner_middle,
+                                        "keltner_upper": lt_keltner_upper,
+                                        "keltner_lower": lt_keltner_lower,
+                                    },
                                 },
                                 "open_interest": oi,
                                 "funding_rate": funding,
@@ -789,6 +888,21 @@ class TradingBotEngine:
                         # handled by the OptionsExecutor; everything else falls
                         # through to the existing Hyperliquid path.
                         if (decision.get('venue') or 'hyperliquid').lower() == 'thalex':
+                            if self.trading_mode == "manual":
+                                try:
+                                    proposal = self._create_thalex_proposal(decision)
+                                    self.pending_proposals.append(proposal)
+                                    self.logger.info(
+                                        "[PROPOSAL] Created: %s %s %s (ID: %s)",
+                                        (decision.get("strategy") or "thalex").upper(),
+                                        decision.get("action", "hold").upper(),
+                                        asset,
+                                        proposal.id[:8],
+                                    )
+                                    self.state.pending_proposals = [p.to_dict() for p in self.pending_proposals if p.is_pending]
+                                except Exception as exc:  # pylint: disable=broad-except
+                                    self.logger.error("Error creating Thalex proposal for %s: %s", asset, exc)
+                                continue
                             await self._execute_thalex_decision(decision)
                             continue
 
@@ -1028,11 +1142,35 @@ class TradingBotEngine:
 
     def _notify_state_update(self):
         """Notify GUI of state update via callback"""
+        self._refresh_hedge_state()
         if self.on_state_update:
             try:
                 self.on_state_update(self.state)
             except Exception as e:
                 self.logger.error(f"Error in state update callback: {e}")
+
+    def _refresh_hedge_state(self) -> None:
+        """Copy live hedge-manager telemetry into BotState for the GUI."""
+        if self.hedge_manager is None:
+            self.state.hedge_status = {
+                "health": "unavailable",
+                "degraded_underlyings": {},
+                "tracked_underlyings": 0,
+                "active_underlyings": 0,
+                "last_update": datetime.now(UTC).isoformat(),
+            }
+            self.state.hedge_metrics = []
+            return
+
+        snapshot = self.hedge_manager.get_status_snapshot()
+        self.state.hedge_status = {
+            "health": snapshot.get("health", "unknown"),
+            "degraded_underlyings": snapshot.get("degraded_underlyings", {}),
+            "tracked_underlyings": snapshot.get("tracked_underlyings", 0),
+            "active_underlyings": snapshot.get("active_underlyings", 0),
+            "last_update": snapshot.get("last_update", datetime.now(UTC).isoformat()),
+        }
+        self.state.hedge_metrics = snapshot.get("metrics", [])
 
     def _write_diary_entry(self, entry: Dict):
         """Write entry to diary.jsonl"""
@@ -1205,6 +1343,44 @@ class TradingBotEngine:
         """
         try:
             self.logger.info(f"Executing proposal: {proposal.action.upper()} {proposal.asset}")
+            market_conditions = proposal.market_conditions or {}
+
+            if (proposal.venue or market_conditions.get("venue") or "hyperliquid") == "thalex":
+                decision_payload = market_conditions.get("decision_payload")
+                if not isinstance(decision_payload, dict):
+                    raise ValueError("Missing Thalex decision payload on proposal")
+
+                ok, reason = await self._execute_thalex_decision(decision_payload)
+                if not ok:
+                    raise RuntimeError(reason or "Thalex execution failed")
+
+                proposal.mark_executed(proposal.entry_price)
+                self._write_diary_entry({
+                    'timestamp': datetime.now(UTC).isoformat(),
+                    'asset': proposal.asset,
+                    'venue': 'thalex',
+                    'action': proposal.action,
+                    'strategy': market_conditions.get('strategy'),
+                    'contracts': market_conditions.get('contracts'),
+                    'target_gamma_btc': market_conditions.get('target_gamma_btc'),
+                    'rationale': proposal.rationale,
+                    'from_proposal': proposal.id,
+                    'approved_manually': True,
+                })
+
+                if self.on_trade_executed:
+                    self.on_trade_executed({
+                        'asset': proposal.asset,
+                        'venue': 'thalex',
+                        'action': proposal.action,
+                        'amount': proposal.size,
+                        'price': proposal.entry_price,
+                        'timestamp': datetime.now(UTC).isoformat(),
+                        'from_proposal': True,
+                    })
+
+                self.logger.info(f"[SUCCESS] Proposal executed: {proposal.id[:8]}")
+                return
             
             # Get fresh price
             current_price = await self.hyperliquid.get_current_price(proposal.asset)
@@ -1271,7 +1447,7 @@ class TradingBotEngine:
                 'entry_price': current_price,
                 'tp_oid': tp_oid,
                 'sl_oid': sl_oid,
-                'exit_plan': proposal.market_conditions.get('exit_plan', ''),
+                'exit_plan': market_conditions.get('exit_plan', ''),
                 'opened_at': datetime.now(UTC).isoformat(),
                 'from_proposal': proposal.id
             })

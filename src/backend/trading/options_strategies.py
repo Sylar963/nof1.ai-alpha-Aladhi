@@ -202,10 +202,16 @@ class OptionsExecutor:
         if not instrument_name:
             return ExecutionResult(ok=False, reason="no matching instrument on Thalex")
 
+        delta_per_contract = await self._lookup_delta(instrument_name)
+        if delta_per_contract is None:
+            return ExecutionResult(
+                ok=False,
+                reason=f"missing live delta for {instrument_name}",
+            )
+
         thalex_order = await self.thalex.place_buy_order(instrument_name, contracts)
 
-        # Determine hedge direction + size from the live delta (or fallback).
-        delta_per_contract = await self._lookup_delta(instrument_name, decision.kind or "call")
+        # Determine hedge direction + size from the live delta.
         hedge_size = abs(contracts * delta_per_contract)
         hl_orders = []
         if hedge_size > 0:
@@ -260,7 +266,7 @@ class OptionsExecutor:
         # ------------------------------------------------------------------
         # STAGE PHASE — resolve all tenors before any submit happens.
         # ------------------------------------------------------------------
-        staged_legs: list[tuple[int, str]] = []
+        staged_legs: list[tuple[int, str, float]] = []
         for tenor in tenors:
             intent = OptionIntent(
                 underlying=underlying,
@@ -289,7 +295,20 @@ class OptionsExecutor:
                     ok=False,
                     reason=f"no instrument for {kind} tenor={tenor}",
                 )
-            staged_legs.append((tenor, instrument_name))
+
+            delta_per_contract = await self._lookup_delta(instrument_name)
+            if delta_per_contract is None:
+                logger.error(
+                    "multi-tenor missing live delta for %s tenor=%d",
+                    instrument_name,
+                    tenor,
+                )
+                return ExecutionResult(
+                    ok=False,
+                    reason=f"missing live delta for {instrument_name}",
+                )
+
+            staged_legs.append((tenor, instrument_name, delta_per_contract))
 
         # ------------------------------------------------------------------
         # SUBMIT PHASE — orders go out only now, with retry + unwind.
@@ -299,7 +318,7 @@ class OptionsExecutor:
         thalex_orders = []
         hl_orders = []
 
-        for tenor, instrument_name in staged_legs:
+        for tenor, instrument_name, delta_per_contract in staged_legs:
             # Submit Thalex leg with retry.
             try:
                 thalex_order = await _retry_async(
@@ -323,9 +342,6 @@ class OptionsExecutor:
             thalex_orders.append(thalex_order)
             submitted_thalex.append((instrument_name, per_leg_contracts))
 
-            # Compute hedge size from live delta. Errors here fall back to
-            # ATM defaults inside _lookup_delta, so this call doesn't raise.
-            delta_per_contract = await self._lookup_delta(instrument_name, kind)
             hedge_size = abs(per_leg_contracts * delta_per_contract)
             if hedge_size <= 0:
                 continue
@@ -469,16 +485,12 @@ class OptionsExecutor:
     # Helpers
     # ------------------------------------------------------------------
 
-    async def _lookup_delta(self, instrument_name: str, kind: str) -> float:
-        """Best-effort delta lookup with three layers of fallback.
+    async def _lookup_delta(self, instrument_name: str) -> Optional[float]:
+        """Return the live delta for an instrument, or ``None`` when unknown.
 
-        1. Test-fake escape hatch: if the adapter exposes a
-           ``delta_per_position`` mapping, use it (lets unit tests inject
-           deterministic deltas without touching ``get_greeks``).
-        2. Live ticker via the adapter: ``await thalex.get_greeks(...)``.
-           This is the production path on Thalex.
-        3. ATM default: ±0.5 with a loud warning so the operator notices
-           that the live path failed.
+        The hedge engine must not trade on guessed ATM deltas. If no live greek
+        is available, the caller should fail closed or degrade hedge management
+        until the feed recovers.
         """
         delta_map = getattr(self.thalex, "delta_per_position", {}) or {}
         if instrument_name in delta_map:
@@ -492,8 +504,8 @@ class OptionsExecutor:
             except Exception as exc:  # pylint: disable=broad-except
                 logger.warning("get_greeks failed for %s: %s", instrument_name, exc)
 
-        logger.warning("Delta unknown for %s — using ATM default", instrument_name)
-        return 0.5 if kind == "call" else -0.5
+        logger.error("Delta unknown for %s — refusing to hedge on guessed value", instrument_name)
+        return None
 
 
 class DeltaHedger:

@@ -90,29 +90,29 @@ def create_market(bot_service: BotService, state_manager: StateManager):
             ui.label('Trend Indicators').classes('text-xl font-bold text-white mb-4')
 
             with ui.column().classes('gap-3 w-full'):
-                # EMA 20/50
+                # SMA 99
                 with ui.row().classes('w-full justify-between items-center'):
-                    ui.label('EMA 20').classes('text-gray-300')
+                    ui.label('SMA 99 (5m)').classes('text-gray-300')
                     ema20_label = ui.label('$0.00').classes('text-white font-semibold')
 
                 with ui.row().classes('w-full justify-between items-center'):
-                    ui.label('EMA 50').classes('text-gray-300')
+                    ui.label('SMA 99 (HTF)').classes('text-gray-300')
                     ema50_label = ui.label('$0.00').classes('text-white font-semibold')
 
                 ui.separator()
 
-                # MACD
-                ui.label('MACD').classes('text-lg font-bold text-white mt-2')
+                # Keltner
+                ui.label('Keltner 130 x 4').classes('text-lg font-bold text-white mt-2')
                 with ui.row().classes('w-full justify-between items-center'):
-                    ui.label('MACD Line').classes('text-gray-300')
+                    ui.label('Middle').classes('text-gray-300')
                     macd_line_label = ui.label('0.00').classes('text-white font-semibold')
 
                 with ui.row().classes('w-full justify-between items-center'):
-                    ui.label('Signal Line').classes('text-gray-300')
+                    ui.label('Upper').classes('text-gray-300')
                     macd_signal_label = ui.label('0.00').classes('text-white font-semibold')
 
                 with ui.row().classes('w-full justify-between items-center'):
-                    ui.label('Histogram').classes('text-gray-300')
+                    ui.label('Lower').classes('text-gray-300')
                     macd_hist_label = ui.label('0.00').classes('text-green-400 font-semibold')
 
         # Right column - Momentum Indicators
@@ -120,31 +120,31 @@ def create_market(bot_service: BotService, state_manager: StateManager):
             ui.label('Momentum Indicators').classes('text-xl font-bold text-white mb-4')
 
             with ui.column().classes('gap-3 w-full'):
-                # RSI
+                # Anchored VWAP
                 with ui.row().classes('w-full justify-between items-center'):
-                    ui.label('RSI (14)').classes('text-gray-300')
+                    ui.label('AVWAP 2026').classes('text-gray-300')
                     rsi_label = ui.label('50.00').classes('text-white font-semibold')
 
-                # RSI Bar
+                # Position Bar (price vs AVWAP)
                 rsi_progress = ui.linear_progress(value=0.5, show_value=False).classes('w-full')
 
                 ui.separator()
 
-                # ATR
+                # Long-term AVWAP
                 with ui.row().classes('w-full justify-between items-center'):
-                    ui.label('ATR (14)').classes('text-gray-300')
+                    ui.label('AVWAP Anchor').classes('text-gray-300')
                     atr_label = ui.label('$0.00').classes('text-white font-semibold')
 
                 ui.separator()
 
-                # Stochastic
-                ui.label('Stochastic').classes('text-lg font-bold text-white mt-2')
+                # Opening Range
+                ui.label('Opening Range').classes('text-lg font-bold text-white mt-2')
                 with ui.row().classes('w-full justify-between items-center'):
-                    ui.label('%K').classes('text-gray-300')
+                    ui.label('High').classes('text-gray-300')
                     stoch_k_label = ui.label('50.00').classes('text-white font-semibold')
 
                 with ui.row().classes('w-full justify-between items-center'):
-                    ui.label('%D').classes('text-gray-300')
+                    ui.label('Low').classes('text-gray-300')
                     stoch_d_label = ui.label('50.00').classes('text-white font-semibold')
 
     # ===== INDICATOR CHART =====
@@ -195,11 +195,33 @@ def create_market(bot_service: BotService, state_manager: StateManager):
                     volume_icon = ui.label('○').classes('text-2xl text-gray-400')
                     ui.label('Volume Signal').classes('text-gray-300')
 
+    # ===== HEDGE STATUS =====
+    with ui.card().classes('w-full p-4 mt-6'):
+        ui.label('Delta Hedge Status').classes('text-xl font-bold text-white mb-4')
+        with ui.row().classes('w-full gap-6 items-center'):
+            with ui.column().classes('flex-1 gap-2'):
+                hedge_status_label = ui.label('IDLE').classes('text-3xl font-bold text-gray-400')
+                hedge_status_desc = ui.label('No hedge data yet').classes('text-sm text-gray-400')
+            with ui.column().classes('flex-1 gap-2'):
+                hedge_target_label = ui.label('Target: --').classes('text-gray-300')
+                hedge_current_label = ui.label('Current: --').classes('text-gray-300')
+                hedge_residual_label = ui.label('Residual: --').classes('text-gray-300')
+                hedge_last_label = ui.label('Last rebalance: --').classes('text-gray-400 text-sm')
+
     # ===== AUTO-REFRESH LOGIC =====
     async def update_market_data():
         """Update market data and indicators from real bot data"""
         state = state_manager.get_state()
         selected_asset = asset_select.value
+        hedge_metric = next(
+            (m for m in (getattr(state, 'hedge_metrics', []) or []) if m.get('underlying') == selected_asset),
+            None,
+        )
+        degraded_reason = None
+        hedge_status = getattr(state, 'hedge_status', {}) or {}
+        degraded_map = hedge_status.get('degraded_underlyings', {}) or {}
+        if selected_asset in degraded_map:
+            degraded_reason = degraded_map[selected_asset]
 
         # Get market data for selected asset from bot state
         market_data = None
@@ -216,6 +238,8 @@ def create_market(bot_service: BotService, state_manager: StateManager):
             change_24h_label.set_text('--')
             volume_24h_label.set_text('--')
             open_interest_label.set_text('--')
+            hedge_status_label.set_text('NO DATA')
+            hedge_status_desc.set_text('Waiting for market and hedge data from bot...')
             return
 
         # Update price cards with real data
@@ -239,69 +263,64 @@ def create_market(bot_service: BotService, state_manager: StateManager):
         intraday = market_data.get('intraday', {})
         long_term = market_data.get('long_term', {})
         
-        # EMA values
-        ema20_5m = intraday.get('ema20')
-        ema20_lt = long_term.get('ema20')
+        sma99_5m = intraday.get('sma99')
+        sma99_lt = long_term.get('sma99')
+        avwap = intraday.get('avwap') or long_term.get('avwap')
+        opening_range = intraday.get('opening_range', {})
+        keltner = intraday.get('keltner', {})
         
-        if ema20_5m:
-            ema20_label.set_text(f'${ema20_5m:,.2f}')
+        if sma99_5m:
+            ema20_label.set_text(f'${sma99_5m:,.2f}')
         else:
             ema20_label.set_text('--')
         
-        ema50_val = long_term.get('ema50')
-        if ema50_val:
-            ema50_label.set_text(f'${ema50_val:,.2f}')
+        if sma99_lt:
+            ema50_label.set_text(f'${sma99_lt:,.2f}')
         else:
             ema50_label.set_text('--')
         
-        # MACD
-        macd_val = intraday.get('macd')
-        if macd_val:
-            macd_line_label.set_text(f'{macd_val:.2f}')
-        else:
-            macd_line_label.set_text('--')
-        
-        macd_signal_label.set_text('--')  # Not separate in current data
-        macd_hist_label.set_text('--')
-        
-        # RSI
-        rsi_value = intraday.get('rsi14')
-        if rsi_value:
-            rsi_label.set_text(f'{rsi_value:.2f}')
-            rsi_progress.set_value(rsi_value / 100)
-            
-            if rsi_value > 70:
-                rsi_label.classes('text-red-400 font-semibold')
-            elif rsi_value < 30:
-                rsi_label.classes('text-green-400 font-semibold')
+        middle = keltner.get('middle')
+        upper = keltner.get('upper')
+        lower = keltner.get('lower')
+        macd_line_label.set_text(f'${middle:,.2f}' if middle else '--')
+        macd_signal_label.set_text(f'${upper:,.2f}' if upper else '--')
+        macd_hist_label.set_text(f'${lower:,.2f}' if lower else '--')
+
+        if avwap:
+            rsi_label.set_text(f'${avwap:,.2f}')
+            if current_price and current_price > avwap:
+                rsi_progress.set_value(0.75)
+            elif current_price and current_price < avwap:
+                rsi_progress.set_value(0.25)
             else:
-                rsi_label.classes('text-white font-semibold')
+                rsi_progress.set_value(0.5)
         else:
             rsi_label.set_text('--')
             rsi_progress.set_value(0.5)
-        
-        # ATR
-        atr_val = long_term.get('atr14')
-        if atr_val:
-            atr_label.set_text(f'${atr_val:.2f}')
+
+        if avwap:
+            atr_label.set_text(f'${avwap:,.2f}')
         else:
             atr_label.set_text('--')
-        
-        stoch_k_label.set_text('--')  # Not available
-        stoch_d_label.set_text('--')
+
+        or_high = opening_range.get('high')
+        or_low = opening_range.get('low')
+        stoch_k_label.set_text(f'${or_high:,.2f}' if or_high else '--')
+        stoch_d_label.set_text(f'${or_low:,.2f}' if or_low else '--')
         
         # Update sentiment based on indicators
-        if rsi_value and ema20_5m and current_price:
-            if rsi_value > 60 and current_price > ema20_5m:
+        opening_range_position = opening_range.get('position')
+        if sma99_5m and avwap and current_price:
+            if current_price > sma99_5m and current_price > avwap and opening_range_position == 'above':
                 sentiment_label.set_text('BULLISH')
                 sentiment_label.classes('text-3xl font-bold text-green-400')
-                sentiment_desc.set_text('Price above EMA20, RSI showing strength')
+                sentiment_desc.set_text('Price above SMA99 and AVWAP, holding above opening range')
                 trend_icon.set_text('●')
                 trend_icon.classes('text-2xl text-green-400')
-            elif rsi_value < 40 and current_price < ema20_5m:
+            elif current_price < sma99_5m and current_price < avwap and opening_range_position == 'below':
                 sentiment_label.set_text('BEARISH')
                 sentiment_label.classes('text-3xl font-bold text-red-400')
-                sentiment_desc.set_text('Price below EMA20, RSI showing weakness')
+                sentiment_desc.set_text('Price below SMA99 and AVWAP, holding below opening range')
                 trend_icon.set_text('●')
                 trend_icon.classes('text-2xl text-red-400')
             else:
@@ -319,6 +338,39 @@ def create_market(bot_service: BotService, state_manager: StateManager):
         momentum_icon.classes('text-2xl text-gray-400')
         volume_icon.set_text('○')
         volume_icon.classes('text-2xl text-gray-400')
+
+        if hedge_metric:
+            hedge_status_label.set_text(str(hedge_metric.get('status', 'unknown')).upper())
+            if hedge_metric.get('degraded'):
+                hedge_status_label.classes('text-3xl font-bold text-red-400')
+                hedge_status_desc.set_text(degraded_reason or hedge_metric.get('degraded_reason') or 'Live greeks unavailable')
+            else:
+                hedge_status_label.classes('text-3xl font-bold text-green-400')
+                hedge_status_desc.set_text(
+                    f"{hedge_metric.get('open_option_positions', 0)} option leg(s), {len(hedge_metric.get('subscribed_instruments', []))} ticker subscriptions"
+                )
+            target = hedge_metric.get('target_perp_delta')
+            current = hedge_metric.get('current_perp_delta')
+            residual = hedge_metric.get('residual_delta')
+            hedge_target_label.set_text(f'Target: {target:+.4f}' if target is not None else 'Target: --')
+            hedge_current_label.set_text(f'Current: {current:+.4f}' if current is not None else 'Current: --')
+            hedge_residual_label.set_text(f'Residual: {residual:+.4f}' if residual is not None else 'Residual: --')
+            last_side = hedge_metric.get('last_rebalance_side') or 'none'
+            last_size = hedge_metric.get('last_rebalance_size') or 0.0
+            hedge_last_label.set_text(f'Last rebalance: {last_side} {last_size:.4f}')
+        else:
+            if degraded_reason:
+                hedge_status_label.set_text('DEGRADED')
+                hedge_status_label.classes('text-3xl font-bold text-red-400')
+                hedge_status_desc.set_text(degraded_reason)
+            else:
+                hedge_status_label.set_text('IDLE')
+                hedge_status_label.classes('text-3xl font-bold text-gray-400')
+                hedge_status_desc.set_text('No active hedge for this asset')
+            hedge_target_label.set_text('Target: --')
+            hedge_current_label.set_text('Current: --')
+            hedge_residual_label.set_text('Residual: --')
+            hedge_last_label.set_text('Last rebalance: --')
 
     # Auto-refresh every 5 seconds
     ui.timer(5.0, update_market_data)

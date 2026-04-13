@@ -8,7 +8,7 @@ import logging
 import os
 from pathlib import Path
 from typing import List, Dict, Optional
-from datetime import datetime
+from datetime import UTC, datetime
 
 from src.backend.bot_engine import TradingBotEngine, BotState
 from src.backend.config_loader import CONFIG
@@ -22,6 +22,8 @@ class BotService:
         self.state_manager = None  # Set externally after creation
         self.equity_history: List[Dict] = []
         self.recent_events: List[Dict] = []
+        self._last_hedge_health: Optional[str] = None
+        self._last_degraded_underlyings: Dict[str, str] = {}
         self.logger = logging.getLogger(__name__)
 
         # Configuration
@@ -306,11 +308,11 @@ class BotService:
             return False
 
         try:
-            # Schedule async execution
-            asyncio.create_task(self.bot_engine.approve_proposal(proposal_id))
-            self._add_event(f"✅ Proposal {proposal_id[:8]} approved - executing trade")
-            self.logger.info(f"Proposal approved: {proposal_id}")
-            return True
+            success = self.bot_engine.approve_proposal(proposal_id)
+            if success:
+                self._add_event(f"✅ Proposal {proposal_id[:8]} approved - executing trade")
+                self.logger.info(f"Proposal approved: {proposal_id}")
+            return success
         except Exception as e:
             self.logger.error(f"Failed to approve proposal: {e}")
             self._add_event(f"❌ Approval failed: {str(e)}", level="error")
@@ -332,11 +334,11 @@ class BotService:
             return False
 
         try:
-            # Schedule async execution
-            asyncio.create_task(self.bot_engine.reject_proposal(proposal_id, reason))
-            self._add_event(f"❌ Proposal {proposal_id[:8]} rejected - {reason}")
-            self.logger.info(f"Proposal rejected: {proposal_id} - Reason: {reason}")
-            return True
+            success = self.bot_engine.reject_proposal(proposal_id, reason)
+            if success:
+                self._add_event(f"❌ Proposal {proposal_id[:8]} rejected - {reason}")
+                self.logger.info(f"Proposal rejected: {proposal_id} - Reason: {reason}")
+            return success
         except Exception as e:
             self.logger.error(f"Failed to reject proposal: {e}")
             self._add_event(f"❌ Rejection failed: {str(e)}", level="error")
@@ -388,13 +390,39 @@ class BotService:
 
         # Track equity history for charting
         self.equity_history.append({
-            'time': state.last_update or datetime.utcnow().isoformat(),
+            'time': state.last_update or datetime.now(UTC).isoformat(),
             'value': state.total_value
         })
+
+        self._track_hedge_events(state)
 
         # Keep only last 500 points
         if len(self.equity_history) > 500:
             self.equity_history = self.equity_history[-500:]
+
+    def _track_hedge_events(self, state: BotState):
+        """Emit activity-feed events when hedge health changes."""
+        hedge_status = getattr(state, 'hedge_status', {}) or {}
+        hedge_health = hedge_status.get('health')
+        degraded = dict(hedge_status.get('degraded_underlyings') or {})
+
+        if hedge_health and hedge_health != self._last_hedge_health:
+            if hedge_health == 'degraded':
+                self._add_event('⚠️ Delta hedge health degraded', level='error')
+            elif hedge_health == 'healthy':
+                self._add_event('✅ Delta hedge healthy', level='info')
+            elif hedge_health == 'idle':
+                self._add_event('ℹ️ Delta hedge idle', level='info')
+            self._last_hedge_health = hedge_health
+
+        for underlying, reason in degraded.items():
+            if self._last_degraded_underlyings.get(underlying) != reason:
+                self._add_event(f'⚠️ Hedge degraded for {underlying}: {reason}', level='error')
+
+        for underlying in set(self._last_degraded_underlyings) - set(degraded):
+            self._add_event(f'✅ Hedge recovered for {underlying}', level='info')
+
+        self._last_degraded_underlyings = degraded
 
     def _on_trade_executed(self, trade: Dict):
         """
@@ -419,7 +447,7 @@ class BotService:
     def _add_event(self, message: str, level: str = "info"):
         """Add event to recent events feed"""
         self.recent_events.append({
-            'time': datetime.utcnow().strftime("%H:%M:%S"),
+            'time': datetime.now(UTC).strftime("%H:%M:%S"),
             'message': message,
             'level': level
         })

@@ -4,8 +4,12 @@ import requests
 import os
 import time
 import logging
+from datetime import datetime, timedelta, timezone
 from src.backend.config_loader import CONFIG
 from src.backend.indicators.taapi_cache import get_cache
+
+
+AVWAP_ANCHOR_UTC = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
 
 
 class TAAPIClient:
@@ -106,13 +110,11 @@ class TAAPIClient:
                     "indicator": config["indicator"]
                 }
 
-                # Add optional parameters
-                if "period" in config:
-                    indicator_def["period"] = config["period"]
-                if "results" in config:
-                    indicator_def["results"] = config["results"]
-                if "backtrack" in config:
-                    indicator_def["backtrack"] = config["backtrack"]
+                # Forward endpoint-specific parameters (period, results,
+                # anchorPeriod, atrLength, multiplier, etc.) transparently.
+                for key, value in config.items():
+                    if key not in {"id", "indicator"}:
+                        indicator_def[key] = value
 
                 indicators.append(indicator_def)
 
@@ -143,10 +145,109 @@ class TAAPIClient:
             logging.error(f"TAAPI bulk fetch exception for {symbol} {interval}: {e}")
             return {}
 
-    def fetch_asset_indicators(self, asset):
+    def fetch_candles(self, symbol: str, interval: str, params: dict | None = None) -> list:
+        """Fetch raw candle objects from TAAPI's ``candles`` endpoint."""
+        base_params = {
+            "secret": self.api_key,
+            "exchange": "binance",
+            "symbol": symbol,
+            "interval": interval,
+        }
+        if params:
+            base_params.update(params)
+        try:
+            data = self._get_with_retry(f"{self.base_url}candles", base_params)
+            return data if isinstance(data, list) else []
+        except Exception as e:
+            logging.error(f"TAAPI candles fetch exception for {symbol} {interval}: {e}")
+            return []
+
+    def _extract_keltner_series(self, data):
+        """Normalize TAAPI Keltner responses into parallel float arrays."""
+        if not isinstance(data, dict):
+            return {"lower": [], "middle": [], "upper": []}
+
+        def _as_list(value):
+            if isinstance(value, list):
+                return [round(v, 4) if isinstance(v, (int, float)) else v for v in value]
+            if isinstance(value, (int, float)):
+                return [round(value, 4)]
+            return []
+
+        return {
+            "lower": _as_list(data.get("lower")),
+            "middle": _as_list(data.get("middle")),
+            "upper": _as_list(data.get("upper")),
+        }
+
+    def _build_opening_range(self, candles: list, current_spot=None) -> dict:
+        """Compute the first-hour opening range from 5m candle highs/lows."""
+        highs = []
+        lows = []
+        for candle in candles:
+            if not isinstance(candle, dict):
+                continue
+            high = candle.get("high")
+            low = candle.get("low")
+            try:
+                highs.append(float(high))
+                lows.append(float(low))
+            except (TypeError, ValueError):
+                continue
+
+        if not highs or not lows:
+            return {"high": None, "low": None, "position": "unknown"}
+
+        high = max(highs)
+        low = min(lows)
+        position = "unknown"
+        if current_spot is not None:
+            try:
+                spot = float(current_spot)
+                if spot > high:
+                    position = "above"
+                elif spot < low:
+                    position = "below"
+                else:
+                    position = "inside"
+            except (TypeError, ValueError):
+                position = "unknown"
+        return {"high": round(high, 4), "low": round(low, 4), "position": position}
+
+    def _compute_avwap(self, candles: list) -> float | None:
+        """Compute anchored VWAP from OHLCV candles."""
+        notional = 0.0
+        volume_total = 0.0
+        for candle in candles:
+            if not isinstance(candle, dict):
+                continue
+            try:
+                high = float(candle.get("high"))
+                low = float(candle.get("low"))
+                close = float(candle.get("close"))
+                volume = float(candle.get("volume"))
+            except (TypeError, ValueError):
+                continue
+            if volume <= 0:
+                continue
+            typical_price = (high + low + close) / 3.0
+            notional += typical_price * volume
+            volume_total += volume
+
+        if volume_total <= 0:
+            return None
+        return round(notional / volume_total, 4)
+
+    def fetch_asset_indicators(self, asset, current_spot=None):
         """
-        Fetch all required indicators for an asset using bulk requests.
-        Makes 2 requests total (5m + 4h) instead of 10 individual requests.
+        Fetch the curated perps indicator set for an asset.
+
+        Intraday (5m): SMA99, Keltner(130, atrLength=130, multiplier=4),
+        anchored VWAP from 2026-01-01 00:00 UTC, and first-hour opening range
+        from 5m candles.
+
+        Higher timeframe (configured interval): SMA99, Keltner(130, 130, 4),
+        and the same anchored VWAP.
         
         IMPORTANT: Free plan has 1 request per 15 seconds limit.
         This method adds 15s delay between requests to respect rate limits.
@@ -159,13 +260,21 @@ class TAAPIClient:
         Returns:
             Dict with structure:
             {
-                "5m": {"ema20": [...], "macd": [...], "rsi7": [...], "rsi14": [...]},
-                "4h": {"ema20": value, "ema50": value, "atr3": value, "atr14": value,
-                       "macd": [...], "rsi14": [...]}
+                "5m": {
+                    "sma99": [...],
+                    "avwap": 12345.67,
+                    "keltner": {"lower": [...], "middle": [...], "upper": [...]},
+                    "opening_range": {"high": ..., "low": ..., "position": ...},
+                },
+                "4h": {
+                    "sma99": [...],
+                    "avwap": 12345.67,
+                    "keltner": {"lower": [...], "middle": [...], "upper": [...]},
+                },
             }
         """
         # Check cache first (for current interval from config)
-        interval = CONFIG.get("interval", "1h")
+        interval = CONFIG.get("interval", "4h")
         
         # Try to get cached data for both intervals
         if self.enable_cache and self.cache:
@@ -180,47 +289,71 @@ class TAAPIClient:
         result = {"5m": {}, interval: {}}
 
         # Bulk request for 5m indicators
-        # Note: Free plan limit is 20 calculations per request
-        # 4 indicators × 5 results = 20 calculations (at limit)
         indicators_5m = [
-            {"id": "ema20", "indicator": "ema", "period": 20, "results": 5},
-            {"id": "macd", "indicator": "macd", "results": 5},
-            {"id": "rsi7", "indicator": "rsi", "period": 7, "results": 5},
-            {"id": "rsi14", "indicator": "rsi", "period": 14, "results": 5}
+            {"id": "sma99", "indicator": "sma", "period": 99, "results": 5},
+            {
+                "id": "keltner",
+                "indicator": "keltnerchannels",
+                "period": 130,
+                "atrLength": 130,
+                "multiplier": 4,
+                "results": 5,
+            },
         ]
 
         bulk_5m = self.fetch_bulk_indicators(symbol, "5m", indicators_5m)
 
         # Extract series data from bulk response
-        result["5m"]["ema20"] = self._extract_series(bulk_5m.get("ema20"), "value")
-        result["5m"]["macd"] = self._extract_series(bulk_5m.get("macd"), "valueMACD")
-        result["5m"]["rsi7"] = self._extract_series(bulk_5m.get("rsi7"), "value")
-        result["5m"]["rsi14"] = self._extract_series(bulk_5m.get("rsi14"), "value")
+        result["5m"]["sma99"] = self._extract_series(bulk_5m.get("sma99"), "value")
+        result["5m"]["keltner"] = self._extract_keltner_series(bulk_5m.get("keltner"))
+
+        now = datetime.now(timezone.utc)
+        start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+        end = start + timedelta(hours=1)
+        opening_range_candles = self.fetch_candles(
+            symbol,
+            "5m",
+            params={
+                "fromTimestamp": int(start.timestamp()),
+                "toTimestamp": int(end.timestamp()),
+            },
+        )
+        result["5m"]["opening_range"] = self._build_opening_range(opening_range_candles, current_spot=current_spot)
+
+        avwap_candles = self.fetch_candles(
+            symbol,
+            "1d",
+            params={
+                "fromTimestamp": int(AVWAP_ANCHOR_UTC.timestamp()),
+                "toTimestamp": int(now.timestamp()),
+                "period": 300,
+            },
+        )
+        avwap = self._compute_avwap(avwap_candles)
+        result["5m"]["avwap"] = avwap
 
         # Wait 15 seconds to respect Free plan rate limit (1 request per 15 seconds)
         logging.info(f"Waiting 15s for TAAPI rate limit (Free plan: 1 req/15s)...")
         time.sleep(15)
 
-        # Bulk request for 4h indicators
-        # Note: 4 single values (4 calc) + MACD (5 calc) + RSI14 (5 calc) = 14 calculations
-        indicators_4h = [
-            {"id": "ema20", "indicator": "ema", "period": 20},
-            {"id": "ema50", "indicator": "ema", "period": 50},
-            {"id": "atr3", "indicator": "atr", "period": 3},
-            {"id": "atr14", "indicator": "atr", "period": 14},
-            {"id": "macd", "indicator": "macd", "results": 5},
-            {"id": "rsi14", "indicator": "rsi", "period": 14, "results": 5}
+        indicators_long = [
+            {"id": "sma99", "indicator": "sma", "period": 99, "results": 5},
+            {
+                "id": "keltner",
+                "indicator": "keltnerchannels",
+                "period": 130,
+                "atrLength": 130,
+                "multiplier": 4,
+                "results": 5,
+            },
         ]
 
-        bulk_4h = self.fetch_bulk_indicators(symbol, "4h", indicators_4h)
+        bulk_long = self.fetch_bulk_indicators(symbol, interval, indicators_long)
 
         # Extract values and series
-        result[interval]["ema20"] = self._extract_value(bulk_4h.get("ema20"))
-        result[interval]["ema50"] = self._extract_value(bulk_4h.get("ema50"))
-        result[interval]["atr3"] = self._extract_value(bulk_4h.get("atr3"))
-        result[interval]["atr14"] = self._extract_value(bulk_4h.get("atr14"))
-        result[interval]["macd"] = self._extract_series(bulk_4h.get("macd"), "valueMACD")
-        result[interval]["rsi14"] = self._extract_series(bulk_4h.get("rsi14"), "value")
+        result[interval]["sma99"] = self._extract_series(bulk_long.get("sma99"), "value")
+        result[interval]["keltner"] = self._extract_keltner_series(bulk_long.get("keltner"))
+        result[interval]["avwap"] = avwap
 
         # Cache the results
         if self.enable_cache and self.cache:
