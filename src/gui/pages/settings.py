@@ -15,6 +15,11 @@ from src.backend.config_loader import CONFIG
 def create_settings(bot_service: BotService, state_manager: StateManager):
     """Create settings page with 4 tabs for configuration"""
 
+    def _assets_to_text(raw_assets) -> str:
+        if isinstance(raw_assets, list):
+            return ', '.join(str(asset).strip() for asset in raw_assets if str(asset).strip())
+        return str(raw_assets or '')
+
     ui.label('Settings').classes('text-3xl font-bold mb-4 text-white')
 
     # Configuration file path
@@ -33,7 +38,7 @@ def create_settings(bot_service: BotService, state_manager: StateManager):
         # Return defaults from environment
         return {
             'strategy': {
-                'assets': CONFIG.get('assets') or 'BTC ETH',
+                'assets': _assets_to_text(bot_service._parse_assets(CONFIG.get('assets')) or ['BTC', 'ETH']),
                 'interval': CONFIG.get('interval') or '5m',
                 'llm_model': CONFIG.get('llm_model') or 'x-ai/grok-4',
                 'reasoning_enabled': CONFIG.get('reasoning_enabled', False),
@@ -77,6 +82,37 @@ def create_settings(bot_service: BotService, state_manager: StateManager):
 
     # Load initial configuration
     config_data = load_config()
+
+    def _sync_runtime_api_config() -> None:
+        """Keep in-memory config and env in sync with the API settings form."""
+        runtime_values = {
+            'taapi_api_key': taapi_input.value or '',
+            'hyperliquid_private_key': hyperliquid_input.value or '',
+            'hyperliquid_network': hyperliquid_network.value or 'mainnet',
+            'openrouter_api_key': openrouter_input.value or '',
+            'thalex_network': thalex_network.value or 'test',
+            'thalex_key_id': thalex_key_id_input.value or '',
+            'thalex_private_key_path': thalex_pem_input.value or '',
+            'thalex_account': thalex_account_input.value or '',
+        }
+        env_map = {
+            'taapi_api_key': 'TAAPI_API_KEY',
+            'hyperliquid_private_key': 'HYPERLIQUID_PRIVATE_KEY',
+            'hyperliquid_network': 'HYPERLIQUID_NETWORK',
+            'openrouter_api_key': 'OPENROUTER_API_KEY',
+            'thalex_network': 'THALEX_NETWORK',
+            'thalex_key_id': 'THALEX_KEY_ID',
+            'thalex_private_key_path': 'THALEX_PRIVATE_KEY_PATH',
+            'thalex_account': 'THALEX_ACCOUNT',
+        }
+
+        for key, value in runtime_values.items():
+            CONFIG[key] = value
+            env_name = env_map[key]
+            if value:
+                os.environ[env_name] = value
+            else:
+                os.environ.pop(env_name, None)
 
     # ===== TABBED INTERFACE =====
     with ui.card().classes('w-full p-4'):
@@ -160,10 +196,12 @@ def create_settings(bot_service: BotService, state_manager: StateManager):
                             if save_config(config_data):
                                 # Update bot service config
                                 assets_list = [a.strip() for a in config_data['strategy']['assets'].replace(',', ' ').split() if a.strip()]
-                                bot_service.update_config({
+                                await bot_service.update_config({
                                     'assets': assets_list,
                                     'interval': config_data['strategy']['interval'],
-                                    'model': config_data['strategy']['llm_model']
+                                    'llm_model': config_data['strategy']['llm_model'],
+                                    'reasoning_enabled': config_data['strategy']['reasoning_enabled'],
+                                    'reasoning_effort': config_data['strategy']['reasoning_effort'],
                                 })
                                 ui.notify('Strategy configuration saved successfully!', type='positive')
                             else:
@@ -195,10 +233,10 @@ def create_settings(bot_service: BotService, state_manager: StateManager):
                     # Connection status indicators
                     ui.label('Connection Status').classes('text-lg font-semibold text-white')
                     with ui.row().classes('gap-4 items-center'):
-                        taapi_status = ui.label('TAAPI: 🔴 Not Connected').classes('text-sm')
-                        hyperliquid_status = ui.label('Hyperliquid: 🔴 Not Connected').classes('text-sm')
-                        openrouter_status = ui.label('OpenRouter: 🔴 Not Connected').classes('text-sm')
-                        thalex_status = ui.label('Thalex: 🔴 Not Connected').classes('text-sm')
+                        taapi_status = ui.label('TAAPI: Not configured').classes('text-sm text-gray-400')
+                        hyperliquid_status = ui.label('Hyperliquid: Not configured').classes('text-sm text-gray-400')
+                        openrouter_status = ui.label('OpenRouter: Not configured').classes('text-sm text-gray-400')
+                        thalex_status = ui.label('Thalex: Not configured').classes('text-sm text-gray-400')
                     thalex_error = ui.label('').classes('text-xs text-red-300')
 
                     ui.separator()
@@ -285,30 +323,16 @@ def create_settings(bot_service: BotService, state_manager: StateManager):
                         try:
                             ui.notify('Testing API connections...', type='info')
 
-                            # Update environment variables temporarily for testing
-                            if taapi_input.value:
-                                os.environ['TAAPI_API_KEY'] = taapi_input.value
-                            if hyperliquid_input.value:
-                                os.environ['HYPERLIQUID_PRIVATE_KEY'] = hyperliquid_input.value
-                            if openrouter_input.value:
-                                os.environ['OPENROUTER_API_KEY'] = openrouter_input.value
-                            if thalex_network.value:
-                                os.environ['THALEX_NETWORK'] = thalex_network.value
-                            if thalex_key_id_input.value:
-                                os.environ['THALEX_KEY_ID'] = thalex_key_id_input.value
-                            if thalex_pem_input.value:
-                                os.environ['THALEX_PRIVATE_KEY_PATH'] = thalex_pem_input.value
-                            if thalex_account_input.value:
-                                os.environ['THALEX_ACCOUNT'] = thalex_account_input.value
+                            _sync_runtime_api_config()
 
                             # Test connections via bot service
                             results = await bot_service.test_api_connections()
 
                             # Update status indicators
-                            taapi_status.text = f"TAAPI: {'🟢 Connected' if results.get('TAAPI', False) else '🔴 Failed'}"
-                            hyperliquid_status.text = f"Hyperliquid: {'🟢 Connected' if results.get('Hyperliquid', False) else '🔴 Failed'}"
-                            openrouter_status.text = f"OpenRouter: {'🟢 Connected' if results.get('OpenRouter', False) else '🔴 Failed'}"
-                            thalex_status.text = f"Thalex: {'🟢 Connected' if results.get('Thalex', False) else '🔴 Failed'}"
+                            _set_api_status(taapi_status, 'TAAPI', bool(results.get('TAAPI', False)))
+                            _set_api_status(hyperliquid_status, 'Hyperliquid', bool(results.get('Hyperliquid', False)))
+                            _set_api_status(openrouter_status, 'OpenRouter', bool(results.get('OpenRouter', False)))
+                            _set_api_status(thalex_status, 'Thalex', bool(results.get('Thalex', False)))
                             errors = results.get('errors')
                             if isinstance(errors, dict) and errors.get('Thalex'):
                                 thalex_error.text = f"Thalex error: {errors.get('Thalex')}"
@@ -316,8 +340,9 @@ def create_settings(bot_service: BotService, state_manager: StateManager):
                                 thalex_error.text = ''
 
                             # Show summary notification
-                            connected_count = sum(1 for v in results.values() if v)
-                            total_count = len(results)
+                            api_names = ('TAAPI', 'Hyperliquid', 'OpenRouter', 'Thalex')
+                            connected_count = sum(1 for name in api_names if results.get(name))
+                            total_count = len(api_names)
 
                             if connected_count == total_count:
                                 ui.notify(f'All APIs connected successfully! ({connected_count}/{total_count})', type='positive')
@@ -344,21 +369,8 @@ def create_settings(bot_service: BotService, state_manager: StateManager):
 
                             # Save to file
                             if save_config(config_data):
-                                # Update environment variables
-                                if taapi_input.value:
-                                    os.environ['TAAPI_API_KEY'] = taapi_input.value
-                                if hyperliquid_input.value:
-                                    os.environ['HYPERLIQUID_PRIVATE_KEY'] = hyperliquid_input.value
-                                if openrouter_input.value:
-                                    os.environ['OPENROUTER_API_KEY'] = openrouter_input.value
-                                if thalex_network.value:
-                                    os.environ['THALEX_NETWORK'] = thalex_network.value
-                                if thalex_key_id_input.value:
-                                    os.environ['THALEX_KEY_ID'] = thalex_key_id_input.value
-                                if thalex_pem_input.value:
-                                    os.environ['THALEX_PRIVATE_KEY_PATH'] = thalex_pem_input.value
-                                if thalex_account_input.value:
-                                    os.environ['THALEX_ACCOUNT'] = thalex_account_input.value
+                                _sync_runtime_api_config()
+                                _refresh_api_status_hints()
 
                                 ui.notify('API keys saved successfully!', type='positive')
                                 ui.notify('Note: Restart the bot for changes to take effect', type='info')
@@ -370,6 +382,31 @@ def create_settings(bot_service: BotService, state_manager: StateManager):
                     with ui.row().classes('gap-2'):
                         ui.button('Save API Keys', on_click=save_api_keys, icon='save').props('color=primary')
                         ui.button('Test Connections', on_click=test_api_connections, icon='network_check').props('color=secondary')
+
+                    def _set_status_tone(label, tone: str):
+                        label.classes(remove='text-gray-400 text-green-400 text-red-400 text-yellow-400')
+                        label.classes(add=tone)
+
+                    def _set_api_hint(label, service_name: str, configured: bool, pending: bool = False):
+                        if not configured:
+                            label.text = f'{service_name}: Not configured'
+                            _set_status_tone(label, 'text-gray-400')
+                        elif pending:
+                            label.text = f'{service_name}: Configured, not tested'
+                            _set_status_tone(label, 'text-yellow-400')
+
+                    def _set_api_status(label, service_name: str, connected: bool):
+                        label.text = f"{service_name}: {'Connected' if connected else 'Failed'}"
+                        _set_status_tone(label, 'text-green-400' if connected else 'text-red-400')
+
+                    def _refresh_api_status_hints():
+                        _set_api_hint(taapi_status, 'TAAPI', bool(taapi_input.value), pending=True)
+                        _set_api_hint(hyperliquid_status, 'Hyperliquid', bool(hyperliquid_input.value), pending=True)
+                        _set_api_hint(openrouter_status, 'OpenRouter', bool(openrouter_input.value), pending=True)
+                        thalex_configured = bool(thalex_key_id_input.value and thalex_pem_input.value)
+                        _set_api_hint(thalex_status, 'Thalex', thalex_configured, pending=True)
+
+                    _refresh_api_status_hints()
 
                     ui.separator()
 
@@ -541,8 +578,7 @@ def create_settings(bot_service: BotService, state_manager: StateManager):
                                 ui.notify('Desktop notifications are disabled', type='warning')
 
                             if telegram_enabled_checkbox.value and telegram_token_input.value:
-                                ui.notify('Telegram test notification would be sent here', type='info')
-                                # TODO: Implement actual Telegram notification
+                                ui.notify('Telegram delivery test is not implemented in the GUI yet.', type='warning')
 
                         except Exception as e:
                             ui.notify(f'Error sending test notification: {str(e)}', type='negative')
@@ -582,7 +618,22 @@ def create_settings(bot_service: BotService, state_manager: StateManager):
             current_config = await bot_service.get_current_config() if hasattr(bot_service, 'get_current_config') else None
             if current_config:
                 # Update UI with current config
-                pass
+                assets_input.value = _assets_to_text(current_config.get('assets')) or assets_input.value
+                interval_select.value = current_config.get('interval', interval_select.value)
+                llm_model_select.value = current_config.get('llm_model', llm_model_select.value)
+                reasoning_enabled.value = bool(current_config.get('reasoning_enabled', reasoning_enabled.value))
+                reasoning_effort.value = current_config.get('reasoning_effort', reasoning_effort.value)
+
+                taapi_input.value = current_config.get('taapi_key', taapi_input.value)
+                hyperliquid_input.value = current_config.get('hyperliquid_private_key', hyperliquid_input.value)
+                hyperliquid_network.value = current_config.get('hyperliquid_network', hyperliquid_network.value)
+                openrouter_input.value = current_config.get('openrouter_key', openrouter_input.value)
+                thalex_network.value = current_config.get('thalex_network', thalex_network.value)
+                thalex_key_id_input.value = current_config.get('thalex_key_id', thalex_key_id_input.value)
+                thalex_pem_input.value = current_config.get('thalex_private_key_path', thalex_pem_input.value)
+                thalex_account_input.value = current_config.get('thalex_account', thalex_account_input.value)
+
+                _refresh_api_status_hints()
         except Exception as e:
             pass  # Fail silently on initial load
 

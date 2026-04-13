@@ -17,15 +17,25 @@ from src.backend.config_loader import CONFIG
 class BotService:
     """Service layer for bot management and data access"""
 
+    @staticmethod
+    def _parse_assets(raw_assets: str | List[str] | None) -> List[str]:
+        """Normalize configured assets from env, settings UI, or persisted state."""
+        if raw_assets is None:
+            return []
+        if isinstance(raw_assets, str):
+            return [asset.strip() for asset in raw_assets.replace(',', ' ').split() if asset.strip()]
+        return [str(asset).strip() for asset in raw_assets if str(asset).strip()]
+
     def __init__(self):
         self.bot_engine: Optional[TradingBotEngine] = None
         self.state_manager = None  # Set externally after creation
         self.logger = logging.getLogger(__name__)
+        self.delta_hedge_enabled = bool(CONFIG.get('delta_hedge_enabled', True))
         self._reset_session_trackers()
 
         # Configuration
         self.config = {
-            'assets': CONFIG.get('assets', '').split() if CONFIG.get('assets') else ['BTC', 'ETH'],
+            'assets': self._parse_assets(CONFIG.get('assets')) or ['BTC', 'ETH'],
             'interval': CONFIG.get('interval', '5m'),
             'model': CONFIG.get('llm_model', 'x-ai/grok-4')
         }
@@ -74,6 +84,7 @@ class BotService:
             self.bot_engine = TradingBotEngine(
                 assets=assets,
                 interval=interval,
+                delta_hedge_enabled=self.delta_hedge_enabled,
                 on_state_update=self._on_state_update,
                 on_trade_executed=self._on_trade_executed,
                 on_error=self._on_error
@@ -96,6 +107,172 @@ class BotService:
         self.recent_events = []
         self._last_hedge_health = None
         self._last_degraded_underlyings = {}
+        self._last_hedge_state_error = None
+
+    @staticmethod
+    def _normalize_position(position: Dict, price_map: Dict[str, float | None]) -> Dict:
+        """Convert raw exchange positions into the UI's normalized shape."""
+        def _field(*names: str):
+            if isinstance(position, dict):
+                for name in names:
+                    if name in position:
+                        return position.get(name)
+                return None
+            for name in names:
+                if hasattr(position, name):
+                    return getattr(position, name)
+            return None
+
+        venue = str(_field('venue') or 'hyperliquid').lower()
+        asset = str(_field('asset', 'symbol', 'coin') or '')
+        instrument_name = str(_field('instrument_name') or asset)
+        symbol = instrument_name if venue == 'thalex' else asset
+
+        quantity = float(_field('quantity', 'szi', 'size') or 0)
+        side = str(_field('side') or '').lower()
+        if venue == 'thalex' and side in {'long', 'short'}:
+            quantity = abs(quantity) if side == 'long' else -abs(quantity)
+
+        entry_price = float(_field('entry_price', 'entryPx') or 0)
+        current_price = _field('current_price')
+        if current_price is None:
+            current_price = price_map.get(asset) or price_map.get(symbol)
+        current_price = float(current_price or 0)
+        unrealized_pnl = _field('unrealized_pnl', 'pnl')
+        liquidation_price = float(_field('liquidation_price', 'liquidationPx') or 0)
+        leverage = _field('leverage') or 1
+        if isinstance(leverage, dict):
+            leverage = leverage.get('value', 1)
+
+        return {
+            'row_id': f'{venue}:{instrument_name}',
+            'symbol': symbol,
+            'asset': asset,
+            'instrument_name': instrument_name,
+            'venue': venue,
+            'quantity': quantity,
+            'entry_price': entry_price,
+            'current_price': current_price,
+            'unrealized_pnl': float(unrealized_pnl or 0),
+            'liquidation_price': liquidation_price,
+            'leverage': leverage or 1,
+            'opened_by': 'External',
+            'closable': venue == 'hyperliquid',
+        }
+
+    @staticmethod
+    def _latest(series: List[float]) -> float | None:
+        return series[-1] if series else None
+
+    @staticmethod
+    def _account_field(state: object, name: str, default: float = 0.0) -> float:
+        if isinstance(state, dict):
+            value = state.get(name, default)
+        else:
+            value = getattr(state, name, default)
+        return float(value or 0.0)
+
+    @classmethod
+    def _aggregate_account_state(cls, hyperliquid_state: Dict, thalex_state: object | None = None) -> Dict:
+        balance_breakdown = {
+            'hyperliquid': cls._account_field(hyperliquid_state, 'balance'),
+        }
+        total_value_breakdown = {
+            'hyperliquid': cls._account_field(
+                hyperliquid_state,
+                'total_value',
+                default=balance_breakdown['hyperliquid'],
+            ),
+        }
+
+        if thalex_state is not None:
+            balance_breakdown['thalex'] = cls._account_field(thalex_state, 'balance')
+            total_value_breakdown['thalex'] = cls._account_field(
+                thalex_state,
+                'total_value',
+                default=balance_breakdown['thalex'],
+            )
+
+        return {
+            'balance': sum(balance_breakdown.values()),
+            'total_value': sum(total_value_breakdown.values()),
+            'balance_breakdown': balance_breakdown,
+            'total_value_breakdown': total_value_breakdown,
+        }
+
+    @classmethod
+    def _keltner_snapshot(cls, keltner: Dict, current_price: float | None) -> Dict:
+        middle_series = list((keltner or {}).get('middle') or [])
+        upper_series = list((keltner or {}).get('upper') or [])
+        lower_series = list((keltner or {}).get('lower') or [])
+        middle = cls._latest(middle_series)
+        upper = cls._latest(upper_series)
+        lower = cls._latest(lower_series)
+        position = 'unknown'
+        if all(v is not None for v in (upper, lower, current_price)):
+            if current_price > upper:
+                position = 'above'
+            elif current_price < lower:
+                position = 'below'
+            else:
+                position = 'inside'
+        return {
+            'middle': middle,
+            'upper': upper,
+            'lower': lower,
+            'position': position,
+        }
+
+    @classmethod
+    def _build_indicator_frame(cls, frame: Dict, current_price: float | None, interval: str | None = None) -> Dict:
+        frame = frame or {}
+        keltner = frame.get('keltner') or {}
+        shaped = {
+            'sma99': cls._latest(list(frame.get('sma99') or [])),
+            'avwap': frame.get('avwap'),
+            'keltner': cls._keltner_snapshot(keltner, current_price),
+            'opening_range': frame.get('opening_range') or {},
+            'series': {
+                'sma99': list(frame.get('sma99') or []),
+                'keltner_middle': list(keltner.get('middle') or []),
+                'keltner_upper': list(keltner.get('upper') or []),
+                'keltner_lower': list(keltner.get('lower') or []),
+                'timestamps': list(frame.get('timestamps') or []),
+                'price_candles': frame.get('price_candles') or {},
+            },
+        }
+        if interval:
+            shaped['interval'] = interval
+        return shaped
+
+    @classmethod
+    def _build_market_sections(
+        cls,
+        assets: List[str],
+        market_data: Dict[str, Dict],
+        indicator_payloads: Dict[str, Dict] | None = None,
+    ) -> List[Dict]:
+        """Shape manual refresh market data like the running bot state."""
+        sections: List[Dict] = []
+        indicator_payloads = indicator_payloads or {}
+        for asset in assets:
+            snapshot = market_data.get(asset, {})
+            price = snapshot.get('price')
+            indicators = indicator_payloads.get(asset) or {}
+            long_term_interval = str(CONFIG.get('interval', '4h'))
+            sections.append({
+                'asset': asset,
+                'current_price': price,
+                'price': price,
+                'funding_rate': snapshot.get('funding_rate'),
+                'open_interest': snapshot.get('open_interest'),
+                'prev_day_price': snapshot.get('prev_day_price'),
+                'volume_24h': snapshot.get('volume_24h'),
+                'timestamp': snapshot.get('timestamp'),
+                'intraday': cls._build_indicator_frame(indicators.get('5m') or {}, price),
+                'long_term': cls._build_indicator_frame(indicators.get(long_term_interval) or {}, price, interval=long_term_interval),
+            })
+        return sections
 
     async def stop(self):
         """Stop the trading bot"""
@@ -112,6 +289,50 @@ class BotService:
     def is_running(self) -> bool:
         """Check if bot is currently running"""
         return self.bot_engine is not None and self.bot_engine.is_running
+
+    def supports_delta_hedge(self) -> bool:
+        if self.bot_engine is not None:
+            return self.bot_engine.supports_delta_hedge()
+        return bool(CONFIG.get('thalex_key_id') and CONFIG.get('thalex_private_key_path'))
+
+    def is_delta_hedge_enabled(self) -> bool:
+        if self.bot_engine is not None and self.bot_engine.supports_delta_hedge():
+            return self.bot_engine.is_delta_hedge_enabled()
+        return self.supports_delta_hedge() and self.delta_hedge_enabled
+
+    async def set_delta_hedge_enabled(self, enabled: bool) -> bool:
+        if not self.supports_delta_hedge():
+            return False
+
+        enabled = bool(enabled)
+        self.delta_hedge_enabled = enabled
+
+        if self.bot_engine is not None:
+            changed = await self.bot_engine.set_delta_hedge_enabled(enabled)
+            if not changed:
+                return False
+
+        if self.state_manager and (self.bot_engine is None or not self.bot_engine.is_running):
+            state = self.state_manager.get_state()
+            state.hedge_status = {
+                'health': 'idle' if enabled else 'disabled',
+                'enabled': enabled,
+                'available': True,
+                'degraded_underlyings': {},
+                'tracked_underlyings': 0,
+                'active_underlyings': 0,
+                'state_error': None,
+                'last_update': datetime.now(UTC).isoformat(),
+            }
+            if not enabled:
+                state.hedge_metrics = []
+            self.state_manager.update(state)
+
+        self._add_event(
+            '🛡️ Delta hedge enabled' if enabled else '⏸ Delta hedge disabled',
+            level='info',
+        )
+        return True
 
     def get_state(self) -> BotState:
         """Get current bot state"""
@@ -228,11 +449,11 @@ class BotService:
             return self.bot_engine.get_assets()
         return self.config['assets']
 
-    async def refresh_market_data(self) -> bool:
+    async def refresh_market_data(self, include_indicators: bool = False) -> bool:
         """
         Manually refresh market data from Hyperliquid without starting the bot.
         Fetches account state, positions, and market data (prices, funding rates).
-        Does NOT fetch TAAPI indicators or run AI analysis.
+        Optionally includes the curated TAAPI indicator bundle for the market page.
 
         Returns:
             True if successful, False otherwise
@@ -241,6 +462,21 @@ class BotService:
             from src.backend.trading.hyperliquid_api import HyperliquidAPI
 
             hyperliquid = HyperliquidAPI()
+            taapi = None
+            indicator_payloads: Dict[str, Dict] = {}
+            rate_limit_pause = None
+
+            if include_indicators and CONFIG.get('taapi_api_key'):
+                from src.backend.indicators.taapi_client import TAAPIClient
+
+                taapi = TAAPIClient()
+                loop = asyncio.get_running_loop()
+
+                def _pause_for_taapi_rate_limit() -> None:
+                    future = asyncio.run_coroutine_threadsafe(asyncio.sleep(15), loop)
+                    future.result()
+
+                rate_limit_pause = _pause_for_taapi_rate_limit
 
             # Fetch account state (balance, positions)
             user_state = await hyperliquid.get_user_state()
@@ -249,26 +485,48 @@ class BotService:
             assets = self.get_assets()
             market_data = {}
 
-            for asset in assets:
+            for idx, asset in enumerate(assets):
                 try:
                     price = await hyperliquid.get_current_price(asset)
                     funding_rate = await hyperliquid.get_funding_rate(asset)
                     open_interest = await hyperliquid.get_open_interest(asset)
+                    prev_day_price = await hyperliquid.get_prev_day_price(asset)
+                    volume_24h = await hyperliquid.get_daily_notional_volume(asset)
 
                     market_data[asset] = {
                         'price': price,
                         'funding_rate': funding_rate,
                         'open_interest': open_interest,
-                        'timestamp': datetime.utcnow().isoformat()
+                        'prev_day_price': prev_day_price,
+                        'volume_24h': volume_24h,
+                        'timestamp': datetime.now(UTC).isoformat()
                     }
+
+                    if taapi:
+                        try:
+                            indicator_payloads[asset] = await asyncio.to_thread(
+                                taapi.fetch_asset_indicators,
+                                asset,
+                                current_spot=price,
+                                request_pause=rate_limit_pause,
+                                include_chart_data=True,
+                            )
+                        except Exception as e:
+                            self.logger.warning(f"Failed to fetch indicators for {asset}: {e}")
+                            indicator_payloads[asset] = {}
+                        if idx < len(assets) - 1:
+                            await asyncio.sleep(15)
                 except Exception as e:
                     self.logger.warning(f"Failed to fetch market data for {asset}: {e}")
                     market_data[asset] = {
                         'price': None,
                         'funding_rate': None,
                         'open_interest': None,
-                        'timestamp': datetime.utcnow().isoformat()
+                        'prev_day_price': None,
+                        'volume_24h': None,
+                        'timestamp': datetime.now(UTC).isoformat()
                     }
+                    indicator_payloads[asset] = {}
 
             # Update bot state with fresh data (create new state if bot not running)
             if not self.bot_engine:
@@ -277,19 +535,57 @@ class BotService:
             else:
                 state = self.bot_engine.get_state()
 
+            price_map = {
+                asset: snapshot.get('price')
+                for asset, snapshot in market_data.items()
+            }
+            thalex_state = None
+            normalized_positions = [
+                self._normalize_position(position, price_map)
+                for position in (user_state.get('positions') or [])
+            ]
+
+            if self.supports_delta_hedge():
+                thalex = None
+                try:
+                    from src.backend.trading.thalex_api import ThalexAPI
+
+                    thalex = ThalexAPI()
+                    thalex_state = await thalex.get_user_state()
+                    normalized_positions.extend(
+                        self._normalize_position(position, price_map)
+                        for position in (getattr(thalex_state, 'positions', []) or [])
+                    )
+                except Exception as e:
+                    self.logger.warning(f"Failed to refresh Thalex portfolio positions: {e}")
+                finally:
+                    if thalex is not None:
+                        try:
+                            await thalex.disconnect()
+                        except Exception:
+                            pass
+
+            account_snapshot = self._aggregate_account_state(user_state, thalex_state)
+
             # Update with fresh market data
-            state.balance = user_state.get('balance', state.balance)
-            state.total_value = user_state.get('total_value', state.total_value)
-            state.positions = user_state.get('positions', state.positions)
-            state.market_data = market_data
-            state.last_update = datetime.utcnow().isoformat()
+            state.balance = account_snapshot['balance']
+            state.total_value = account_snapshot['total_value']
+            state.balance_breakdown = account_snapshot['balance_breakdown']
+            state.total_value_breakdown = account_snapshot['total_value_breakdown']
+            state.positions = normalized_positions
+            state.market_data = self._build_market_sections(assets, market_data, indicator_payloads)
+            state.last_update = datetime.now(UTC).isoformat()
 
             # Update state manager
             if self.state_manager:
                 self.state_manager.update(state)
 
             # Add event to activity feed
-            self._add_event(f"📊 Market data refreshed - Balance: ${state.balance:,.2f}")
+            self._add_event(
+                "📊 Market data refreshed - Balance: "
+                f"${state.balance:,.2f} (HL ${state.balance_breakdown.get('hyperliquid', 0.0):,.2f}"
+                f", Thalex ${state.balance_breakdown.get('thalex', 0.0):,.2f})"
+            )
 
             self.logger.info("Market data refreshed successfully")
             return True
@@ -411,14 +707,23 @@ class BotService:
         hedge_status = getattr(state, 'hedge_status', {}) or {}
         hedge_health = hedge_status.get('health')
         degraded = dict(hedge_status.get('degraded_underlyings') or {})
+        state_error = hedge_status.get('state_error')
 
         if hedge_health and hedge_health != self._last_hedge_health:
-            if hedge_health == 'degraded':
-                self._add_event('⚠️ Delta hedge health degraded', level='error')
-            elif hedge_health == 'healthy':
-                self._add_event('✅ Delta hedge healthy', level='info')
-            elif hedge_health == 'idle':
-                self._add_event('ℹ️ Delta hedge idle', level='info')
+            suppress_passive_boot_event = (
+                self._last_hedge_health is None
+                and not getattr(state, 'is_running', False)
+                and hedge_health in {'disabled', 'idle'}
+            )
+            if not suppress_passive_boot_event:
+                if hedge_health == 'degraded':
+                    self._add_event('⚠️ Delta hedge health degraded', level='error')
+                elif hedge_health == 'healthy':
+                    self._add_event('✅ Delta hedge healthy', level='info')
+                elif hedge_health == 'disabled':
+                    self._add_event('⏸ Delta hedge disabled', level='info')
+                elif hedge_health == 'idle':
+                    self._add_event('ℹ️ Delta hedge idle', level='info')
             self._last_hedge_health = hedge_health
 
         for underlying, reason in degraded.items():
@@ -428,7 +733,13 @@ class BotService:
         for underlying in set(self._last_degraded_underlyings) - set(degraded):
             self._add_event(f'✅ Hedge recovered for {underlying}', level='info')
 
+        if state_error and state_error != self._last_hedge_state_error:
+            self._add_event(f'⚠️ Thalex unavailable: {state_error}', level='error')
+        if self._last_hedge_state_error and not state_error:
+            self._add_event('✅ Thalex hedge state restored', level='info')
+
         self._last_degraded_underlyings = degraded
+        self._last_hedge_state_error = state_error
 
     def _on_trade_executed(self, trade: Dict):
         """
@@ -467,8 +778,24 @@ class BotService:
     async def update_config(self, config_updates: Dict) -> bool:
         """Update bot configuration and save to file"""
         try:
+            if 'assets' in config_updates:
+                assets = self._parse_assets(config_updates['assets'])
+                self.config['assets'] = list(assets)
+                CONFIG['assets'] = ' '.join(self.config['assets'])
+
+            if 'interval' in config_updates:
+                self.config['interval'] = config_updates['interval']
+                CONFIG['interval'] = config_updates['interval']
+
+            model = config_updates.get('llm_model', config_updates.get('model'))
+            if model is not None:
+                self.config['model'] = model
+                CONFIG['llm_model'] = model
+
             # Save to .env-like configuration
             for key, value in config_updates.items():
+                if key in {'assets', 'interval', 'model', 'llm_model'}:
+                    continue
                 if isinstance(value, list):
                     CONFIG[key] = ' '.join(value)
                 else:
@@ -488,12 +815,19 @@ class BotService:
         try:
             # Load from CONFIG dict
             return {
-                'assets': CONFIG.get('assets', 'BTC ETH').split(),
+                'assets': self._parse_assets(CONFIG.get('assets', 'BTC ETH')),
                 'interval': CONFIG.get('interval', '5m'),
                 'llm_model': CONFIG.get('llm_model', 'x-ai/grok-4'),
+                'reasoning_enabled': CONFIG.get('reasoning_enabled', False),
+                'reasoning_effort': CONFIG.get('reasoning_effort', 'high'),
                 'taapi_key': CONFIG.get('taapi_api_key', ''),
                 'hyperliquid_private_key': CONFIG.get('hyperliquid_private_key', ''),
+                'hyperliquid_network': CONFIG.get('hyperliquid_network', 'mainnet'),
                 'openrouter_key': CONFIG.get('openrouter_api_key', ''),
+                'thalex_network': CONFIG.get('thalex_network', 'test'),
+                'thalex_key_id': CONFIG.get('thalex_key_id', ''),
+                'thalex_private_key_path': CONFIG.get('thalex_private_key_path', ''),
+                'thalex_account': CONFIG.get('thalex_account', ''),
                 'max_position_size': CONFIG.get('max_position_size', 1000),
                 'max_leverage': CONFIG.get('max_leverage', 5),
                 'desktop_notifications': CONFIG.get('desktop_notifications', True),
@@ -601,7 +935,7 @@ class BotService:
 
         try:
             # Test TAAPI
-            taapi_key = CONFIG.get("taapi_api_key", "")
+            taapi_key = (os.getenv("TAAPI_API_KEY") or CONFIG.get("taapi_api_key") or "").strip()
             if taapi_key and taapi_key != "your_taapi_key_here":
                 import aiohttp
                 async with aiohttp.ClientSession() as session:
@@ -617,7 +951,7 @@ class BotService:
                         errors["TAAPI"] = str(e)
 
             # Test Hyperliquid
-            hl_key = CONFIG.get("hyperliquid_private_key", "")
+            hl_key = (os.getenv("HYPERLIQUID_PRIVATE_KEY") or CONFIG.get("hyperliquid_private_key") or "").strip()
             if hl_key and hl_key != "your_private_key_here":
                 try:
                     from src.backend.trading.hyperliquid_api import HyperliquidAPI
@@ -630,7 +964,7 @@ class BotService:
                     errors["Hyperliquid"] = str(e)
 
             # Test OpenRouter
-            or_key = CONFIG.get("openrouter_api_key", "")
+            or_key = (os.getenv("OPENROUTER_API_KEY") or CONFIG.get("openrouter_api_key") or "").strip()
             if or_key and or_key != "your_openrouter_key_here":
                 import aiohttp
                 async with aiohttp.ClientSession() as session:

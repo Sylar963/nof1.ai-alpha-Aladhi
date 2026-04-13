@@ -4,6 +4,7 @@ These tests verify the class shape and config loading. They do NOT open a
 WebSocket connection to Thalex — that lives in the integration suite."""
 
 import pytest
+from types import SimpleNamespace
 
 from src.backend.trading.exchange_adapter import ExchangeAdapter
 from src.backend.trading import thalex_api as thalex_module
@@ -49,3 +50,57 @@ def test_thalex_api_rejects_unknown_network(monkeypatch):
     monkeypatch.setenv("THALEX_PRIVATE_KEY_PATH", "/tmp/fake.pem")
     with pytest.raises(ValueError, match="THALEX_NETWORK"):
         thalex_module.ThalexAPI()
+
+
+@pytest.mark.asyncio
+async def test_place_buy_order_uses_ioc_limit_price_guard():
+    from thalex import OrderType, TimeInForce
+
+    adapter = thalex_module.ThalexAPI.__new__(thalex_module.ThalexAPI)
+    adapter.venue = "thalex"
+    adapter._client = SimpleNamespace(ticker=object(), insert=object())
+
+    calls = []
+
+    async def _fake_request_with_retry(sender, **kwargs):
+        if sender is adapter._client.ticker:
+            return {"best_ask": 100.0}
+        if sender is adapter._client.insert:
+            calls.append(kwargs)
+            return {"status": "filled", "price": kwargs["price"], "order_id": "o1"}
+        raise AssertionError(f"unexpected sender {sender!r}")
+
+    adapter._request_with_retry = _fake_request_with_retry
+
+    order = await thalex_module.ThalexAPI.place_buy_order(adapter, "BTC-10MAY26-65000-C", 0.05, slippage=0.02)
+
+    assert calls[0]["order_type"] == OrderType.LIMIT
+    assert calls[0]["time_in_force"] == TimeInForce.IOC
+    assert calls[0]["price"] == pytest.approx(102.0)
+    assert order.price == pytest.approx(102.0)
+
+
+@pytest.mark.asyncio
+async def test_place_take_profit_submits_reduce_only_gtc_limit():
+    from thalex import Direction, OrderType, TimeInForce
+
+    adapter = thalex_module.ThalexAPI.__new__(thalex_module.ThalexAPI)
+    adapter.venue = "thalex"
+    adapter._client = SimpleNamespace(insert=object())
+
+    calls = []
+
+    async def _fake_request_with_retry(sender, **kwargs):
+        assert sender is adapter._client.insert
+        calls.append(kwargs)
+        return {"status": "open", "price": kwargs["price"], "order_id": "tp1"}
+
+    adapter._request_with_retry = _fake_request_with_retry
+
+    order = await thalex_module.ThalexAPI.place_take_profit(adapter, "BTC-10MAY26-65000-C", True, 0.05, 1400.0)
+
+    assert calls[0]["direction"] == Direction.SELL
+    assert calls[0]["order_type"] == OrderType.LIMIT
+    assert calls[0]["time_in_force"] == TimeInForce.GTC
+    assert calls[0]["reduce_only"] is True
+    assert order.price == pytest.approx(1400.0)

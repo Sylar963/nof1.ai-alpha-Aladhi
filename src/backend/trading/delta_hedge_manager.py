@@ -48,16 +48,42 @@ class DeltaHedgeManager:
         thalex: ExchangeAdapter,
         hyperliquid: ExchangeAdapter,
         hedger: Optional[DeltaHedger] = None,
+        enabled: bool = True,
     ) -> None:
         self.thalex = thalex
         self.hyperliquid = hyperliquid
         self.hedger = hedger or DeltaHedger()
+        self._enabled = enabled
         self._subscribed_instruments: dict[str, str] = {}
         self._reconcile_lock = asyncio.Lock()
         self._underlying_locks: dict[str, asyncio.Lock] = {}
         self.degraded_underlyings: dict[str, str] = {}
         self._metrics_by_underlying: dict[str, dict[str, Any]] = {}
         self._last_known_positions: dict[str, list[_OptionPosition]] = {}
+        self._last_state_error: Optional[str] = None
+        self._unknown_state_logged_for: set[str] = set()
+
+    def is_enabled(self) -> bool:
+        return self._enabled
+
+    async def set_enabled(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if self._enabled == enabled:
+            return
+
+        self._enabled = enabled
+        if not enabled:
+            for instrument_name in list(self._subscribed_instruments):
+                await self._drop_subscription(instrument_name)
+            self.degraded_underlyings.clear()
+            self._metrics_by_underlying.clear()
+            self._last_known_positions.clear()
+            self._last_state_error = None
+            self._unknown_state_logged_for.clear()
+            logger.info("DeltaHedgeManager disabled")
+            return
+
+        logger.info("DeltaHedgeManager enabled")
 
     async def add_position(
         self,
@@ -119,13 +145,27 @@ class DeltaHedgeManager:
 
     def get_status_snapshot(self) -> dict[str, Any]:
         """Return a UI-friendly snapshot of hedge health and metrics."""
+        if not self._enabled:
+            return {
+                "health": "disabled",
+                "enabled": False,
+                "degraded_underlyings": {},
+                "tracked_underlyings": 0,
+                "active_underlyings": 0,
+                "metrics": [],
+                "state_error": None,
+                "last_update": datetime.now(UTC).isoformat(),
+            }
+
         metrics = [
             self._metrics_by_underlying[key]
             for key in sorted(self._metrics_by_underlying)
         ]
         degraded = [m for m in metrics if m.get("degraded")]
         active = [m for m in metrics if (m.get("open_option_positions") or 0) > 0]
-        if degraded:
+        if self._last_state_error:
+            health = "unavailable"
+        elif degraded:
             health = "degraded"
         elif active:
             health = "healthy"
@@ -133,15 +173,20 @@ class DeltaHedgeManager:
             health = "idle"
         return {
             "health": health,
+            "enabled": True,
             "degraded_underlyings": dict(self.degraded_underlyings),
             "tracked_underlyings": len(metrics),
             "active_underlyings": len(active),
             "metrics": metrics,
+            "state_error": self._last_state_error,
             "last_update": datetime.now(UTC).isoformat(),
         }
 
     async def reconcile(self, underlying: Optional[str] = None) -> list[OrderResult]:
         """Rebuild subscriptions and hedge target from live Thalex positions."""
+        if not self._enabled:
+            return []
+
         async with self._reconcile_lock:
             tracked_underlyings_before = {
                 name_underlying
@@ -156,10 +201,13 @@ class DeltaHedgeManager:
             else:
                 positions = self._cached_positions(underlying=underlying)
                 if not positions:
-                    logger.warning(
-                        "delta hedge reconcile: skipping %s because Thalex position state is unknown",
-                        underlying.upper() if underlying is not None else "all underlyings",
-                    )
+                    scope = underlying.upper() if underlying is not None else "all underlyings"
+                    if scope not in self._unknown_state_logged_for:
+                        logger.warning(
+                            "delta hedge reconcile: skipping %s because Thalex position state is unknown",
+                            scope,
+                        )
+                        self._unknown_state_logged_for.add(scope)
                     return []
 
             tracked_underlyings_after = {
@@ -186,8 +234,14 @@ class DeltaHedgeManager:
         try:
             state = await self.thalex.get_user_state()
         except Exception as exc:  # pylint: disable=broad-except
-            logger.warning("delta hedge reconcile: thalex get_user_state failed: %s", exc)
+            message = str(exc)
+            if message != self._last_state_error:
+                logger.warning("delta hedge reconcile: thalex get_user_state failed: %s", exc)
+                self._last_state_error = message
             return None
+
+        self._last_state_error = None
+        self._unknown_state_logged_for.clear()
 
         raw_positions = []
         if isinstance(state, dict):
@@ -270,6 +324,9 @@ class DeltaHedgeManager:
         logger.info("DeltaHedgeManager unsubscribed %s", instrument_name)
 
     async def _on_ticker(self, instrument_name: str, payload) -> None:
+        if not self._enabled:
+            return
+
         if hasattr(self.thalex, "cache_greeks_snapshot"):
             try:
                 self.thalex.cache_greeks_snapshot(instrument_name, payload)

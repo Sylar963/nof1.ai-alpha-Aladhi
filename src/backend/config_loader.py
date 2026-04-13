@@ -2,28 +2,48 @@
 
 import json
 import os
+import re
 from dotenv import load_dotenv
 
 load_dotenv()
 
 
+def _clean_env_value(value: str | None) -> str | None:
+    """Normalize env values and ignore comment-only placeholders.
+
+    This makes `.env` entries like `KEY=  # optional override` behave like an
+    empty value instead of the literal string `# optional override`.
+    """
+    if value is None:
+        return None
+    cleaned = value.strip()
+    if cleaned.startswith("#"):
+        return ""
+    inline_comment = re.search(r"\s+#", cleaned)
+    if inline_comment:
+        cleaned = cleaned[: inline_comment.start()].strip()
+    return cleaned
+
+
 def _get_env(name: str, default: str | None = None, required: bool = False) -> str | None:
     """Fetch an environment variable with optional default and required validation."""
-    value = os.getenv(name, default)
+    value = _clean_env_value(os.getenv(name))
+    if (value is None or value == "") and default is not None:
+        value = default
     if required and (value is None or value == ""):
         raise RuntimeError(f"Missing required environment variable: {name}")
     return value
 
 
 def _get_bool(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
+    raw = _clean_env_value(os.getenv(name))
+    if raw is None or raw == "":
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _get_int(name: str, default: int | None = None) -> int | None:
-    raw = os.getenv(name)
+    raw = _clean_env_value(os.getenv(name))
     if raw is None or raw.strip() == "":
         return default
     try:
@@ -42,7 +62,7 @@ def _require_positive(name: str, value: float | int | None) -> float | int | Non
 
 
 def _get_json(name: str, default: dict | None = None) -> dict | None:
-    raw = os.getenv(name)
+    raw = _clean_env_value(os.getenv(name))
     if raw is None or raw.strip() == "":
         return default
     try:
@@ -55,7 +75,7 @@ def _get_json(name: str, default: dict | None = None) -> dict | None:
 
 
 def _get_list(name: str, default: list[str] | None = None) -> list[str] | None:
-    raw = os.getenv(name)
+    raw = _clean_env_value(os.getenv(name))
     if raw is None or raw.strip() == "":
         return default
     raw = raw.strip()

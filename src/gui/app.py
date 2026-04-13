@@ -65,12 +65,12 @@ def create_app():
     ''')
 
     # Main layout
-    with ui.column().classes('w-full h-screen'):
+    with ui.column().classes('w-full h-screen overflow-hidden'):
         create_header(state_manager)
 
-        with ui.row().classes('w-full flex-grow'):
+        with ui.row().classes('w-full flex-grow min-h-0 no-wrap'):
             # Sidebar with navigation
-            with ui.column().classes('w-64 bg-gray-800 p-4 gap-2 h-full'):
+            with ui.column().classes('w-64 shrink-0 bg-gray-800 p-4 gap-2 h-full'):
                 # Navigation buttons
                 menu_items = [
                     ('Dashboard', '📊 Dashboard', 'Main dashboard with metrics'),
@@ -99,7 +99,7 @@ def create_app():
 
             # Main content area (will be updated by navigation)
             global content_container
-            content_container = ui.column().classes('flex-grow p-6 overflow-auto items-start')
+            content_container = ui.column().classes('flex-grow min-w-0 h-full w-full p-6 overflow-auto items-start')
 
     # Load default page
     with content_container:

@@ -624,6 +624,45 @@ async def test_credit_put_spread_executes_two_legs_in_correct_directions():
 
 
 @pytest.mark.asyncio
+async def test_multi_leg_unwinds_submitted_legs_when_later_leg_fails():
+    thalex = FakeThalex()
+    hl = FakeHyperliquid()
+    executor = OptionsExecutor(thalex=thalex, hyperliquid=hl)
+    thalex.instruments_by_intent[("BTC", "put", 14, 55000.0)] = "BTC-25APR26-55000-P"
+    thalex.instruments_by_intent[("BTC", "put", 14, 50000.0)] = "BTC-25APR26-50000-P"
+
+    real_buy = thalex.place_buy_order
+
+    async def _failing_buy(asset, amount, slippage=0.01):
+        if asset == "BTC-25APR26-50000-P":
+            raise RuntimeError("second leg failed")
+        return await real_buy(asset, amount, slippage)
+
+    thalex.place_buy_order = _failing_buy
+
+    decision = parse_decision({
+        "venue": "thalex",
+        "asset": "BTC",
+        "action": "sell",
+        "strategy": "credit_put_spread",
+        "underlying": "BTC",
+        "tenor_days": 14,
+        "legs": [
+            {"kind": "put", "side": "sell", "target_strike": 55000, "contracts": 0.05},
+            {"kind": "put", "side": "buy", "target_strike": 50000, "contracts": 0.05},
+        ],
+        "rationale": "short vol",
+    })
+    result = await executor.execute(decision, open_positions_count=0)
+
+    assert result.ok is False
+    methods = [c.method for c in thalex.calls]
+    assert methods == ["sell", "buy"]
+    assert thalex.calls[1].asset == "BTC-25APR26-55000-P"
+    assert hl.calls == []
+
+
+@pytest.mark.asyncio
 async def test_credit_call_spread_executes_two_call_legs():
     """Sell near call + buy further OTM call = defined-risk credit call spread."""
     thalex = FakeThalex()

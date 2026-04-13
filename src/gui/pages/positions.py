@@ -9,8 +9,27 @@ from src.gui.services.state_manager import StateManager
 
 def create_positions(bot_service: BotService, state_manager: StateManager):
     """Create positions page with live table and action buttons"""
+
+    def _format_price(value) -> str:
+        return f'${float(value):,.2f}' if value is not None else 'N/A'
+
+    def _format_signed_currency(value) -> str:
+        return f'${float(value):+,.2f}' if value is not None else 'N/A'
+
+    def _format_position_snapshot(row: dict) -> str:
+        return (
+            f"Side: {row.get('side', 'N/A')}\n"
+            f"Size: {float(row.get('quantity') or 0):.4f} {row.get('symbol', '')}\n"
+            f"Entry Price: {_format_price(row.get('entry_price'))}\n"
+            f"Current Price: {_format_price(row.get('current_price'))}\n"
+            f"Unrealized PnL: {_format_signed_currency(row.get('unrealized_pnl'))}\n"
+            f"PnL %: {float(row.get('pnl_pct') or 0):+.2f}%\n"
+            f"Leverage: {row.get('leverage', 'N/A')}x\n"
+            f"Liquidation Price: {_format_price(row.get('liquidation_price'))}"
+        )
     
     ui.label('Active Positions').classes('text-3xl font-bold mb-4 text-white')
+    ui.label('Source: latest bot state merged from Hyperliquid and Thalex portfolio data').classes('text-xs text-gray-400 mb-3')
     
     # Summary cards
     with ui.row().classes('w-full gap-4 mb-6'):
@@ -35,7 +54,9 @@ def create_positions(bot_service: BotService, state_manager: StateManager):
         
         # Table columns definition
         columns = [
-            {'name': 'symbol', 'label': 'Asset', 'field': 'symbol', 'align': 'left', 'sortable': True},
+            {'name': 'symbol', 'label': 'Position', 'field': 'symbol', 'align': 'left', 'sortable': True},
+            {'name': 'venue', 'label': 'Venue', 'field': 'venue', 'align': 'center', 'sortable': True},
+            {'name': 'opened_by', 'label': 'Opened By', 'field': 'opened_by', 'align': 'center', 'sortable': True},
             {'name': 'side', 'label': 'Side', 'field': 'side', 'align': 'center', 'sortable': True},
             {'name': 'quantity', 'label': 'Size', 'field': 'quantity', 'align': 'right', 'sortable': True},
             {'name': 'entry_price', 'label': 'Entry Price', 'field': 'entry_price', 'align': 'right', 'sortable': True},
@@ -51,7 +72,7 @@ def create_positions(bot_service: BotService, state_manager: StateManager):
         table = ui.table(
             columns=columns,
             rows=[],
-            row_key='symbol',
+            row_key='row_id',
             pagination={'rowsPerPage': 10, 'sortBy': 'unrealized_pnl', 'descending': True}
         ).classes('w-full')
         
@@ -76,7 +97,52 @@ def create_positions(bot_service: BotService, state_manager: StateManager):
         # Custom cell rendering for Side
         table.add_slot('body-cell-side', '''
             <q-td :props="props">
-                <q-badge :color="props.row.side === 'LONG' ? 'green' : 'red'" :label="props.row.side" />
+                <q-badge :color="props.row.side === 'LONG' ? 'green' : props.row.side === 'SHORT' ? 'red' : 'grey'" :label="props.row.side" />
+            </q-td>
+        ''')
+
+        table.add_slot('body-cell-venue', '''
+            <q-td :props="props">
+                <q-badge :color="props.row.venue === 'THALEX' ? 'purple' : 'blue'" :label="props.row.venue" />
+            </q-td>
+        ''')
+
+        table.add_slot('body-cell-opened_by', '''
+            <q-td :props="props">
+                <q-badge :color="props.row.opened_by === 'AI' ? 'positive' : 'grey-7'" :label="props.row.opened_by" />
+            </q-td>
+        ''')
+
+        table.add_slot('body-cell-quantity', '''
+            <q-td :props="props">
+                <span>{{ props.row.quantity !== null ? props.row.quantity.toFixed(4) : '-' }}</span>
+            </q-td>
+        ''')
+
+        table.add_slot('body-cell-entry_price', '''
+            <q-td :props="props">
+                <span v-if="props.row.entry_price !== null">${{ props.row.entry_price.toFixed(2) }}</span>
+                <span v-else class="text-gray-500">-</span>
+            </q-td>
+        ''')
+
+        table.add_slot('body-cell-current_price', '''
+            <q-td :props="props">
+                <span v-if="props.row.current_price !== null">${{ props.row.current_price.toFixed(2) }}</span>
+                <span v-else class="text-gray-500">-</span>
+            </q-td>
+        ''')
+
+        table.add_slot('body-cell-liquidation_price', '''
+            <q-td :props="props">
+                <span v-if="props.row.liquidation_price !== null">${{ props.row.liquidation_price.toFixed(2) }}</span>
+                <span v-else class="text-gray-500">-</span>
+            </q-td>
+        ''')
+
+        table.add_slot('body-cell-leverage', '''
+            <q-td :props="props">
+                <span>{{ props.row.leverage !== null ? Number(props.row.leverage).toFixed(1) + 'x' : '-' }}</span>
             </q-td>
         ''')
         
@@ -86,7 +152,7 @@ def create_positions(bot_service: BotService, state_manager: StateManager):
                 <q-btn flat dense icon="show_chart" color="blue" size="sm" @click="$parent.$emit('chart', props.row)">
                     <q-tooltip>View Chart</q-tooltip>
                 </q-btn>
-                <q-btn flat dense icon="close" color="red" size="sm" @click="$parent.$emit('close', props.row)">
+                <q-btn v-if="props.row.closable" flat dense icon="close" color="red" size="sm" @click="$parent.$emit('close', props.row)">
                     <q-tooltip>Close Position</q-tooltip>
                 </q-btn>
             </q-td>
@@ -96,7 +162,7 @@ def create_positions(bot_service: BotService, state_manager: StateManager):
         chart_dialog = ui.dialog()
         with chart_dialog, ui.card().classes('w-96'):
             dialog_title = ui.label('').classes('text-xl font-bold mb-4')
-            dialog_content = ui.label('Chart functionality coming soon...').classes('text-gray-400')
+            dialog_content = ui.label('').classes('text-gray-400 whitespace-pre-wrap')
             ui.button('Close', on_click=chart_dialog.close).classes('mt-4')
         
         # Close confirmation dialog
@@ -109,36 +175,39 @@ def create_positions(bot_service: BotService, state_manager: StateManager):
                 close_confirm_btn = ui.button('Close Position', on_click=lambda: None).classes('bg-red-600')
         
         # Event handlers
-        current_position = {'symbol': None}
+        current_position = {'target': None, 'label': None}
         
         def show_chart(e):
-            """Show chart dialog for position"""
+            """Show current position snapshot dialog."""
             position = e.args
-            dialog_title.text = f"{position['symbol']} Chart"
+            dialog_title.text = f"{position['symbol']} Snapshot"
+            dialog_content.text = _format_position_snapshot(position)
             chart_dialog.open()
         
         async def show_close_dialog(e):
             """Show close confirmation dialog"""
             position = e.args
-            current_position['symbol'] = position['symbol']
+            current_position['target'] = position.get('asset') or position.get('symbol')
+            current_position['label'] = position.get('symbol')
             close_title.text = f"Close {position['symbol']} Position?"
             close_message.text = f"Are you sure you want to close your {position['side']} position in {position['symbol']}?\n\nCurrent PnL: ${position['unrealized_pnl']:.2f} ({position['pnl_pct']:+.2f}%)"
             close_dialog.open()
-        
+
         async def confirm_close():
             """Confirm position closing"""
-            symbol = current_position['symbol']
-            if symbol:
+            target = current_position['target']
+            label = current_position['label'] or target
+            if target:
                 try:
                     close_dialog.close()
-                    ui.notify(f'Closing {symbol} position...', type='info')
+                    ui.notify(f'Closing {label} position...', type='info')
                     
-                    success = await bot_service.close_position(symbol)
+                    success = await bot_service.close_position(target)
                     
                     if success:
-                        ui.notify(f'Successfully closed {symbol} position!', type='positive')
+                        ui.notify(f'Successfully closed {label} position!', type='positive')
                     else:
-                        ui.notify(f'Failed to close {symbol} position', type='negative')
+                        ui.notify(f'Failed to close {label} position', type='negative')
                 except Exception as e:
                     ui.notify(f'Error closing position: {str(e)}', type='negative')
         
@@ -165,7 +234,10 @@ def create_positions(bot_service: BotService, state_manager: StateManager):
             if positions:
                 # Calculate summary metrics
                 total_unrealized_pnl = sum(p.get('unrealized_pnl', 0) for p in positions)
-                total_notional = sum(abs(p.get('quantity', 0) * p.get('current_price', 0)) for p in positions)
+                total_notional = sum(
+                    abs((p.get('quantity', 0) or 0) * ((p.get('current_price') if p.get('current_price') not in (None, 0) else p.get('entry_price')) or 0))
+                    for p in positions
+                )
                 
                 # Update summary cards
                 positions_count.text = str(len(positions))
@@ -181,28 +253,33 @@ def create_positions(bot_service: BotService, state_manager: StateManager):
                 rows = []
                 for pos in positions:
                     quantity = pos.get('quantity', 0)
-                    entry_price = pos.get('entry_price', 0)
-                    current_price = pos.get('current_price', 0)
+                    entry_price = pos.get('entry_price') if pos.get('entry_price') not in (None, 0) else None
+                    current_price = pos.get('current_price') if pos.get('current_price') not in (None, 0) else None
                     unrealized_pnl = pos.get('unrealized_pnl', 0)
                     
                     # Calculate PnL percentage
-                    pnl_pct = 0
-                    if entry_price > 0:
+                    pnl_pct = 0.0
+                    if entry_price and current_price and entry_price > 0:
                         if quantity > 0:  # LONG
                             pnl_pct = ((current_price - entry_price) / entry_price) * 100
-                        else:  # SHORT
+                        elif quantity < 0:  # SHORT
                             pnl_pct = ((entry_price - current_price) / entry_price) * 100
                     
                     rows.append({
+                        'row_id': pos.get('row_id') or f"{pos.get('venue', 'hyperliquid')}:{pos.get('instrument_name') or pos.get('symbol')}",
                         'symbol': pos.get('symbol', ''),
-                        'side': 'LONG' if quantity > 0 else 'SHORT',
+                        'venue': str(pos.get('venue', 'hyperliquid')).upper(),
+                        'opened_by': pos.get('opened_by', 'External'),
+                        'side': 'LONG' if quantity > 0 else 'SHORT' if quantity < 0 else 'FLAT',
                         'quantity': abs(quantity),
                         'entry_price': entry_price,
                         'current_price': current_price,
                         'unrealized_pnl': unrealized_pnl,
                         'pnl_pct': pnl_pct,
-                        'leverage': pos.get('leverage', 1),
-                        'liquidation_price': pos.get('liquidation_price', 0),
+                        'leverage': pos.get('leverage'),
+                        'liquidation_price': pos.get('liquidation_price') if pos.get('liquidation_price') not in (None, 0) else None,
+                        'asset': pos.get('asset') or pos.get('symbol', ''),
+                        'closable': bool(pos.get('closable', True)),
                     })
                 
                 table.rows = rows
@@ -212,6 +289,7 @@ def create_positions(bot_service: BotService, state_manager: StateManager):
                 positions_count.text = '0'
                 total_pnl.text = '$0.00'
                 total_exposure.text = '$0.00'
+                total_pnl.classes(remove='text-green-500 text-red-500', add='text-white')
         
         except Exception as e:
             ui.notify(f'Error updating positions: {str(e)}', type='warning')
