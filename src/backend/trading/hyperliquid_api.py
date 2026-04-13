@@ -42,6 +42,7 @@ class HyperliquidAPI(ExchangeAdapter):
     """
 
     venue = "hyperliquid"
+    _EMPTY_SPOT_META = {"universe": [], "tokens": []}
 
     def __init__(self):
         """Initialize wallet credentials and instantiate exchange clients.
@@ -93,8 +94,10 @@ class HyperliquidAPI(ExchangeAdapter):
 
     def _build_clients(self):
         """Instantiate exchange and info client instances for the active base URL."""
-        self.info = Info(self.base_url)
-        self.exchange = Exchange(self.wallet, self.base_url)
+        # Manual refresh and perp trading do not need spot metadata, and bypassing
+        # the SDK's spot bootstrap avoids intermittent IndexError crashes.
+        self.info = Info(self.base_url, skip_ws=True, spot_meta=self._EMPTY_SPOT_META)
+        self.exchange = Exchange(self.wallet, self.base_url, spot_meta=self._EMPTY_SPOT_META)
 
     def _reset_clients(self):
         """Recreate SDK clients after connection failures while logging failures."""
@@ -333,7 +336,16 @@ class HyperliquidAPI(ExchangeAdapter):
         """
         state = await self._retry(lambda: self.info.user_state(self.wallet.address))
         positions = state.get("assetPositions", [])
-        total_value = float(state.get("accountValue", 0.0))
+        margin_summary = state.get("marginSummary") if isinstance(state.get("marginSummary"), dict) else {}
+        cross_margin_summary = (
+            state.get("crossMarginSummary") if isinstance(state.get("crossMarginSummary"), dict) else {}
+        )
+        total_value = float(
+            state.get("accountValue", 0.0)
+            or cross_margin_summary.get("accountValue", 0.0)
+            or margin_summary.get("accountValue", 0.0)
+            or 0.0
+        )
         enriched_positions = []
         for pos_wrap in positions:
             pos = pos_wrap["position"]
@@ -345,7 +357,14 @@ class HyperliquidAPI(ExchangeAdapter):
             pos["pnl"] = pnl
             pos["notional_entry"] = abs(size) * entry_px
             enriched_positions.append(pos)
-        balance = float(state.get("withdrawable", 0.0))
+        balance = float(
+            state.get("accountValue", 0.0)
+            or cross_margin_summary.get("accountValue", 0.0)
+            or margin_summary.get("accountValue", 0.0)
+            or 0.0
+        )
+        if not balance:
+            balance = float(state.get("withdrawable", 0.0) or 0.0)
         if not total_value:
             total_value = balance + sum(max(p.get("pnl", 0.0), 0.0) for p in enriched_positions)
         return {"balance": balance, "total_value": total_value, "positions": enriched_positions}
@@ -374,6 +393,21 @@ class HyperliquidAPI(ExchangeAdapter):
             self._meta_cache = response
         return self._meta_cache
 
+    async def _get_asset_ctx(self, asset: str) -> dict | None:
+        """Return the raw asset context payload for ``asset`` when present."""
+        try:
+            data = await self.get_meta_and_ctxs()
+            if isinstance(data, list) and len(data) >= 2:
+                meta, asset_ctxs = data[0], data[1]
+                universe = meta.get("universe", [])
+                asset_idx = next((i for i, u in enumerate(universe) if u.get("name") == asset), None)
+                if asset_idx is not None and asset_idx < len(asset_ctxs):
+                    return asset_ctxs[asset_idx]
+            return None
+        except (RuntimeError, ValueError, KeyError, ConnectionError, TypeError) as e:
+            logging.error("Asset context fetch error for %s: %s", asset, e)
+            return None
+
     async def get_open_interest(self, asset):
         """Return open interest for ``asset`` if it exists in cached metadata.
 
@@ -384,14 +418,10 @@ class HyperliquidAPI(ExchangeAdapter):
             Rounded open interest or ``None`` if unavailable.
         """
         try:
-            data = await self.get_meta_and_ctxs()
-            if isinstance(data, list) and len(data) >= 2:
-                meta, asset_ctxs = data[0], data[1]
-                universe = meta.get("universe", [])
-                asset_idx = next((i for i, u in enumerate(universe) if u.get("name") == asset), None)
-                if asset_idx is not None and asset_idx < len(asset_ctxs):
-                    oi = asset_ctxs[asset_idx].get("openInterest")
-                    return round(float(oi), 2) if oi else None
+            asset_ctx = await self._get_asset_ctx(asset)
+            if asset_ctx:
+                oi = asset_ctx.get("openInterest")
+                return round(float(oi), 2) if oi is not None else None
             return None
         except (RuntimeError, ValueError, KeyError, ConnectionError, TypeError) as e:
             logging.error("OI fetch error for %s: %s", asset, e)
@@ -407,15 +437,35 @@ class HyperliquidAPI(ExchangeAdapter):
             Funding rate as a float or ``None`` when not present.
         """
         try:
-            data = await self.get_meta_and_ctxs()
-            if isinstance(data, list) and len(data) >= 2:
-                meta, asset_ctxs = data[0], data[1]
-                universe = meta.get("universe", [])
-                asset_idx = next((i for i, u in enumerate(universe) if u.get("name") == asset), None)
-                if asset_idx is not None and asset_idx < len(asset_ctxs):
-                    funding = asset_ctxs[asset_idx].get("funding")
-                    return round(float(funding), 8) if funding else None
+            asset_ctx = await self._get_asset_ctx(asset)
+            if asset_ctx:
+                funding = asset_ctx.get("funding")
+                return round(float(funding), 8) if funding is not None else None
             return None
         except (RuntimeError, ValueError, KeyError, ConnectionError, TypeError) as e:
             logging.error("Funding fetch error for %s: %s", asset, e)
+            return None
+
+    async def get_prev_day_price(self, asset: str) -> float | None:
+        """Return the prior daily reference price for ``asset`` when available."""
+        try:
+            asset_ctx = await self._get_asset_ctx(asset)
+            if asset_ctx:
+                prev_day_px = asset_ctx.get("prevDayPx")
+                return float(prev_day_px) if prev_day_px is not None else None
+            return None
+        except (RuntimeError, ValueError, KeyError, ConnectionError, TypeError) as e:
+            logging.error("Prev day price fetch error for %s: %s", asset, e)
+            return None
+
+    async def get_daily_notional_volume(self, asset: str) -> float | None:
+        """Return the trailing 24h notional volume for ``asset`` when available."""
+        try:
+            asset_ctx = await self._get_asset_ctx(asset)
+            if asset_ctx:
+                day_notional_volume = asset_ctx.get("dayNtlVlm")
+                return float(day_notional_volume) if day_notional_volume is not None else None
+            return None
+        except (RuntimeError, ValueError, KeyError, ConnectionError, TypeError) as e:
+            logging.error("24h volume fetch error for %s: %s", asset, e)
             return None

@@ -148,6 +148,47 @@ def _extract_greeks(payload: Any) -> dict:
     return found
 
 
+def _quote_field(payload: Any, *paths: tuple[str, ...]) -> Optional[float]:
+    if not isinstance(payload, dict):
+        return None
+    for path in paths:
+        node: Any = payload
+        for segment in path:
+            if not isinstance(node, dict):
+                node = None
+                break
+            node = node.get(segment)
+        if node is None:
+            continue
+        try:
+            return float(node)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _stable_asset_multiplier(currency: str, index_price: Any) -> Optional[float]:
+    if index_price is not None:
+        try:
+            return float(index_price)
+        except (TypeError, ValueError):
+            return None
+    if str(currency or "").upper() in {"USD", "USDC", "USDT", "DAI"}:
+        return 1.0
+    return None
+
+
+def _summary_amount(summary: dict, *keys: str) -> Optional[float]:
+    for key in keys:
+        if key not in summary:
+            continue
+        try:
+            return float(summary.get(key) or 0.0)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 class ThalexAPI(ExchangeAdapter):
     """ExchangeAdapter implementation backed by the official ``thalex`` library."""
 
@@ -469,56 +510,206 @@ class ThalexAPI(ExchangeAdapter):
     # ExchangeAdapter implementation
     # ------------------------------------------------------------------
 
-    async def place_buy_order(self, asset: str, amount: float, slippage: float = 0.01) -> OrderResult:
-        from thalex import Direction, OrderType
+    async def _entry_limit_price(self, instrument_name: str, side: str, slippage: float) -> float:
+        ticker = await self._request_with_retry(
+            self._client.ticker,
+            instrument_name=instrument_name,
+            description=f"Thalex ticker {instrument_name}",
+        )
+        if side == "buy":
+            reference = _quote_field(
+                ticker,
+                ("best_ask",),
+                ("ask_price",),
+                ("mark_price",),
+                ("last_price",),
+                ("best_bid",),
+            )
+            if reference is None or reference <= 0:
+                raise RuntimeError(f"No ask/mark quote available for {instrument_name}")
+            return reference * (1.0 + max(float(slippage or 0.0), 0.0))
 
-        result = await self._request(
+        reference = _quote_field(
+            ticker,
+            ("best_bid",),
+            ("bid_price",),
+            ("mark_price",),
+            ("last_price",),
+            ("best_ask",),
+        )
+        if reference is None or reference <= 0:
+            raise RuntimeError(f"No bid/mark quote available for {instrument_name}")
+        return max(reference * (1.0 - max(float(slippage or 0.0), 0.0)), 0.0)
+
+    async def _submit_limit_order(
+        self,
+        *,
+        instrument_name: str,
+        amount: float,
+        side: str,
+        limit_price: float,
+        time_in_force=None,
+        reduce_only: bool | None = None,
+        description: str,
+    ) -> OrderResult:
+        from thalex import Direction, OrderType, TimeInForce
+
+        direction = Direction.BUY if side == "buy" else Direction.SELL
+        tif = time_in_force if time_in_force is not None else TimeInForce.IOC
+        result = await self._request_with_retry(
             self._client.insert,
-            direction=Direction.BUY,
+            direction=direction,
+            instrument_name=instrument_name,
+            amount=amount,
+            price=limit_price,
+            order_type=OrderType.LIMIT,
+            time_in_force=tif,
+            reduce_only=reduce_only,
+            description=description,
+        )
+        return self._make_order_result(instrument_name, side, amount, result, submitted_price=limit_price)
+
+    async def _submit_conditional_order(
+        self,
+        *,
+        instrument_name: str,
+        amount: float,
+        side: str,
+        stop_price: float,
+        limit_price: Optional[float] = None,
+        bracket_price: Optional[float] = None,
+        trailing_stop_callback_rate: Optional[float] = None,
+        reduce_only: bool = True,
+        description: str,
+    ) -> OrderResult:
+        from thalex import Direction, Target
+
+        direction = Direction.BUY if side == "buy" else Direction.SELL
+        result = await self._request_with_retry(
+            self._client.create_conditional_order,
+            direction=direction,
+            instrument_name=instrument_name,
+            amount=amount,
+            stop_price=float(stop_price),
+            limit_price=float(limit_price) if limit_price is not None else None,
+            bracket_price=float(bracket_price) if bracket_price is not None else None,
+            trailing_stop_callback_rate=(
+                float(trailing_stop_callback_rate)
+                if trailing_stop_callback_rate is not None
+                else None
+            ),
+            reduce_only=reduce_only,
+            target=Target.MARK,
+            description=description,
+        )
+        return self._make_order_result(
+            instrument_name,
+            side,
+            amount,
+            result,
+            submitted_price=limit_price,
+        )
+
+    async def place_buy_order(self, asset: str, amount: float, slippage: float = 0.01) -> OrderResult:
+        limit_price = await self._entry_limit_price(asset, "buy", slippage)
+        return await self._submit_limit_order(
             instrument_name=asset,
             amount=amount,
-            order_type=OrderType.MARKET,
+            side="buy",
+            limit_price=limit_price,
+            description=f"Thalex buy {asset}",
         )
-        return self._make_order_result(asset, "buy", amount, result)
 
     async def place_sell_order(self, asset: str, amount: float, slippage: float = 0.01) -> OrderResult:
-        from thalex import Direction, OrderType
-
-        result = await self._request(
-            self._client.insert,
-            direction=Direction.SELL,
+        limit_price = await self._entry_limit_price(asset, "sell", slippage)
+        return await self._submit_limit_order(
             instrument_name=asset,
             amount=amount,
-            order_type=OrderType.MARKET,
+            side="sell",
+            limit_price=limit_price,
+            description=f"Thalex sell {asset}",
         )
-        return self._make_order_result(asset, "sell", amount, result)
 
     async def place_take_profit(self, asset: str, is_buy: bool, amount: float, tp_price: float) -> OrderResult:
-        """Thalex does not support trigger orders for options.
+        from thalex import TimeInForce
 
-        For v1, the strategy layer is responsible for monitoring price and
-        submitting an exit limit order. We return a sentinel OrderResult so the
-        bot engine can log this gracefully without crashing.
-        """
-        return OrderResult(
-            venue=self.venue,
-            order_id="",
-            asset=asset,
-            side="tp",
+        exit_side = "sell" if is_buy else "buy"
+        return await self._submit_limit_order(
+            instrument_name=asset,
             amount=amount,
-            status="not_supported",
-            error="Thalex options have no native TP triggers; handled by strategy layer",
+            side=exit_side,
+            limit_price=float(tp_price),
+            time_in_force=TimeInForce.GTC,
+            reduce_only=True,
+            description=f"Thalex take-profit {asset}",
         )
 
     async def place_stop_loss(self, asset: str, is_buy: bool, amount: float, sl_price: float) -> OrderResult:
-        return OrderResult(
-            venue=self.venue,
-            order_id="",
-            asset=asset,
-            side="sl",
+        exit_side = "sell" if is_buy else "buy"
+        return await self._submit_conditional_order(
+            instrument_name=asset,
             amount=amount,
-            status="not_supported",
-            error="Thalex options have no native SL triggers; handled by strategy layer",
+            side=exit_side,
+            stop_price=float(sl_price),
+            reduce_only=True,
+            description=f"Thalex stop-loss {asset}",
+        )
+
+    async def place_stop_limit_order(
+        self,
+        asset: str,
+        is_buy: bool,
+        amount: float,
+        stop_price: float,
+        limit_price: float,
+    ) -> OrderResult:
+        exit_side = "sell" if is_buy else "buy"
+        return await self._submit_conditional_order(
+            instrument_name=asset,
+            amount=amount,
+            side=exit_side,
+            stop_price=float(stop_price),
+            limit_price=float(limit_price),
+            reduce_only=True,
+            description=f"Thalex stop-limit {asset}",
+        )
+
+    async def place_bracket_order(
+        self,
+        asset: str,
+        is_buy: bool,
+        amount: float,
+        stop_price: float,
+        bracket_price: float,
+    ) -> OrderResult:
+        exit_side = "sell" if is_buy else "buy"
+        return await self._submit_conditional_order(
+            instrument_name=asset,
+            amount=amount,
+            side=exit_side,
+            stop_price=float(stop_price),
+            bracket_price=float(bracket_price),
+            reduce_only=True,
+            description=f"Thalex bracket {asset}",
+        )
+
+    async def place_trailing_stop_order(
+        self,
+        asset: str,
+        is_buy: bool,
+        amount: float,
+        stop_price: float,
+        callback_rate: float,
+    ) -> OrderResult:
+        exit_side = "sell" if is_buy else "buy"
+        return await self._submit_conditional_order(
+            instrument_name=asset,
+            amount=amount,
+            side=exit_side,
+            stop_price=float(stop_price),
+            trailing_stop_callback_rate=float(callback_rate),
+            reduce_only=True,
+            description=f"Thalex trailing-stop {asset}",
         )
 
     async def cancel_order(self, asset: str, order_id: Any) -> dict:
@@ -542,11 +733,44 @@ class ThalexAPI(ExchangeAdapter):
         return []
 
     async def get_user_state(self) -> AccountState:
+        if not self.connected:
+            await self.connect()
+        if self._client is None:
+            raise RuntimeError("Thalex client not initialized after connect()")
+
         summary = await self._request(self._client.account_summary)
         portfolio = await self._request(self._client.portfolio)
 
-        balance = float((summary or {}).get("equity", 0.0) or 0.0)
-        total_value = float((summary or {}).get("portfolio_value", balance) or balance)
+        summary_dict = summary if isinstance(summary, dict) else {}
+        cash_entries = summary_dict.get("cash") if isinstance(summary_dict.get("cash"), list) else []
+        derived_cash_collateral = 0.0
+        for entry in cash_entries:
+            if not isinstance(entry, dict):
+                continue
+            multiplier = _stable_asset_multiplier(
+                str(entry.get("currency") or entry.get("asset_name") or ""),
+                entry.get("collateral_index_price"),
+            )
+            if multiplier is None:
+                continue
+            try:
+                derived_cash_collateral += float(entry.get("balance") or 0.0) * multiplier
+            except (TypeError, ValueError):
+                continue
+
+        cash_collateral = _summary_amount(summary_dict, "cash_collateral")
+        if cash_collateral is None:
+            cash_collateral = derived_cash_collateral
+        unrealized_pnl = _summary_amount(summary_dict, "unrealised_pnl", "unrealized_pnl") or 0.0
+        margin = _summary_amount(summary_dict, "margin", "equity", "portfolio_value")
+        if margin is None:
+            margin = cash_collateral + unrealized_pnl
+
+        balance = float(margin or cash_collateral or 0.0)
+        total_value = float(
+            _summary_amount(summary_dict, "portfolio_value", "margin", "equity")
+            or balance
+        )
 
         positions: list[PositionSnapshot] = []
         if isinstance(portfolio, list):
@@ -622,12 +846,30 @@ class ThalexAPI(ExchangeAdapter):
     # Helpers
     # ------------------------------------------------------------------
 
-    def _make_order_result(self, asset: str, side: str, amount: float, raw: Any) -> OrderResult:
+    def _make_order_result(
+        self,
+        asset: str,
+        side: str,
+        amount: float,
+        raw: Any,
+        *,
+        submitted_price: Optional[float] = None,
+    ) -> OrderResult:
         order_id = ""
         status = "ok"
+        price = submitted_price
         if isinstance(raw, dict):
             order_id = str(raw.get("order_id") or raw.get("id") or "")
             status = str(raw.get("status") or "ok")
+            price = _quote_field(
+                raw,
+                ("price",),
+                ("average_price",),
+                ("avg_price",),
+                ("filled_price",),
+                ("fill_price",),
+                ("limit_price",),
+            ) or price
         return OrderResult(
             venue=self.venue,
             order_id=order_id,
@@ -636,5 +878,6 @@ class ThalexAPI(ExchangeAdapter):
             amount=amount,
             status=status,
             instrument_name=asset,
+            price=price,
             raw=raw if isinstance(raw, dict) else None,
         )

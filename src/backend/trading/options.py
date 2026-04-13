@@ -122,6 +122,35 @@ def _expiry_from_thalex(record: dict) -> Optional[date]:
     return spec.expiry if spec else None
 
 
+def _record_delta(record: dict) -> Optional[float]:
+    """Extract a live-ish delta hint from an instrument/ticker record.
+
+    Public instrument snapshots are not fully standardized, so we defensively
+    try a few plausible layouts and return ``None`` when no usable delta is
+    present.
+    """
+    candidates = [
+        record.get("delta"),
+        record.get("mark_delta"),
+        record.get("option_delta"),
+    ]
+    greeks = record.get("greeks")
+    if isinstance(greeks, dict):
+        candidates.append(greeks.get("delta"))
+    greek = record.get("greek")
+    if isinstance(greek, dict):
+        candidates.append(greek.get("delta"))
+
+    for value in candidates:
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def find_best_instrument(
     instruments: Iterable[dict],
     intent: OptionIntent,
@@ -137,7 +166,10 @@ def find_best_instrument(
     """
     today = today or date.today()
     desired_kind = intent.kind.lower()
-    candidates: list[tuple[int, float, str]] = []  # (tenor_distance, strike_distance, name)
+    candidates: list[tuple[int, float, float, str]] = []
+    # Shape: (tenor_distance, primary_distance, secondary_distance, name)
+    # ``primary_distance`` is strike error when target_strike is provided,
+    # otherwise delta error when target_delta is provided.
 
     for record in instruments:
         if record.get("type") != "option":
@@ -155,16 +187,36 @@ def find_best_instrument(
             continue
         tenor_distance = abs(days_out - intent.tenor_days)
         if intent.target_strike is not None:
-            strike_distance = abs(spec.strike - intent.target_strike)
+            primary_distance = abs(spec.strike - intent.target_strike)
+            delta_hint = _record_delta(record)
+            secondary_distance = (
+                abs(abs(delta_hint) - abs(intent.target_delta))
+                if delta_hint is not None and intent.target_delta is not None
+                else 0.0
+            )
+        elif intent.target_delta is not None:
+            delta_hint = _record_delta(record)
+            if delta_hint is None:
+                primary_distance = float("inf")
+            else:
+                primary_distance = abs(abs(delta_hint) - abs(intent.target_delta))
+            secondary_distance = 0.0
         else:
-            strike_distance = 0.0
-        candidates.append((tenor_distance, strike_distance, record["instrument_name"]))
+            primary_distance = 0.0
+            secondary_distance = 0.0
+        candidates.append((tenor_distance, primary_distance, secondary_distance, record["instrument_name"]))
 
     if not candidates:
         return None
 
-    candidates.sort(key=lambda c: (c[0], c[1]))
-    return candidates[0][2]
+    if intent.target_strike is None and intent.target_delta is not None:
+        finite_candidates = [candidate for candidate in candidates if candidate[1] != float("inf")]
+        if not finite_candidates:
+            return None
+        candidates = finite_candidates
+
+    candidates.sort(key=lambda c: (c[0], c[1], c[2]))
+    return candidates[0][3]
 
 
 def validate_options_order(

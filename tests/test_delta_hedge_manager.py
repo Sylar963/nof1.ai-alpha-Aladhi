@@ -1,6 +1,7 @@
 """Tests for the portfolio-driven DeltaHedgeManager."""
 
 from dataclasses import dataclass
+import logging
 
 import pytest
 
@@ -301,6 +302,56 @@ async def test_status_snapshot_exposes_underlying_metrics():
 
 
 @pytest.mark.asyncio
+async def test_status_snapshot_exposes_unavailable_state_error():
+    thalex = FakeThalexForHedge()
+    thalex.fail_user_state = True
+    hl = FakeHyperliquidForHedge(perp_size=0.0)
+    manager = DeltaHedgeManager(thalex=thalex, hyperliquid=hl, hedger=DeltaHedger(threshold=0.02))
+
+    await manager.reconcile()
+    snapshot = manager.get_status_snapshot()
+
+    assert snapshot["health"] == "unavailable"
+    assert snapshot["state_error"] == "temporary thalex outage"
+
+
+@pytest.mark.asyncio
+async def test_disabled_manager_skips_reconcile_and_reports_disabled_status():
+    thalex = FakeThalexForHedge()
+    thalex.positions = [_option_position(instrument_name="BTC-10MAY26-65000-C", delta=0.5)]
+    hl = FakeHyperliquidForHedge(perp_size=0.0)
+    manager = DeltaHedgeManager(
+        thalex=thalex,
+        hyperliquid=hl,
+        hedger=DeltaHedger(threshold=0.02),
+        enabled=False,
+    )
+
+    orders = await manager.reconcile()
+    snapshot = manager.get_status_snapshot()
+
+    assert orders == []
+    assert thalex.subscribed == []
+    assert hl.calls == []
+    assert snapshot["health"] == "disabled"
+    assert snapshot["enabled"] is False
+
+
+@pytest.mark.asyncio
+async def test_disabling_manager_unsubscribes_live_tickers():
+    thalex = FakeThalexForHedge()
+    thalex.positions = [_option_position(instrument_name="BTC-10MAY26-65000-C", delta=0.5)]
+    hl = FakeHyperliquidForHedge(perp_size=0.0)
+    manager = DeltaHedgeManager(thalex=thalex, hyperliquid=hl, hedger=DeltaHedger(threshold=0.02))
+
+    await manager.reconcile()
+    await manager.set_enabled(False)
+
+    assert "BTC-10MAY26-65000-C" in thalex.unsubscribed
+    assert manager.get_status_snapshot()["health"] == "disabled"
+
+
+@pytest.mark.asyncio
 async def test_reconcile_unsubscribes_closed_positions_and_flattens_hedge():
     thalex = FakeThalexForHedge()
     thalex.positions = [_option_position(instrument_name="BTC-10MAY26-65000-C", delta=0.5)]
@@ -335,6 +386,32 @@ async def test_reconcile_keeps_subscriptions_and_hedge_when_position_state_is_un
     assert thalex.unsubscribed == []
     assert hl.perp_size == pytest.approx(-0.025)
     assert len(hl.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_reconcile_logs_unavailable_state_only_once_until_recovered(caplog):
+    thalex = FakeThalexForHedge()
+    thalex.fail_user_state = True
+    hl = FakeHyperliquidForHedge(perp_size=0.0)
+    manager = DeltaHedgeManager(thalex=thalex, hyperliquid=hl, hedger=DeltaHedger(threshold=0.02))
+
+    with caplog.at_level(logging.WARNING):
+        await manager.reconcile()
+        await manager.reconcile()
+
+    messages = [record.message for record in caplog.records]
+    assert messages.count("delta hedge reconcile: thalex get_user_state failed: temporary thalex outage") == 1
+    assert messages.count("delta hedge reconcile: skipping all underlyings because Thalex position state is unknown") == 1
+
+    thalex.fail_user_state = False
+    await manager.reconcile()
+    thalex.fail_user_state = True
+
+    with caplog.at_level(logging.WARNING):
+        await manager.reconcile()
+
+    messages = [record.message for record in caplog.records]
+    assert messages.count("delta hedge reconcile: thalex get_user_state failed: temporary thalex outage") == 2
 
 
 @pytest.mark.asyncio

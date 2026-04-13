@@ -115,9 +115,21 @@ class HedgeAction:
 class OptionsExecutor:
     """Executes options decisions across Thalex (and Hyperliquid for hedging)."""
 
-    def __init__(self, thalex: ExchangeAdapter, hyperliquid: ExchangeAdapter) -> None:
+    def __init__(
+        self,
+        thalex: ExchangeAdapter,
+        hyperliquid: ExchangeAdapter,
+        delta_hedge_enabled: bool = True,
+    ) -> None:
         self.thalex = thalex
         self.hyperliquid = hyperliquid
+        self._delta_hedge_enabled = bool(delta_hedge_enabled)
+
+    def set_delta_hedge_enabled(self, enabled: bool) -> None:
+        self._delta_hedge_enabled = bool(enabled)
+
+    def is_delta_hedge_enabled(self) -> bool:
+        return self._delta_hedge_enabled
 
     async def execute(self, decision: TradeDecision, open_positions_count: int) -> ExecutionResult:
         if decision.venue != "thalex":
@@ -211,6 +223,9 @@ class OptionsExecutor:
 
         thalex_order = await self.thalex.place_buy_order(instrument_name, contracts)
 
+        if not self._delta_hedge_enabled:
+            return ExecutionResult(ok=True, thalex_orders=[thalex_order], hyperliquid_orders=[])
+
         # Determine hedge direction + size from the live delta.
         hedge_size = abs(contracts * delta_per_contract)
         hl_orders = []
@@ -253,6 +268,31 @@ class OptionsExecutor:
                 instrument_name,
                 exc,
             )
+
+    async def _unwind_multi_leg_orders(
+        self,
+        submitted_legs: list[tuple[str, str, float]],
+    ) -> None:
+        """Best-effort rollback for partially-submitted multi-leg structures."""
+        for instrument_name, side, contracts in reversed(submitted_legs):
+            try:
+                if side == "sell":
+                    await self.thalex.place_buy_order(instrument_name, contracts)
+                else:
+                    await self.thalex.place_sell_order(instrument_name, contracts)
+                logger.info(
+                    "unwind: reversed multi-leg %s %s (%.4f contracts)",
+                    side,
+                    instrument_name,
+                    contracts,
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.warning(
+                    "unwind: reverse multi-leg %s %s failed: %s — manual intervention may be needed",
+                    side,
+                    instrument_name,
+                    exc,
+                )
 
     async def _execute_delta_hedged_multi_tenor(
         self,
@@ -372,6 +412,9 @@ class OptionsExecutor:
             thalex_orders.append(thalex_order)
             submitted_thalex.append((instrument_name, per_leg_contracts))
 
+            if not self._delta_hedge_enabled:
+                continue
+
             hedge_size = abs(per_leg_contracts * delta_per_contract)
             if hedge_size <= 0:
                 continue
@@ -490,6 +533,7 @@ class OptionsExecutor:
             if not ok:
                 return ExecutionResult(ok=False, reason=f"leg rejected: {reason}")
 
+        staged_legs: list[tuple[str, str, float]] = []
         thalex_orders = []
         for leg in decision.legs:
             intent = OptionIntent(
@@ -500,13 +544,28 @@ class OptionsExecutor:
                 target_strike=leg.target_strike,
                 target_delta=leg.target_delta,
             )
-            instrument_name = await self.thalex.resolve_intent(intent)  # type: ignore[attr-defined]
+            try:
+                instrument_name = await self.thalex.resolve_intent(intent)  # type: ignore[attr-defined]
+            except Exception as exc:  # pylint: disable=broad-except
+                return ExecutionResult(ok=False, reason=f"resolve_intent failed for leg {leg}: {exc}")
             if not instrument_name:
                 return ExecutionResult(ok=False, reason=f"no instrument for leg {leg}")
-            if leg.side == "sell":
-                order = await self.thalex.place_sell_order(instrument_name, leg.contracts)
-            else:
-                order = await self.thalex.place_buy_order(instrument_name, leg.contracts)
+            staged_legs.append((instrument_name, leg.side, leg.contracts))
+
+        submitted_legs: list[tuple[str, str, float]] = []
+        for instrument_name, side, contracts in staged_legs:
+            try:
+                if side == "sell":
+                    order = await self.thalex.place_sell_order(instrument_name, contracts)
+                else:
+                    order = await self.thalex.place_buy_order(instrument_name, contracts)
+            except Exception as exc:  # pylint: disable=broad-except
+                await self._unwind_multi_leg_orders(submitted_legs)
+                return ExecutionResult(
+                    ok=False,
+                    reason=f"thalex submit failed for {instrument_name}: {exc}",
+                )
+            submitted_legs.append((instrument_name, side, contracts))
             thalex_orders.append(order)
 
         return ExecutionResult(ok=True, thalex_orders=thalex_orders)

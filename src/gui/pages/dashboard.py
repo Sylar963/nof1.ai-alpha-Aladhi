@@ -11,6 +11,31 @@ from src.gui.services.state_manager import StateManager
 def create_dashboard(bot_service: BotService, state_manager: StateManager):
     """Create dashboard page with real-time metrics, charts, and controls"""
 
+    def _format_compact_number(value: float | int | None, prefix: str = '') -> str:
+        if value is None:
+            return '--'
+        amount = float(value)
+        for threshold, suffix in ((1e9, 'B'), (1e6, 'M'), (1e3, 'K')):
+            if abs(amount) >= threshold:
+                return f'{prefix}{amount / threshold:,.2f}{suffix}'
+        if amount.is_integer():
+            return f'{prefix}{amount:,.0f}'
+        return f'{prefix}{amount:,.2f}'
+
+    def _format_change(current_price: float | None, prev_day_price: float | None) -> tuple[str, str]:
+        if current_price is None or prev_day_price is None or prev_day_price <= 0:
+            return '--', 'text-gray-400'
+        change_pct = ((current_price - prev_day_price) / prev_day_price) * 100
+        if change_pct > 0:
+            return f'+{change_pct:.2f}%', 'text-green-400'
+        if change_pct < 0:
+            return f'{change_pct:.2f}%', 'text-red-400'
+        return '0.00%', 'text-gray-400'
+
+    def _set_status_indicator_tone(tone: str):
+        status_indicator.classes(remove='text-gray-400 text-green-500 text-red-500')
+        status_indicator.classes(add=tone)
+
     ui.label('Dashboard').classes('text-3xl font-bold mb-4 text-white')
 
     # ===== METRICS CARDS =====
@@ -19,6 +44,7 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
         with ui.card().classes('metric-card'):
             balance_value = ui.label('$0.00').classes('text-4xl font-bold text-white')
             ui.label('Total Balance').classes('text-sm text-gray-200 mt-2')
+            balance_breakdown_value = ui.label('HL: -- | Thalex: --').classes('text-xs text-gray-300 mt-1')
 
         # Card 2: Total Return
         with ui.card().classes('metric-card'):
@@ -34,6 +60,7 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
         with ui.card().classes('metric-card'):
             positions_value = ui.label('0').classes('text-4xl font-bold text-white')
             ui.label('Active Positions').classes('text-sm text-gray-200 mt-2')
+            positions_breakdown_value = ui.label('AI: 0 | External: 0').classes('text-xs text-gray-300 mt-1')
 
         # Card 5: Hedge Health
         with ui.card().classes('metric-card'):
@@ -92,6 +119,10 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
     # ===== MARKET DATA =====
     with ui.card().classes('w-full p-4 mb-6'):
         ui.label('Market Data').classes('text-xl font-bold text-white mb-2')
+        with ui.row().classes('gap-2 text-xs text-gray-400 mb-3 wrap'): 
+            ui.badge('Price: Hyperliquid mids').classes('bg-gray-800 text-gray-200')
+            ui.badge('24h metrics: Hyperliquid metaAndAssetCtxs').classes('bg-gray-800 text-gray-200')
+            ui.badge('Indicators: TAAPI').classes('bg-gray-800 text-gray-200')
         market_data_container = ui.column().classes('w-full gap-4')
         
         with market_data_container:
@@ -135,6 +166,9 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
             stop_btn.classes('bg-red-600 hover:bg-red-700 text-white px-6 py-3')
             stop_btn.props('disable')  # Initially disabled
 
+            hedge_toggle_btn = ui.button('⏸ Delta Hedge OFF', on_click=lambda: toggle_delta_hedge())
+            hedge_toggle_btn.classes('bg-yellow-600 hover:bg-yellow-700 text-white px-6 py-3')
+
             # Status indicator
             status_indicator = ui.label('⚫ Stopped').classes('text-lg font-bold ml-4')
 
@@ -154,7 +188,7 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
             await bot_service.start()
 
             status_indicator.text = '🟢 Running'
-            status_indicator.classes(remove='text-gray-400', add='text-green-500')
+            _set_status_indicator_tone('text-green-500')
             start_btn.props('disable')
             stop_btn.props(remove='disable')
 
@@ -163,7 +197,7 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
 
         except Exception as e:
             status_indicator.text = '🔴 Error'
-            status_indicator.classes(add='text-red-500')
+            _set_status_indicator_tone('text-red-500')
             activity_log.push(f'❌ Error starting bot: {str(e)}')
             ui.notify(f'Failed to start: {str(e)}', type='negative')
 
@@ -176,7 +210,7 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
             await bot_service.stop()
 
             status_indicator.text = '⚫ Stopped'
-            status_indicator.classes(remove='text-green-500', add='text-gray-400')
+            _set_status_indicator_tone('text-gray-400')
             start_btn.props(remove='disable')
             stop_btn.props('disable')
 
@@ -187,12 +221,36 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
             activity_log.push(f'❌ Error stopping bot: {str(e)}')
             ui.notify(f'Failed to stop: {str(e)}', type='negative')
 
+    async def toggle_delta_hedge():
+        """Enable or disable live delta hedging from the dashboard."""
+        if not bot_service.supports_delta_hedge():
+            ui.notify('Delta hedge is unavailable until Thalex is configured', type='warning')
+            return
+
+        desired_state = not bot_service.is_delta_hedge_enabled()
+        hedge_toggle_btn.enabled = False
+        try:
+            success = await bot_service.set_delta_hedge_enabled(desired_state)
+            if success:
+                ui.notify(
+                    'Delta hedge enabled' if desired_state else 'Delta hedge disabled',
+                    type='positive' if desired_state else 'info',
+                )
+                await update_dashboard()
+            else:
+                ui.notify('Unable to change delta hedge state', type='negative')
+        except Exception as e:
+            ui.notify(f'Failed to update delta hedge: {str(e)}', type='negative')
+        finally:
+            hedge_toggle_btn.enabled = True
+
     # ===== AUTO-REFRESH FUNCTIONS =====
 
     import time
     import asyncio
     last_refresh_time = None
     refresh_seconds_ago = 0
+    displayed_events = set()
 
     async def refresh_market_data():
         """Refresh market data from Hyperliquid without starting bot"""
@@ -204,7 +262,7 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
             activity_log.push('📊 Refreshing market data...')
 
             # Call bot service to refresh data
-            success = await bot_service.refresh_market_data()
+            success = await bot_service.refresh_market_data(include_indicators=True)
 
             if success:
                 last_refresh_time = time.time()
@@ -238,6 +296,11 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
 
             # Update metrics cards
             balance_value.text = f'${state.balance:,.2f}'
+            balance_breakdown = getattr(state, 'balance_breakdown', {}) or {}
+            balance_breakdown_value.text = (
+                f"HL: ${balance_breakdown.get('hyperliquid', 0.0):,.2f} | "
+                f"Thalex: ${balance_breakdown.get('thalex', 0.0):,.2f}"
+            )
 
             # Return with color coding
             return_pct = state.total_return_pct
@@ -248,23 +311,38 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
                 return_value.classes(remove='text-green-500', add='text-red-500')
 
             sharpe_value.text = f'{state.sharpe_ratio:.2f}'
-            positions_value.text = str(len(state.positions or []))
+            positions = state.positions or []
+            positions_value.text = str(len(positions))
+            ai_positions = sum(1 for position in positions if position.get('opened_by') == 'AI')
+            positions_breakdown_value.text = f'AI: {ai_positions} | External: {len(positions) - ai_positions}'
 
             hedge_status = getattr(state, 'hedge_status', {}) or {}
             hedge_metrics = getattr(state, 'hedge_metrics', []) or []
             hedge_health = str(hedge_status.get('health', 'idle')).upper()
+            hedge_enabled = bool(hedge_status.get('enabled', bot_service.is_delta_hedge_enabled()))
+            hedge_available = bool(hedge_status.get('available', bot_service.supports_delta_hedge()))
             hedge_health_value.text = hedge_health
             tracked = hedge_status.get('tracked_underlyings', 0)
             active = hedge_status.get('active_underlyings', 0)
             degraded = hedge_status.get('degraded_underlyings', {}) or {}
+            state_error = hedge_status.get('state_error')
             hedge_health_summary.text = f'{active} active / {tracked} tracked'
-            if hedge_health == 'HEALTHY':
+            if not hedge_available:
+                hedge_health_value.text = 'UNAVAILABLE'
+                hedge_health_value.classes(remove='text-green-500 text-red-500 text-yellow-400', add='text-gray-400')
+                hedge_health_summary.text = 'Delta hedge unavailable'
+            elif not hedge_enabled or hedge_health == 'DISABLED':
+                hedge_health_value.text = 'DISABLED'
+                hedge_health_value.classes(remove='text-green-500 text-red-500 text-gray-400', add='text-yellow-400')
+                hedge_health_summary.text = 'Delta hedge paused from GUI'
+            elif hedge_health == 'HEALTHY':
                 hedge_health_value.classes(remove='text-red-500 text-yellow-400 text-gray-400', add='text-green-500')
             elif hedge_health == 'DEGRADED':
                 hedge_health_value.classes(remove='text-green-500 text-gray-400', add='text-red-500')
                 hedge_health_summary.text = f'{len(degraded)} degraded underlying(s)'
             elif hedge_health == 'UNAVAILABLE':
                 hedge_health_value.classes(remove='text-green-500 text-red-500', add='text-gray-400')
+                hedge_health_summary.text = state_error or 'Hedge state unavailable'
             else:
                 hedge_health_value.classes(remove='text-green-500 text-red-500', add='text-gray-400')
 
@@ -279,7 +357,6 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
                 equity_chart.update()
 
             # Update asset allocation chart
-            positions = state.positions or []
             if positions:
                 labels = [p['symbol'] for p in positions]
                 values = [abs(p['quantity'] * p['entry_price']) for p in positions]
@@ -297,7 +374,11 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
                     with ui.grid(columns=len(market_data)).classes('w-full gap-4'):
                         for asset_data in market_data:
                             asset = asset_data.get('asset', 'N/A')
-                            price = asset_data.get('current_price', 0)
+                            price = asset_data.get('current_price')
+                            prev_day_price = asset_data.get('prev_day_price')
+                            volume_24h = asset_data.get('volume_24h')
+                            open_interest = asset_data.get('open_interest')
+                            change_text, change_tone = _format_change(price, prev_day_price)
                             
                             # Intraday data
                             intraday = asset_data.get('intraday', {})
@@ -310,8 +391,20 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
                             lt_avwap = lt.get('avwap', 0)
                             
                             with ui.card().classes('p-4 bg-gradient-to-br from-gray-700 to-gray-800'):
-                                ui.label(asset).classes('text-2xl font-bold text-white mb-2')
-                                ui.label(f'${price:,.2f}').classes('text-xl text-green-400 mb-3')
+                                with ui.row().classes('w-full items-center justify-between mb-2'):
+                                    ui.label(asset).classes('text-2xl font-bold text-white')
+                                    ui.badge('Hyperliquid + TAAPI').classes('bg-gray-900 text-gray-200')
+                                ui.label(f'${price:,.2f}' if price is not None else '--').classes('text-xl text-green-400 mb-2')
+                                with ui.grid(columns=3).classes('w-full gap-2 mb-3'):
+                                    with ui.card().classes('p-2 bg-gray-900/40'):
+                                        ui.label('24h Change').classes('text-xs text-gray-400')
+                                        ui.label(change_text).classes(f'text-sm font-bold {change_tone}')
+                                    with ui.card().classes('p-2 bg-gray-900/40'):
+                                        ui.label('24h Volume').classes('text-xs text-gray-400')
+                                        ui.label(_format_compact_number(volume_24h, prefix='$')).classes('text-sm font-bold text-white')
+                                    with ui.card().classes('p-2 bg-gray-900/40'):
+                                        ui.label('Open Interest').classes('text-xs text-gray-400')
+                                        ui.label(_format_compact_number(open_interest)).classes('text-sm font-bold text-white')
                                 
                                 with ui.column().classes('gap-1 text-sm'):
                                     ui.label(f'SMA99 (5m): {sma99:.2f}' if sma99 else 'SMA99 (5m): N/A').classes('text-gray-300')
@@ -324,7 +417,12 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
                     ui.label('No market data available').classes('text-gray-400 text-center py-4')
 
             hedge_alert_container.clear()
-            if degraded:
+            if state_error:
+                with hedge_alert_container:
+                    with ui.card().classes('w-full bg-yellow-900/40 border border-yellow-700 p-3'):
+                        ui.label('Thalex unavailable').classes('text-yellow-300 font-semibold')
+                        ui.label(str(state_error)).classes('text-sm text-yellow-100')
+            elif degraded:
                 with hedge_alert_container:
                     for underlying, reason in degraded.items():
                         with ui.card().classes('w-full bg-red-900/40 border border-red-700 p-3'):
@@ -364,24 +462,43 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
 
             # Update activity log with recent events
             recent_events = bot_service.get_recent_events(limit=5)
+            current_event_keys = []
             for event in recent_events[-5:]:  # Last 5 only
-                activity_log.push(f"[{event['time']}] {event['message']}")
+                event_key = (event.get('time'), event.get('message'), event.get('level'))
+                current_event_keys.append(event_key)
+                if event_key not in displayed_events:
+                    activity_log.push(f"[{event['time']}] {event['message']}")
+                    displayed_events.add(event_key)
+            displayed_events.intersection_update(current_event_keys)
 
             # Update button states based on bot status
+            if hedge_available:
+                hedge_toggle_btn.props(remove='disable')
+                if hedge_enabled:
+                    hedge_toggle_btn.text = '🛡 Delta Hedge ON'
+                    hedge_toggle_btn.classes(remove='bg-yellow-600 hover:bg-yellow-700 bg-gray-600', add='bg-green-600 hover:bg-green-700')
+                else:
+                    hedge_toggle_btn.text = '⏸ Delta Hedge OFF'
+                    hedge_toggle_btn.classes(remove='bg-green-600 hover:bg-green-700 bg-gray-600', add='bg-yellow-600 hover:bg-yellow-700')
+            else:
+                hedge_toggle_btn.text = 'Delta Hedge Unavailable'
+                hedge_toggle_btn.classes(remove='bg-green-600 hover:bg-green-700 bg-yellow-600 hover:bg-yellow-700', add='bg-gray-600')
+                hedge_toggle_btn.props('disable')
+
             if state.is_running:
                 status_indicator.text = '🟢 Running'
-                status_indicator.classes(remove='text-gray-400', add='text-green-500')
+                _set_status_indicator_tone('text-green-500')
                 start_btn.props('disable')
                 stop_btn.props(remove='disable')
             else:
                 status_indicator.text = '⚫ Stopped'
-                status_indicator.classes(remove='text-green-500', add='text-gray-400')
+                _set_status_indicator_tone('text-gray-400')
                 start_btn.props(remove='disable')
                 stop_btn.props('disable')
 
             if state.error:
                 status_indicator.text = '🔴 Error'
-                status_indicator.classes(add='text-red-500')
+                _set_status_indicator_tone('text-red-500')
                 activity_log.push(f'Error: {state.error}')
 
             # Update refresh timestamp

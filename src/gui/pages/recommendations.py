@@ -64,6 +64,17 @@ def create_recommendations(bot_service: BotService, state_manager: StateManager)
         with proposals_container:
             for proposal in proposals:
                 create_proposal_card(proposal)
+
+    def _proposal_percent_label(action: str, entry_price: float, target_price: float | None, fallback: float | None = None) -> str | None:
+        if fallback is not None:
+            return f'{fallback:+.2f}%'
+        if not target_price or not entry_price:
+            return None
+        if action == 'sell':
+            pct = ((entry_price - target_price) / entry_price) * 100
+        else:
+            pct = ((target_price - entry_price) / entry_price) * 100
+        return f'{pct:+.2f}%'
     
     def create_proposal_card(proposal: dict):
         """Create a card for a single proposal"""
@@ -128,9 +139,9 @@ def create_recommendations(bot_service: BotService, state_manager: StateManager)
                     ui.label('Take Profit').classes('text-xs text-gray-400 mb-1')
                     if tp_price:
                         ui.label(f'${tp_price:,.2f}').classes('text-xl text-green-400 font-bold')
-                        if entry_price:
-                            pct = ((tp_price - entry_price) / entry_price) * 100
-                            ui.label(f'+{pct:.2f}%').classes('text-xs text-green-300')
+                        tp_pct_label = _proposal_percent_label(action, entry_price, tp_price, potential_gain)
+                        if tp_pct_label:
+                            ui.label(tp_pct_label).classes('text-xs text-green-300')
                     else:
                         ui.label('N/A').classes('text-xl text-gray-500')
                 
@@ -139,9 +150,9 @@ def create_recommendations(bot_service: BotService, state_manager: StateManager)
                     ui.label('Stop Loss').classes('text-xs text-gray-400 mb-1')
                     if sl_price:
                         ui.label(f'${sl_price:,.2f}').classes('text-xl text-red-400 font-bold')
-                        if entry_price:
-                            pct = ((sl_price - entry_price) / entry_price) * 100
-                            ui.label(f'{pct:.2f}%').classes('text-xs text-red-300')
+                        sl_pct_label = _proposal_percent_label(action, entry_price, sl_price, potential_loss)
+                        if sl_pct_label:
+                            ui.label(sl_pct_label).classes('text-xs text-red-300')
                     else:
                         ui.label('N/A').classes('text-xl text-gray-500')
             

@@ -13,6 +13,15 @@ from src.gui.services.state_manager import StateManager
 def create_reasoning(bot_service: BotService, state_manager: StateManager):
     """Create AI reasoning page with JSON editor and decision timeline"""
 
+    def _normalize_confidence(confidence: float | int | None) -> tuple[float, int]:
+        if confidence is None:
+            return 0.0, 0
+        value = float(confidence)
+        if value <= 1:
+            return max(0.0, min(value, 1.0)), int(value * 100)
+        pct = max(0.0, min(value, 100.0))
+        return pct / 100.0, int(pct)
+
     ui.label('AI Reasoning').classes('text-3xl font-bold mb-4 text-white')
 
     # ===== JSON EDITOR SECTION =====
@@ -157,9 +166,9 @@ def create_reasoning(bot_service: BotService, state_manager: StateManager):
                                 ):
                                     # Confidence indicator
                                     if confidence:
-                                        confidence_pct = int(confidence * 100) if confidence <= 1 else int(confidence)
+                                        confidence_progress, confidence_pct = _normalize_confidence(confidence)
                                         with ui.row().classes('items-center gap-2 mb-2'):
-                                            ui.linear_progress(value=confidence).classes('flex-grow')
+                                            ui.linear_progress(value=confidence_progress).classes('flex-grow')
                                             ui.label(f'{confidence_pct}%').classes('text-xs text-gray-400 w-12')
 
                                     # Rationale
@@ -171,7 +180,9 @@ def create_reasoning(bot_service: BotService, state_manager: StateManager):
                                         ui.label(f'Allocation: ${allocation:,.2f}')
                                         ui.label(f'TP: {tp_price if tp_price else "N/A"}')
                                         ui.label(f'SL: {sl_price if sl_price else "N/A"}')
-                                        ui.label(f'Exit Plan: {exit_plan[:50]}...' if len(str(exit_plan)) > 50 else f'Exit Plan: {exit_plan}', column_span=2)
+                                        ui.label(
+                                            f'Exit Plan: {exit_plan[:50]}...' if len(str(exit_plan)) > 50 else f'Exit Plan: {exit_plan}'
+                                        ).classes('col-span-2')
                     else:
                         ui.label(f'No {action_filter.value} decisions in current batch').classes('text-gray-400 text-center py-4')
                 else:

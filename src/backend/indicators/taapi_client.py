@@ -180,6 +180,59 @@ class TAAPIClient:
             "upper": _as_list(data.get("upper")),
         }
 
+    def _normalize_candle_timestamp(self, candle: dict) -> str | None:
+        """Extract an ISO timestamp from a TAAPI candle payload."""
+        if not isinstance(candle, dict):
+            return None
+
+        for key in ("timestampHuman", "datetime", "date", "time"):
+            value = candle.get(key)
+            if isinstance(value, str) and value:
+                try:
+                    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=timezone.utc)
+                    return parsed.astimezone(timezone.utc).isoformat()
+                except ValueError:
+                    return value
+
+        for key in ("timestamp", "startTime", "closeTime", "unix"):
+            value = candle.get(key)
+            if value in (None, ""):
+                continue
+            try:
+                raw = float(value)
+            except (TypeError, ValueError):
+                continue
+            if raw > 1_000_000_000_000:
+                raw /= 1000.0
+            return datetime.fromtimestamp(raw, tz=timezone.utc).isoformat()
+
+        return None
+
+    def _extract_candle_series(self, candles: list) -> dict:
+        """Normalize TAAPI candles into Plotly-friendly OHLC arrays."""
+        series = {"time": [], "open": [], "high": [], "low": [], "close": []}
+        for candle in candles:
+            if not isinstance(candle, dict):
+                continue
+            timestamp = self._normalize_candle_timestamp(candle)
+            try:
+                open_ = float(candle.get("open"))
+                high = float(candle.get("high"))
+                low = float(candle.get("low"))
+                close = float(candle.get("close"))
+            except (TypeError, ValueError):
+                continue
+            if not timestamp:
+                continue
+            series["time"].append(timestamp)
+            series["open"].append(round(open_, 4))
+            series["high"].append(round(high, 4))
+            series["low"].append(round(low, 4))
+            series["close"].append(round(close, 4))
+        return series
+
     def _build_opening_range(self, candles: list, current_spot=None) -> dict:
         """Compute the first-hour opening range from 5m candle highs/lows."""
         highs = []
@@ -245,7 +298,7 @@ class TAAPIClient:
         logging.info("Waiting 15s for TAAPI rate limit (Free plan: 1 req/15s)...")
         request_pause()
 
-    def fetch_asset_indicators(self, asset, current_spot=None, request_pause=None):
+    def fetch_asset_indicators(self, asset, current_spot=None, request_pause=None, include_chart_data: bool = False):
         """
         Fetch the curated perps indicator set for an asset.
 
@@ -272,11 +325,15 @@ class TAAPIClient:
                     "avwap": 12345.67,
                     "keltner": {"lower": [...], "middle": [...], "upper": [...]},
                     "opening_range": {"high": ..., "low": ..., "position": ...},
+                    "timestamps": [...],
+                    "price_candles": {"time": [...], "open": [...], "high": [...], "low": [...], "close": [...]},
                 },
                 "4h": {
                     "sma99": [...],
                     "avwap": 12345.67,
                     "keltner": {"lower": [...], "middle": [...], "upper": [...]},
+                    "timestamps": [...],
+                    "price_candles": {"time": [...], "open": [...], "high": [...], "low": [...], "close": [...]},
                 },
             }
         """
@@ -313,6 +370,13 @@ class TAAPIClient:
         # Extract series data from bulk response
         result["5m"]["sma99"] = self._extract_series(bulk_5m.get("sma99"), "value")
         result["5m"]["keltner"] = self._extract_keltner_series(bulk_5m.get("keltner"))
+
+        if include_chart_data:
+            self._pause_for_rate_limit(request_pause)
+            recent_5m_candles = self.fetch_candles(symbol, "5m", params={"results": 20})
+            recent_5m_series = self._extract_candle_series(recent_5m_candles)
+            result["5m"]["timestamps"] = recent_5m_series["time"]
+            result["5m"]["price_candles"] = recent_5m_series
 
         now = datetime.now(timezone.utc)
         start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
@@ -360,6 +424,13 @@ class TAAPIClient:
         result[interval]["sma99"] = self._extract_series(bulk_long.get("sma99"), "value")
         result[interval]["keltner"] = self._extract_keltner_series(bulk_long.get("keltner"))
         result[interval]["avwap"] = avwap
+
+        if include_chart_data:
+            self._pause_for_rate_limit(request_pause)
+            recent_long_candles = self.fetch_candles(symbol, interval, params={"results": 20})
+            recent_long_series = self._extract_candle_series(recent_long_candles)
+            result[interval]["timestamps"] = recent_long_series["time"]
+            result[interval]["price_candles"] = recent_long_series
 
         # Cache the results
         if self.enable_cache and self.cache:

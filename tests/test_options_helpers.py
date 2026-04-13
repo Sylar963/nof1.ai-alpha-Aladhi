@@ -109,6 +109,21 @@ def test_find_best_picks_closest_tenor(sample_instruments):
     assert pick == "BTC-20APR26-60000-C"
 
 
+def test_find_best_uses_target_delta_when_strike_missing(sample_instruments):
+    sample_instruments[2]["delta"] = 0.62
+    sample_instruments[3]["delta"] = 0.49
+    sample_instruments[4]["delta"] = 0.31
+    intent = OptionIntent(underlying="BTC", kind="call", tenor_days=30, target_delta=0.50)
+    pick = find_best_instrument(sample_instruments, intent, today=date(2026, 4, 10))
+    assert pick == "BTC-10MAY26-65000-C"
+
+
+def test_find_best_returns_none_when_target_delta_has_no_live_hints(sample_instruments):
+    intent = OptionIntent(underlying="BTC", kind="call", tenor_days=30, target_delta=0.25)
+    pick = find_best_instrument(sample_instruments, intent, today=date(2026, 4, 10))
+    assert pick is None
+
+
 def test_find_best_returns_none_when_no_match(sample_instruments):
     intent = OptionIntent(underlying="DOGE", kind="call", tenor_days=30, target_strike=1.0)
     pick = find_best_instrument(sample_instruments, intent, today=date(2026, 4, 10))

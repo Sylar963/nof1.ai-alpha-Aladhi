@@ -34,6 +34,8 @@ class BotState:
     is_running: bool = False
     balance: float = 0.0
     total_value: float = 0.0
+    balance_breakdown: Dict[str, float] = field(default_factory=dict)
+    total_value_breakdown: Dict[str, float] = field(default_factory=dict)
     total_return_pct: float = 0.0
     sharpe_ratio: float = 0.0
     positions: List[Dict] = field(default_factory=list)
@@ -60,6 +62,7 @@ class TradingBotEngine:
         self,
         assets: List[str],
         interval: str,
+        delta_hedge_enabled: bool = True,
         on_state_update: Optional[Callable[[BotState], None]] = None,
         on_trade_executed: Optional[Callable[[Dict], None]] = None,
         on_error: Optional[Callable[[str], None]] = None,
@@ -102,6 +105,7 @@ class TradingBotEngine:
         self.options_executor: Optional[OptionsExecutor] = None
         self.hedge_manager: Optional[DeltaHedgeManager] = None
         self.options_scheduler: Optional[OptionsScheduler] = None
+        self._delta_hedge_enabled = bool(delta_hedge_enabled)
         self._hedge_audit_task: Optional[asyncio.Task] = None
         self._hedge_reconcile_interval_seconds = int(
             CONFIG.get("thalex_hedge_reconcile_interval_seconds") or 15
@@ -112,12 +116,17 @@ class TradingBotEngine:
             try:
                 from src.backend.trading.thalex_api import ThalexAPI
                 self.thalex = ThalexAPI()
-                self.options_executor = OptionsExecutor(thalex=self.thalex, hyperliquid=self.hyperliquid)
+                self.options_executor = OptionsExecutor(
+                    thalex=self.thalex,
+                    hyperliquid=self.hyperliquid,
+                    delta_hedge_enabled=self._delta_hedge_enabled,
+                )
                 threshold = float(CONFIG.get("thalex_delta_threshold") or 0.02)
                 self.hedge_manager = DeltaHedgeManager(
                     thalex=self.thalex,
                     hyperliquid=self.hyperliquid,
                     hedger=DeltaHedger(threshold=threshold),
+                    enabled=self._delta_hedge_enabled,
                 )
                 self.logger.info(
                     "Thalex options venue enabled (network=%s, hedge_threshold=%.4f BTC)",
@@ -167,6 +176,7 @@ class TradingBotEngine:
         self.active_trades: List[Dict] = []  # Local tracking of open positions
         self.recent_events: deque = deque(maxlen=200)
         self.initial_account_value: Optional[float] = None
+        self._last_thalex_execution: Dict[str, Any] = {}
         self.price_history: Dict[str, deque] = {asset: deque(maxlen=60) for asset in assets}
         
         # Manual trading mode
@@ -223,6 +233,7 @@ class TradingBotEngine:
         executor is responsible for risk-cap preflight, intent → instrument
         resolution, leg orders, and the perp delta hedge.
         """
+        self._last_thalex_execution = {}
         if self.options_executor is None or self.thalex is None:
             message = f"Thalex venue is not configured: {decision_payload}"
             self.logger.warning(message)
@@ -234,6 +245,11 @@ class TradingBotEngine:
             self.logger.error("%s — %s", message, decision_payload)
             return False, message
 
+        if decision.sl_price is not None:
+            message = "Thalex options do not support native stop-loss triggers; refusing unprotected SL order"
+            self.logger.error("%s — %s", message, decision_payload)
+            return False, message
+
         try:
             # Ensure WS is connected before the first request.
             await self.thalex.connect()
@@ -242,7 +258,7 @@ class TradingBotEngine:
             self.logger.error(message)
             return False, message
 
-        open_count = sum(1 for t in self.active_trades if (t.get('venue') or 'hyperliquid') == 'thalex')
+        open_count = await self._live_thalex_open_positions_count()
         result = await self.options_executor.execute(decision, open_positions_count=open_count)
         if result.ok:
             hedge_orders = []
@@ -261,19 +277,46 @@ class TradingBotEngine:
                 len(result.hyperliquid_orders) + len(hedge_orders),
             )
             instrument_name = ""
+            instrument_names = []
             if result.thalex_orders:
                 first = result.thalex_orders[0]
                 instrument_name = getattr(first, "instrument_name", None) or getattr(first, "asset", "") or ""
+                instrument_names = [
+                    getattr(order, "instrument_name", None) or getattr(order, "asset", "") or ""
+                    for order in result.thalex_orders
+                ]
+            execution_price = await self._resolve_thalex_execution_price(
+                [name for name in instrument_names if name]
+            )
+
+            if decision.tp_price is not None and len([name for name in instrument_names if name]) == 1:
+                try:
+                    await self.thalex.place_take_profit(
+                        instrument_names[0],
+                        decision.action == "buy",
+                        float(decision.contracts or 0.0),
+                        float(decision.tp_price),
+                    )
+                except Exception as exc:  # pylint: disable=broad-except
+                    self.logger.warning("Failed to place Thalex take-profit for %s: %s", instrument_names[0], exc)
+
+            self._last_thalex_execution = {
+                "instrument_names": [name for name in instrument_names if name],
+                "execution_price": execution_price,
+                "open_positions_count": open_count,
+            }
             self.active_trades.append({
                 "venue": "thalex",
                 "asset": decision.asset,
                 "instrument_name": instrument_name,
+                "instrument_names": [name for name in instrument_names if name],
                 "strategy": decision.strategy,
                 "rationale": decision.rationale,
                 "thalex_orders": [o.order_id for o in result.thalex_orders],
                 "hyperliquid_orders": [
                     o.order_id for o in (result.hyperliquid_orders + hedge_orders)
                 ],
+                "execution_price": execution_price,
                 "opened_at": datetime.now(UTC).isoformat(),
             })
             return True, ""
@@ -303,9 +346,16 @@ class TradingBotEngine:
         # Get initial account value
         try:
             user_state = await self.hyperliquid.get_user_state()
-            self.initial_account_value = user_state.get('total_value', 0.0)
+            thalex_state = None
+            if self.thalex is not None:
+                try:
+                    thalex_state = await self.thalex.get_user_state()
+                except Exception as exc:  # pylint: disable=broad-except
+                    self.logger.warning("Failed to load Thalex initial account value: %s", exc)
+            snapshot = self._account_snapshot(user_state, thalex_state)
+            self.initial_account_value = snapshot['total_value']
             if self.initial_account_value == 0.0:
-                self.initial_account_value = user_state.get('balance', 10000.0)
+                self.initial_account_value = snapshot['balance'] or 10000.0
         except Exception as e:
             self.logger.error(f"Failed to get initial account value: {e}")
             self.initial_account_value = 10000.0
@@ -378,6 +428,33 @@ class TradingBotEngine:
 
         self.logger.info("Bot stopped")
         self._notify_state_update()
+
+    def supports_delta_hedge(self) -> bool:
+        return self.hedge_manager is not None
+
+    def is_delta_hedge_enabled(self) -> bool:
+        if self.hedge_manager is None:
+            return False
+        return self.hedge_manager.is_enabled()
+
+    async def set_delta_hedge_enabled(self, enabled: bool) -> bool:
+        if self.hedge_manager is None:
+            return False
+
+        enabled = bool(enabled)
+        await self.hedge_manager.set_enabled(enabled)
+        self._delta_hedge_enabled = enabled
+        if self.options_executor is not None:
+            self.options_executor.set_delta_hedge_enabled(enabled)
+
+        if enabled:
+            try:
+                await self.hedge_manager.reconcile()
+            except Exception as exc:  # pylint: disable=broad-except
+                self.logger.warning("Delta hedge enable reconcile failed: %s", exc)
+
+        self._notify_state_update()
+        return True
 
     # ------------------------------------------------------------------
     # Options scheduler callbacks
@@ -556,7 +633,7 @@ class TradingBotEngine:
             self.logger.info("OptionsAgent emitted %d decisions", len(decisions))
 
             for decision in decisions:
-                await self._execute_thalex_decision({
+                decision_payload = {
                     "asset": decision.asset,
                     "action": decision.action,
                     "rationale": decision.rationale,
@@ -582,7 +659,29 @@ class TradingBotEngine:
                     "entry_kind": decision.entry_kind,
                     "vol_view": decision.vol_view,
                     "target_gamma_btc": decision.target_gamma_btc,
-                })
+                }
+                if self.trading_mode == "manual":
+                    try:
+                        proposal = self._create_thalex_proposal(decision_payload)
+                        self.pending_proposals.append(proposal)
+                        self.logger.info(
+                            "[PROPOSAL] Created: %s %s %s (ID: %s)",
+                            (decision.strategy or "thalex").upper(),
+                            decision.action.upper(),
+                            decision.asset,
+                            proposal.id[:8],
+                        )
+                        self.state.pending_proposals = [
+                            p.to_dict() for p in self.pending_proposals if p.is_pending
+                        ]
+                    except Exception as exc:  # pylint: disable=broad-except
+                        self.logger.error(
+                            "Error creating scheduled Thalex proposal for %s: %s",
+                            decision.asset,
+                            exc,
+                        )
+                    continue
+                await self._execute_thalex_decision(decision_payload)
         except Exception as exc:  # pylint: disable=broad-except
             self.logger.error("options decision cycle failed: %s", exc)
 
@@ -608,6 +707,159 @@ class TradingBotEngine:
 
         return _ShimLLM(self.logger)
 
+    @staticmethod
+    def _position_field(position: Any, *names: str) -> Any:
+        if isinstance(position, dict):
+            for name in names:
+                if name in position:
+                    return position.get(name)
+            return None
+        for name in names:
+            if hasattr(position, name):
+                return getattr(position, name)
+        return None
+
+    def _position_opened_by(self, venue: str, asset: str, instrument_name: str) -> str:
+        venue_name = (venue or "hyperliquid").lower()
+        for trade in self.active_trades:
+            trade_venue = (trade.get("venue") or "hyperliquid").lower()
+            if trade_venue != venue_name:
+                continue
+            if venue_name == "thalex":
+                tracked_instruments = {
+                    str(name)
+                    for name in (trade.get("instrument_names") or [])
+                    if name
+                }
+                legacy_name = trade.get("instrument_name")
+                if legacy_name:
+                    tracked_instruments.add(str(legacy_name))
+                if instrument_name and instrument_name in tracked_instruments:
+                    return "AI"
+                continue
+            if asset and trade.get("asset") == asset:
+                return "AI"
+        return "External"
+
+    def _build_positions_view(
+        self,
+        hyperliquid_positions: List[Dict],
+        thalex_positions: Optional[List[Any]] = None,
+    ) -> List[Dict]:
+        rows: List[Dict] = []
+
+        for pos in hyperliquid_positions:
+            asset = str(pos.get("symbol") or pos.get("coin") or "")
+            instrument_name = asset
+            rows.append({
+                "row_id": f"hyperliquid:{instrument_name}",
+                "symbol": asset,
+                "asset": asset,
+                "instrument_name": instrument_name,
+                "venue": "hyperliquid",
+                "quantity": float(pos.get("quantity", 0) or 0),
+                "entry_price": float(pos.get("entry_price", 0) or 0),
+                "current_price": float(pos.get("current_price", 0) or 0),
+                "liquidation_price": float(pos.get("liquidation_price", 0) or 0),
+                "unrealized_pnl": float(pos.get("unrealized_pnl", 0) or 0),
+                "leverage": pos.get("leverage", 1) or 1,
+                "opened_by": self._position_opened_by("hyperliquid", asset, instrument_name),
+                "closable": True,
+            })
+
+        for pos in thalex_positions or []:
+            asset = str(self._position_field(pos, "asset", "symbol") or "")
+            instrument_name = str(self._position_field(pos, "instrument_name") or asset)
+            side = str(self._position_field(pos, "side") or "long").lower()
+            size = abs(float(self._position_field(pos, "size", "quantity") or 0) or 0)
+            quantity = size if side == "long" else -size
+            rows.append({
+                "row_id": f"thalex:{instrument_name}",
+                "symbol": instrument_name,
+                "asset": asset,
+                "instrument_name": instrument_name,
+                "venue": "thalex",
+                "quantity": quantity,
+                "entry_price": float(self._position_field(pos, "entry_price") or 0),
+                "current_price": float(self._position_field(pos, "current_price") or 0),
+                "liquidation_price": 0.0,
+                "unrealized_pnl": float(self._position_field(pos, "unrealized_pnl") or 0),
+                "leverage": 1,
+                "opened_by": self._position_opened_by("thalex", asset, instrument_name),
+                "closable": False,
+            })
+
+        return rows
+
+    async def _live_thalex_open_positions_count(self) -> int:
+        if self.thalex is None:
+            return 0
+        try:
+            state = await self.thalex.get_user_state()
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.warning("Failed to load live Thalex position count: %s", exc)
+            return 0
+
+        positions = getattr(state, "positions", None)
+        if positions is None and isinstance(state, dict):
+            positions = state.get("positions")
+        return len(list(positions or []))
+
+    async def _resolve_thalex_execution_price(self, instrument_names: List[str]) -> float:
+        if self.thalex is None or not instrument_names:
+            return 0.0
+
+        tracked = set(instrument_names)
+        try:
+            fills = await self.thalex.get_recent_fills(limit=20)
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.warning("Failed to load Thalex fills for execution price: %s", exc)
+            fills = []
+
+        for fill in reversed(fills or []):
+            if not isinstance(fill, dict):
+                continue
+            fill_instrument = str(fill.get("instrument_name") or fill.get("asset") or "")
+            if fill_instrument not in tracked:
+                continue
+            for key in ("price", "px", "avg_price", "average_price"):
+                value = fill.get(key)
+                if value is None:
+                    continue
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    continue
+
+        try:
+            return float(await self.thalex.get_current_price(instrument_names[0]) or 0.0)
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.warning("Failed to load Thalex mark price fallback: %s", exc)
+            return 0.0
+
+    def _account_snapshot(self, hyperliquid_state: Dict, thalex_state: Optional[Any] = None) -> Dict[str, Any]:
+        hl_balance = float(hyperliquid_state.get('balance', 0.0) or 0.0)
+        hl_total_value = float(hyperliquid_state.get('total_value', hl_balance) or hl_balance)
+        balance_breakdown = {'hyperliquid': hl_balance}
+        total_value_breakdown = {'hyperliquid': hl_total_value}
+
+        if thalex_state is not None:
+            if isinstance(thalex_state, dict):
+                thalex_balance = float(thalex_state.get('balance', 0.0) or 0.0)
+                thalex_total_value = float(thalex_state.get('total_value', thalex_balance) or thalex_balance)
+            else:
+                thalex_balance = float(getattr(thalex_state, 'balance', 0.0) or 0.0)
+                thalex_total_value = float(getattr(thalex_state, 'total_value', thalex_balance) or thalex_balance)
+            balance_breakdown['thalex'] = thalex_balance
+            total_value_breakdown['thalex'] = thalex_total_value
+
+        return {
+            'balance': sum(balance_breakdown.values()),
+            'total_value': sum(total_value_breakdown.values()),
+            'balance_breakdown': balance_breakdown,
+            'total_value_breakdown': total_value_breakdown,
+        }
+
     async def _main_loop(self):
         """
         Main trading loop.
@@ -621,12 +873,22 @@ class TradingBotEngine:
                 try:
                     # ===== PHASE 1: Fetch Account State =====
                     state = await self.hyperliquid.get_user_state()
-                    balance = state['balance']
-                    total_value = state['total_value']
+                    thalex_state = None
+                    if self.thalex is not None:
+                        try:
+                            thalex_state = await self.thalex.get_user_state()
+                        except Exception as exc:  # pylint: disable=broad-except
+                            self.logger.warning("Failed to load Thalex portfolio state: %s", exc)
 
-                    # Calculate total return
-                    initial_balance = 10000.0  # TODO: load from config
-                    total_return_pct = ((total_value - initial_balance) / initial_balance) * 100
+                    account_snapshot = self._account_snapshot(state, thalex_state)
+                    balance = account_snapshot['balance']
+                    total_value = account_snapshot['total_value']
+
+                    # Calculate total return from the actual session baseline.
+                    initial_balance = float(self.initial_account_value or total_value or 0.0)
+                    total_return_pct = 0.0
+                    if initial_balance > 0:
+                        total_return_pct = ((total_value - initial_balance) / initial_balance) * 100
 
                     sharpe_ratio = self._calculate_sharpe(self.trade_log)
                     
@@ -635,16 +897,18 @@ class TradingBotEngine:
                     # Update bot state
                     self.state.balance = balance
                     self.state.total_value = total_value
+                    self.state.balance_breakdown = account_snapshot['balance_breakdown']
+                    self.state.total_value_breakdown = account_snapshot['total_value_breakdown']
                     self.state.total_return_pct = total_return_pct
                     self.state.sharpe_ratio = sharpe_ratio
 
-                    # ===== PHASE 2: Enrich Positions =====
-                    enriched_positions = []
+                    # ===== PHASE 2: Enrich Hyperliquid Positions =====
+                    enriched_hyperliquid_positions = []
                     for pos in state['positions']:
                         symbol = pos.get('coin')
                         try:
                             current_price = await self.hyperliquid.get_current_price(symbol)
-                            enriched_positions.append({
+                            enriched_hyperliquid_positions.append({
                                 'symbol': symbol,
                                 'quantity': float(pos.get('szi', 0) or 0),
                                 'entry_price': float(pos.get('entryPx', 0) or 0),
@@ -655,8 +919,6 @@ class TradingBotEngine:
                             })
                         except Exception as e:
                             self.logger.error(f"Error enriching position for {symbol}: {e}")
-
-                    self.state.positions = enriched_positions
 
                     # ===== PHASE 3: Load Recent Diary =====
                     recent_diary = self._load_recent_diary(limit=10)
@@ -687,8 +949,23 @@ class TradingBotEngine:
 
                     self.state.open_orders = open_orders
 
+                    thalex_positions = []
+                    if thalex_state is not None:
+                        thalex_positions = list(getattr(thalex_state, 'positions', []) or [])
+
                     # ===== PHASE 5: Reconcile Active Trades =====
-                    await self._reconcile_active_trades(state['positions'], open_orders_raw)
+                    await self._reconcile_active_trades(
+                        state['positions'],
+                        open_orders_raw,
+                        thalex_positions,
+                    )
+
+                    combined_positions = self._build_positions_view(
+                        enriched_hyperliquid_positions,
+                        thalex_positions,
+                    )
+                    self.state.positions = combined_positions
+                    self.state.active_trades = list(self.active_trades)
 
                     # ===== PHASE 6: Fetch Recent Fills =====
                     fills_raw = await self.hyperliquid.get_recent_fills(limit=50)
@@ -715,7 +992,7 @@ class TradingBotEngine:
                         'balance': balance,
                         'account_value': total_value,
                         'sharpe_ratio': sharpe_ratio,
-                        'positions': enriched_positions,
+                        'positions': combined_positions,
                         'active_trades': self.active_trades,
                         'open_orders': open_orders,
                         'recent_diary': recent_diary,
@@ -738,6 +1015,8 @@ class TradingBotEngine:
                             # Open interest and funding
                             oi = await self.hyperliquid.get_open_interest(asset)
                             funding = await self.hyperliquid.get_funding_rate(asset)
+                            prev_day_price = await self.hyperliquid.get_prev_day_price(asset)
+                            volume_24h = await self.hyperliquid.get_daily_notional_volume(asset)
 
                             # Fetch the curated TAAPI bundle off the event loop so
                             # sync requests + pacing do not stall hedge audits or shutdown.
@@ -779,6 +1058,8 @@ class TradingBotEngine:
                             lt_keltner_middle = lt_keltner.get("middle", [])
                             lt_keltner_upper = lt_keltner.get("upper", [])
                             lt_keltner_lower = lt_keltner.get("lower", [])
+                            recent_price_points = list(self.price_history[asset])[-10:]
+                            recent_timestamps = [p["t"] for p in recent_price_points]
 
                             def _latest(series):
                                 return series[-1] if series else None
@@ -816,6 +1097,8 @@ class TradingBotEngine:
                                         "keltner_middle": keltner_5m_middle,
                                         "keltner_upper": keltner_5m_upper,
                                         "keltner_lower": keltner_5m_lower,
+                                        "timestamps": recent_timestamps[-len(keltner_5m_middle):] if keltner_5m_middle else [],
+                                        "price_candles": {},
                                     }
                                 },
                                 "long_term": {
@@ -828,12 +1111,17 @@ class TradingBotEngine:
                                         "keltner_middle": lt_keltner_middle,
                                         "keltner_upper": lt_keltner_upper,
                                         "keltner_lower": lt_keltner_lower,
+                                        "timestamps": recent_timestamps[-len(lt_keltner_middle):] if lt_keltner_middle else [],
+                                        "price_candles": {},
                                     },
                                 },
                                 "open_interest": oi,
+                                "prev_day_price": prev_day_price,
+                                "volume_24h": volume_24h,
                                 "funding_rate": funding,
                                 "funding_annualized_pct": funding * 24 * 365 * 100 if funding else None,
-                                "recent_mid_prices": [p['mid'] for p in list(self.price_history[asset])[-10:]]
+                                "recent_mid_prices": [p['mid'] for p in recent_price_points],
+                                "recent_timestamps": recent_timestamps,
                             })
 
                         except Exception as e:
@@ -1033,7 +1321,10 @@ class TradingBotEngine:
                                         t for t in self.active_trades if t['asset'] != asset
                                     ]
                                     self.active_trades.append({
+                                        'venue': 'hyperliquid',
                                         'asset': asset,
+                                        'instrument_name': asset,
+                                        'instrument_names': [asset],
                                         'is_long': (action == 'buy'),
                                         'amount': amount,
                                         'entry_price': current_price,
@@ -1113,7 +1404,12 @@ class TradingBotEngine:
             if self.on_error:
                 self.on_error(str(e))
 
-    async def _reconcile_active_trades(self, positions: List[Dict], open_orders: List[Dict]):
+    async def _reconcile_active_trades(
+        self,
+        positions: List[Dict],
+        open_orders: List[Dict],
+        thalex_positions: Optional[List[Any]] = None,
+    ):
         """
         Reconcile local active_trades with exchange state.
         Remove stale entries that no longer exist on exchange.
@@ -1121,12 +1417,38 @@ class TradingBotEngine:
         exchange_assets = {pos.get('coin') for pos in positions}
         order_assets = {o.get('coin') for o in open_orders}
         tracked_assets = exchange_assets | order_assets
+        thalex_instruments = {
+            str(self._position_field(pos, 'instrument_name') or '')
+            for pos in (thalex_positions or [])
+            if self._position_field(pos, 'instrument_name')
+        }
+        thalex_assets = {
+            str(self._position_field(pos, 'asset') or '')
+            for pos in (thalex_positions or [])
+            if self._position_field(pos, 'asset')
+        }
 
         removed = []
         for trade in self.active_trades[:]:
-            if trade['asset'] not in tracked_assets:
+            venue = (trade.get('venue') or 'hyperliquid').lower()
+            if venue == 'thalex':
+                tracked_instruments = {
+                    str(name)
+                    for name in (trade.get('instrument_names') or [])
+                    if name
+                }
+                legacy_name = trade.get('instrument_name')
+                if legacy_name:
+                    tracked_instruments.add(str(legacy_name))
+                is_live = bool(tracked_instruments & thalex_instruments)
+                if not tracked_instruments:
+                    is_live = trade.get('asset') in thalex_assets
+            else:
+                is_live = trade['asset'] in tracked_assets
+
+            if not is_live:
                 self.active_trades.remove(trade)
-                removed.append(trade['asset'])
+                removed.append(trade.get('instrument_name') or trade['asset'])
 
         if removed:
             self.logger.info(f"Reconciled: removed stale trades for {removed}")
@@ -1174,6 +1496,8 @@ class TradingBotEngine:
         if self.hedge_manager is None:
             self.state.hedge_status = {
                 "health": "unavailable",
+                "enabled": False,
+                "available": False,
                 "degraded_underlyings": {},
                 "tracked_underlyings": 0,
                 "active_underlyings": 0,
@@ -1185,9 +1509,12 @@ class TradingBotEngine:
         snapshot = self.hedge_manager.get_status_snapshot()
         self.state.hedge_status = {
             "health": snapshot.get("health", "unknown"),
+            "enabled": snapshot.get("enabled", self.hedge_manager.is_enabled()),
+            "available": True,
             "degraded_underlyings": snapshot.get("degraded_underlyings", {}),
             "tracked_underlyings": snapshot.get("tracked_underlyings", 0),
             "active_underlyings": snapshot.get("active_underlyings", 0),
+            "state_error": snapshot.get("state_error"),
             "last_update": snapshot.get("last_update", datetime.now(UTC).isoformat()),
         }
         self.state.hedge_metrics = snapshot.get("metrics", [])
@@ -1374,7 +1701,8 @@ class TradingBotEngine:
                 if not ok:
                     raise RuntimeError(reason or "Thalex execution failed")
 
-                proposal.mark_executed(proposal.entry_price)
+                execution_price = float((self._last_thalex_execution or {}).get("execution_price") or 0.0)
+                proposal.mark_executed(execution_price)
                 self._write_diary_entry({
                     'timestamp': datetime.now(UTC).isoformat(),
                     'asset': proposal.asset,
@@ -1383,6 +1711,7 @@ class TradingBotEngine:
                     'strategy': market_conditions.get('strategy'),
                     'contracts': market_conditions.get('contracts'),
                     'target_gamma_btc': market_conditions.get('target_gamma_btc'),
+                    'execution_price': execution_price,
                     'rationale': proposal.rationale,
                     'from_proposal': proposal.id,
                     'approved_manually': True,
@@ -1394,7 +1723,7 @@ class TradingBotEngine:
                         'venue': 'thalex',
                         'action': proposal.action,
                         'amount': proposal.size,
-                        'price': proposal.entry_price,
+                        'price': execution_price,
                         'timestamp': datetime.now(UTC).isoformat(),
                         'from_proposal': True,
                     })
@@ -1461,7 +1790,10 @@ class TradingBotEngine:
                 t for t in self.active_trades if t['asset'] != proposal.asset
             ]
             self.active_trades.append({
+                'venue': 'hyperliquid',
                 'asset': proposal.asset,
+                'instrument_name': proposal.asset,
+                'instrument_names': [proposal.asset],
                 'is_long': (proposal.action == 'buy'),
                 'amount': amount,
                 'entry_price': current_price,

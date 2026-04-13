@@ -7,6 +7,7 @@ import signal
 import sys
 import asyncio
 import atexit
+import os
 from nicegui import ui, app
 
 # Global reference to bot_service for cleanup
@@ -37,6 +38,19 @@ def cleanup():
             print(f"[WARN] Error stopping bot: {e}")
 
 if __name__ in {"__main__", "__mp_main__"}:
+    kernel_version = ""
+    try:
+        kernel_version = open("/proc/version", encoding="utf-8").read().lower()
+    except OSError:
+        pass
+    is_wsl = "microsoft" in kernel_version
+
+    # Prefer the GTK/Wayland stack on Linux/WSL when available.
+    if sys.platform.startswith("linux"):
+        os.environ.setdefault("PYWEBVIEW_GUI", "gtk")
+        if os.getenv("WAYLAND_DISPLAY"):
+            os.environ.setdefault("GDK_BACKEND", "wayland")
+
     # Setup signal handlers for graceful shutdown
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -61,9 +75,13 @@ if __name__ in {"__main__", "__mp_main__"}:
 
     app.on_shutdown(on_app_shutdown)
 
-    # Run in native desktop mode
+    # WSL can expose DISPLAY/WAYLAND but still hang when pywebview initializes GTK.
+    native_mode = not is_wsl
+    if is_wsl:
+        print("[INFO] WSL detected; launching NiceGUI in browser mode instead of native desktop mode.")
+
     ui.run(
-        native=True,              # Desktop mode via pywebview
+        native=native_mode,
         window_size=(1400, 900),  # Window dimensions
         fullscreen=False,
         title="AI Trading Bot",

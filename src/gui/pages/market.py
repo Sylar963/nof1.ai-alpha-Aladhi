@@ -11,6 +11,36 @@ from src.gui.services.state_manager import StateManager
 def create_market(bot_service: BotService, state_manager: StateManager):
     """Create market data page with live prices and technical indicators"""
 
+    def _format_compact_number(value: float | int | None, prefix: str = '') -> str:
+        if value is None:
+            return '--'
+        amount = float(value)
+        for threshold, suffix in ((1e9, 'B'), (1e6, 'M'), (1e3, 'K')):
+            if abs(amount) >= threshold:
+                return f'{prefix}{amount / threshold:,.2f}{suffix}'
+        if amount.is_integer():
+            return f'{prefix}{amount:,.0f}'
+        return f'{prefix}{amount:,.2f}'
+
+    def _set_change_label(value: float | None):
+        change_24h_label.classes(remove='text-green-400 text-red-400 text-gray-400')
+        if value is None:
+            change_24h_label.set_text('--')
+            change_24h_label.classes(add='text-gray-400')
+        elif value > 0:
+            change_24h_label.set_text(f'+{value:.2f}%')
+            change_24h_label.classes(add='text-green-400')
+        elif value < 0:
+            change_24h_label.set_text(f'{value:.2f}%')
+            change_24h_label.classes(add='text-red-400')
+        else:
+            change_24h_label.set_text('0.00%')
+            change_24h_label.classes(add='text-gray-400')
+
+    def _set_status_tone(label, tone: str):
+        label.classes(remove='text-green-400 text-red-400 text-gray-400 text-gray-500 text-yellow-400')
+        label.classes(add=tone)
+
     ui.label('Market Data').classes('text-3xl font-bold mb-4 text-white')
 
     # ===== ASSET SELECTOR =====
@@ -18,8 +48,7 @@ def create_market(bot_service: BotService, state_manager: StateManager):
         ui.label('Select Asset:').classes('text-lg font-semibold text-white')
 
         # Get assets from bot config
-        state = state_manager.get_state()
-        configured_assets = bot_service.get_assets() if bot_service.is_running() else ['BTC', 'ETH', 'SOL']
+        configured_assets = bot_service.get_assets()
         available_assets = configured_assets if configured_assets else ['BTC', 'ETH', 'SOL']
 
         asset_select = ui.select(
@@ -40,25 +69,30 @@ def create_market(bot_service: BotService, state_manager: StateManager):
         with ui.card().classes('metric-card'):
             current_price_label = ui.label('$0.00').classes('text-4xl font-bold text-white')
             ui.label('Current Price').classes('text-sm text-gray-200 mt-2')
+            ui.label('Source: Hyperliquid mids').classes('text-xs text-gray-200/80 mt-1')
 
         # 24h Change Card
         with ui.card().classes('metric-card'):
             change_24h_label = ui.label('+0.00%').classes('text-4xl font-bold text-green-400')
             ui.label('24h Change').classes('text-sm text-gray-200 mt-2')
+            ui.label('Source: Hyperliquid prevDayPx').classes('text-xs text-gray-200/80 mt-1')
 
         # 24h Volume Card
         with ui.card().classes('metric-card'):
             volume_24h_label = ui.label('$0.00M').classes('text-4xl font-bold text-white')
             ui.label('24h Volume').classes('text-sm text-gray-200 mt-2')
+            ui.label('Source: Hyperliquid dayNtlVlm').classes('text-xs text-gray-200/80 mt-1')
 
         # Open Interest Card
         with ui.card().classes('metric-card'):
-            open_interest_label = ui.label('$0.00M').classes('text-4xl font-bold text-white')
+            open_interest_label = ui.label('0').classes('text-4xl font-bold text-white')
             ui.label('Open Interest').classes('text-sm text-gray-200 mt-2')
+            ui.label('Source: Hyperliquid openInterest').classes('text-xs text-gray-200/80 mt-1')
 
     # ===== PRICE CHART =====
     with ui.card().classes('w-full p-4 mb-6'):
         ui.label('Price Chart').classes('text-xl font-bold text-white mb-2')
+        ui.label('Indicators use TAAPI. Price candles fall back to Hyperliquid mids when OHLC is unavailable.').classes('text-xs text-gray-400 mb-3')
 
         # Candlestick chart
         price_chart = ui.plotly(go.Figure(
@@ -105,15 +139,15 @@ def create_market(bot_service: BotService, state_manager: StateManager):
                 ui.label('Keltner 130 x 4').classes('text-lg font-bold text-white mt-2')
                 with ui.row().classes('w-full justify-between items-center'):
                     ui.label('Middle').classes('text-gray-300')
-                    macd_line_label = ui.label('0.00').classes('text-white font-semibold')
+                    keltner_middle_label = ui.label('0.00').classes('text-white font-semibold')
 
                 with ui.row().classes('w-full justify-between items-center'):
                     ui.label('Upper').classes('text-gray-300')
-                    macd_signal_label = ui.label('0.00').classes('text-white font-semibold')
+                    keltner_upper_label = ui.label('0.00').classes('text-white font-semibold')
 
                 with ui.row().classes('w-full justify-between items-center'):
                     ui.label('Lower').classes('text-gray-300')
-                    macd_hist_label = ui.label('0.00').classes('text-green-400 font-semibold')
+                    keltner_lower_label = ui.label('0.00').classes('text-green-400 font-semibold')
 
         # Right column - Momentum Indicators
         with ui.card().classes('flex-1 p-4'):
@@ -123,10 +157,10 @@ def create_market(bot_service: BotService, state_manager: StateManager):
                 # Anchored VWAP
                 with ui.row().classes('w-full justify-between items-center'):
                     ui.label('AVWAP 2026').classes('text-gray-300')
-                    rsi_label = ui.label('50.00').classes('text-white font-semibold')
+                    avwap_label = ui.label('50.00').classes('text-white font-semibold')
 
                 # Position Bar (price vs AVWAP)
-                rsi_progress = ui.linear_progress(value=0.5, show_value=False).classes('w-full')
+                avwap_progress = ui.linear_progress(value=0.5, show_value=False).classes('w-full')
 
                 ui.separator()
 
@@ -141,29 +175,30 @@ def create_market(bot_service: BotService, state_manager: StateManager):
                 ui.label('Opening Range').classes('text-lg font-bold text-white mt-2')
                 with ui.row().classes('w-full justify-between items-center'):
                     ui.label('High').classes('text-gray-300')
-                    stoch_k_label = ui.label('50.00').classes('text-white font-semibold')
+                    opening_range_high_label = ui.label('50.00').classes('text-white font-semibold')
 
                 with ui.row().classes('w-full justify-between items-center'):
                     ui.label('Low').classes('text-gray-300')
-                    stoch_d_label = ui.label('50.00').classes('text-white font-semibold')
+                    opening_range_low_label = ui.label('50.00').classes('text-white font-semibold')
 
     # ===== INDICATOR CHART =====
     with ui.card().classes('w-full p-4 mb-6'):
-        ui.label('RSI & MACD').classes('text-xl font-bold text-white mb-2')
+        ui.label('Open Range & Keltner').classes('text-xl font-bold text-white mb-2')
 
-        # Create subplot for RSI and MACD
         indicator_chart = ui.plotly(go.Figure(
             data=[
-                go.Scatter(x=[], y=[], mode='lines', name='RSI', line=dict(color='#f59e0b', width=2)),
-                go.Scatter(x=[], y=[], mode='lines', name='MACD', line=dict(color='#3b82f6', width=2), yaxis='y2'),
+                go.Scatter(x=[], y=[], mode='lines', name='Keltner Upper', line=dict(color='#ef4444', width=2)),
+                go.Scatter(x=[], y=[], mode='lines', name='Keltner Middle', line=dict(color='#3b82f6', width=2)),
+                go.Scatter(x=[], y=[], mode='lines', name='Keltner Lower', line=dict(color='#10b981', width=2)),
+                go.Scatter(x=[], y=[], mode='lines', name='Open Range High', line=dict(color='#f59e0b', width=2, dash='dash')),
+                go.Scatter(x=[], y=[], mode='lines', name='Open Range Low', line=dict(color='#fbbf24', width=2, dash='dot')),
             ],
             layout=go.Layout(
                 template='plotly_dark',
                 height=300,
-                margin=dict(l=50, r=50, t=20, b=40),
-                xaxis=dict(title='Time', showgrid=True, gridcolor='#374151'),
-                yaxis=dict(title='RSI', showgrid=True, gridcolor='#374151', range=[0, 100]),
-                yaxis2=dict(title='MACD', overlaying='y', side='right', showgrid=False),
+                margin=dict(l=50, r=20, t=20, b=40),
+                xaxis=dict(title='Recent Points', showgrid=True, gridcolor='#374151'),
+                yaxis=dict(title='Price ($)', showgrid=True, gridcolor='#374151'),
                 paper_bgcolor='#1f2937',
                 plot_bgcolor='#1f2937',
                 font=dict(color='#e5e7eb'),
@@ -208,6 +243,140 @@ def create_market(bot_service: BotService, state_manager: StateManager):
                 hedge_residual_label = ui.label('Residual: --').classes('text-gray-300')
                 hedge_last_label = ui.label('Last rebalance: --').classes('text-gray-400 text-sm')
 
+    refresh_in_flight = False
+
+    def _lookup_market_data(state):
+        market_data = None
+        if state.market_data:
+            if isinstance(state.market_data, dict):
+                market_data = state.market_data.get(asset_select.value)
+            elif isinstance(state.market_data, list):
+                market_data = next((m for m in state.market_data if m.get('asset') == asset_select.value), None)
+        return market_data
+
+    def _has_indicator_payload(market_data) -> bool:
+        if not market_data:
+            return False
+        intraday = market_data.get('intraday') or {}
+        long_term = market_data.get('long_term') or {}
+        for frame in (intraday, long_term):
+            series = frame.get('series') or {}
+            if frame.get('avwap') is not None:
+                return True
+            if frame.get('opening_range'):
+                return True
+            if any(series.get(key) for key in ('sma99', 'keltner_middle', 'keltner_upper', 'keltner_lower', 'timestamps')):
+                return True
+            candles = series.get('price_candles') or {}
+            if any(candles.get(key) for key in ('time', 'open', 'high', 'low', 'close')):
+                return True
+        return False
+
+    def _clear_price_chart():
+        candle_trace = price_chart.figure.data[0]
+        candle_trace.x = []
+        candle_trace.open = []
+        candle_trace.high = []
+        candle_trace.low = []
+        candle_trace.close = []
+        price_chart.update()
+
+    def _set_price_chart(price_candles: dict, market_snapshot: dict):
+        """Render recent OHLC candles when available."""
+        time_values = list(price_candles.get('time') or [])
+        open_values = list(price_candles.get('open') or [])
+        high_values = list(price_candles.get('high') or [])
+        low_values = list(price_candles.get('low') or [])
+        close_values = list(price_candles.get('close') or [])
+
+        if not time_values or not open_values or not high_values or not low_values or not close_values:
+            fallback_times = list(market_snapshot.get('recent_timestamps') or [])
+            fallback_prices = list(market_snapshot.get('recent_mid_prices') or [])
+            if fallback_times and fallback_prices:
+                point_count = min(len(fallback_times), len(fallback_prices))
+                aligned_prices = fallback_prices[-point_count:]
+                time_values = fallback_times[-point_count:]
+                open_values = aligned_prices
+                high_values = aligned_prices
+                low_values = aligned_prices
+                close_values = aligned_prices
+
+        point_count = min(len(time_values), len(open_values), len(high_values), len(low_values), len(close_values))
+
+        if point_count == 0:
+            _clear_price_chart()
+            return
+
+        price_chart.figure.data[0].x = time_values[-point_count:]
+        price_chart.figure.data[0].open = open_values[-point_count:]
+        price_chart.figure.data[0].high = high_values[-point_count:]
+        price_chart.figure.data[0].low = low_values[-point_count:]
+        price_chart.figure.data[0].close = close_values[-point_count:]
+        price_chart.update()
+
+    def _set_indicator_chart(series: dict, opening_range: dict, market_snapshot: dict):
+        """Render Keltner bands with the current opening range."""
+        keltner_upper = list(series.get('keltner_upper') or [])
+        keltner_middle = list(series.get('keltner_middle') or [])
+        keltner_lower = list(series.get('keltner_lower') or [])
+        timestamps = list(series.get('timestamps') or market_snapshot.get('recent_timestamps') or [])
+        point_count = max(
+            len(keltner_upper),
+            len(keltner_middle),
+            len(keltner_lower),
+            0,
+        )
+
+        if point_count == 0:
+            for trace in indicator_chart.figure.data:
+                trace.x = []
+                trace.y = []
+            indicator_chart.update()
+            return
+
+        if len(timestamps) >= point_count:
+            x_values = timestamps[-point_count:]
+        else:
+            x_values = list(range(1, point_count + 1))
+
+        def _align(values: list) -> list:
+            if len(values) >= point_count:
+                return values[-point_count:]
+            return [None] * (point_count - len(values)) + values
+
+        or_high = opening_range.get('high')
+        or_low = opening_range.get('low')
+        or_high_series = [or_high] * point_count if or_high is not None else [None] * point_count
+        or_low_series = [or_low] * point_count if or_low is not None else [None] * point_count
+
+        indicator_chart.figure.data[0].x = x_values
+        indicator_chart.figure.data[0].y = _align(keltner_upper)
+        indicator_chart.figure.data[1].x = x_values
+        indicator_chart.figure.data[1].y = _align(keltner_middle)
+        indicator_chart.figure.data[2].x = x_values
+        indicator_chart.figure.data[2].y = _align(keltner_lower)
+        indicator_chart.figure.data[3].x = x_values
+        indicator_chart.figure.data[3].y = or_high_series
+        indicator_chart.figure.data[4].x = x_values
+        indicator_chart.figure.data[4].y = or_low_series
+        indicator_chart.update()
+
+    async def _bootstrap_market_snapshot():
+        """Fetch indicators on demand when the bot is not supplying them."""
+        nonlocal refresh_in_flight
+        if refresh_in_flight or bot_service.is_running():
+            return
+
+        state = state_manager.get_state()
+        if _has_indicator_payload(_lookup_market_data(state)):
+            return
+
+        refresh_in_flight = True
+        try:
+            await bot_service.refresh_market_data(include_indicators=True)
+        finally:
+            refresh_in_flight = False
+
     # ===== AUTO-REFRESH LOGIC =====
     async def update_market_data():
         """Update market data and indicators from real bot data"""
@@ -223,18 +392,20 @@ def create_market(bot_service: BotService, state_manager: StateManager):
         )
         degraded_reason = None
         hedge_status = getattr(state, 'hedge_status', {}) or {}
+        hedge_enabled = bool(hedge_status.get('enabled', True))
+        hedge_available = bool(hedge_status.get('available', True))
         degraded_map = hedge_status.get('degraded_underlyings', {}) or {}
+        state_error = hedge_status.get('state_error')
         if selected_asset in degraded_map:
             degraded_reason = degraded_map[selected_asset]
 
         # Get market data for selected asset from bot state
-        market_data = None
-        if state.market_data:
-            # market_data can be either dict with asset keys or list of dicts
-            if isinstance(state.market_data, dict):
-                market_data = state.market_data.get(selected_asset)
-            elif isinstance(state.market_data, list):
-                market_data = next((m for m in state.market_data if m.get('asset') == selected_asset), None)
+        market_data = _lookup_market_data(state)
+
+        if (not market_data or not _has_indicator_payload(market_data)) and not bot_service.is_running():
+            await _bootstrap_market_snapshot()
+            state = state_manager.get_state()
+            market_data = _lookup_market_data(state)
 
         if not market_data:
             # No data available yet
@@ -248,24 +419,30 @@ def create_market(bot_service: BotService, state_manager: StateManager):
             hedge_current_label.set_text('Current: --')
             hedge_residual_label.set_text('Residual: --')
             hedge_last_label.set_text('Last rebalance: --')
+            _clear_price_chart()
+            _set_indicator_chart({}, {}, {})
             return
 
         # Update price cards with real data
         current_price = market_data.get('price') or market_data.get('current_price', 0)
         current_price_label.set_text(f'${current_price:,.2f}')
         
-        # 24h change (mock for now - need to calculate from price history)
-        change_24h_label.set_text('+0.00%')
-        change_24h_label.classes('text-4xl font-bold text-gray-400')
-        
+        prev_day_price = market_data.get('prev_day_price')
+        if prev_day_price and prev_day_price > 0:
+            change_24h_pct = ((current_price - prev_day_price) / prev_day_price) * 100
+        else:
+            change_24h_pct = None
+        _set_change_label(change_24h_pct)
+
         # Volume and OI
+        volume_24h = market_data.get('volume_24h')
+        volume_24h_label.set_text(_format_compact_number(volume_24h, prefix='$'))
+
         open_interest = market_data.get('open_interest', 0)
         if open_interest:
-            open_interest_label.set_text(f'${open_interest/1e6:.1f}M')
+            open_interest_label.set_text(_format_compact_number(open_interest))
         else:
             open_interest_label.set_text('--')
-        
-        volume_24h_label.set_text('--')  # Not available in current data
         
         # Update indicators from the selected interval, with the alternate
         # cadence as a fallback when a metric only exists on one payload.
@@ -299,24 +476,26 @@ def create_market(bot_service: BotService, state_manager: StateManager):
         else:
             ema50_label.set_text('--')
         
+        selected_series = selected_frame.get('series') or alternate_frame.get('series') or {}
+        _set_price_chart(selected_series.get('price_candles') or {}, market_data)
         middle = keltner.get('middle')
         upper = keltner.get('upper')
         lower = keltner.get('lower')
-        macd_line_label.set_text(f'${middle:,.2f}' if middle else '--')
-        macd_signal_label.set_text(f'${upper:,.2f}' if upper else '--')
-        macd_hist_label.set_text(f'${lower:,.2f}' if lower else '--')
+        keltner_middle_label.set_text(f'${middle:,.2f}' if middle is not None else '--')
+        keltner_upper_label.set_text(f'${upper:,.2f}' if upper is not None else '--')
+        keltner_lower_label.set_text(f'${lower:,.2f}' if lower is not None else '--')
 
         if avwap:
-            rsi_label.set_text(f'${avwap:,.2f}')
+            avwap_label.set_text(f'${avwap:,.2f}')
             if current_price and current_price > avwap:
-                rsi_progress.set_value(0.75)
+                avwap_progress.set_value(0.75)
             elif current_price and current_price < avwap:
-                rsi_progress.set_value(0.25)
+                avwap_progress.set_value(0.25)
             else:
-                rsi_progress.set_value(0.5)
+                avwap_progress.set_value(0.5)
         else:
-            rsi_label.set_text('--')
-            rsi_progress.set_value(0.5)
+            avwap_label.set_text('--')
+            avwap_progress.set_value(0.5)
 
         if avwap:
             atr_label.set_text(f'${avwap:,.2f}')
@@ -325,47 +504,48 @@ def create_market(bot_service: BotService, state_manager: StateManager):
 
         or_high = opening_range.get('high')
         or_low = opening_range.get('low')
-        stoch_k_label.set_text(f'${or_high:,.2f}' if or_high else '--')
-        stoch_d_label.set_text(f'${or_low:,.2f}' if or_low else '--')
+        opening_range_high_label.set_text(f'${or_high:,.2f}' if or_high is not None else '--')
+        opening_range_low_label.set_text(f'${or_low:,.2f}' if or_low is not None else '--')
+        _set_indicator_chart(selected_series, opening_range, market_data)
         
         # Update sentiment based on indicators
         opening_range_position = opening_range.get('position')
         if sma99_selected and avwap and current_price:
             if current_price > sma99_selected and current_price > avwap and opening_range_position == 'above':
                 sentiment_label.set_text('BULLISH')
-                sentiment_label.classes('text-3xl font-bold text-green-400')
+                _set_status_tone(sentiment_label, 'text-green-400')
                 sentiment_desc.set_text('Price above SMA99 and AVWAP, holding above opening range')
                 trend_icon.set_text('●')
-                trend_icon.classes('text-2xl text-green-400')
+                _set_status_tone(trend_icon, 'text-green-400')
             elif current_price < sma99_selected and current_price < avwap and opening_range_position == 'below':
                 sentiment_label.set_text('BEARISH')
-                sentiment_label.classes('text-3xl font-bold text-red-400')
+                _set_status_tone(sentiment_label, 'text-red-400')
                 sentiment_desc.set_text('Price below SMA99 and AVWAP, holding below opening range')
                 trend_icon.set_text('●')
-                trend_icon.classes('text-2xl text-red-400')
+                _set_status_tone(trend_icon, 'text-red-400')
             else:
                 sentiment_label.set_text('NEUTRAL')
-                sentiment_label.classes('text-3xl font-bold text-gray-400')
+                _set_status_tone(sentiment_label, 'text-gray-400')
                 sentiment_desc.set_text('Mixed signals, waiting for clear direction')
                 trend_icon.set_text('○')
-                trend_icon.classes('text-2xl text-gray-400')
+                _set_status_tone(trend_icon, 'text-gray-400')
         else:
             sentiment_label.set_text('NO DATA')
-            sentiment_label.classes('text-3xl font-bold text-gray-500')
+            _set_status_tone(sentiment_label, 'text-gray-500')
             sentiment_desc.set_text('Waiting for market data from bot...')
-        
+
         momentum_icon.set_text('○')
-        momentum_icon.classes('text-2xl text-gray-400')
+        _set_status_tone(momentum_icon, 'text-gray-400')
         volume_icon.set_text('○')
-        volume_icon.classes('text-2xl text-gray-400')
+        _set_status_tone(volume_icon, 'text-gray-400')
 
         if hedge_metric:
             hedge_status_label.set_text(str(hedge_metric.get('status', 'unknown')).upper())
             if hedge_metric.get('degraded'):
-                hedge_status_label.classes('text-3xl font-bold text-red-400')
+                _set_status_tone(hedge_status_label, 'text-red-400')
                 hedge_status_desc.set_text(degraded_reason or hedge_metric.get('degraded_reason') or 'Live greeks unavailable')
             else:
-                hedge_status_label.classes('text-3xl font-bold text-green-400')
+                _set_status_tone(hedge_status_label, 'text-green-400')
                 hedge_status_desc.set_text(
                     f"{hedge_metric.get('open_option_positions', 0)} option leg(s), {len(hedge_metric.get('subscribed_instruments', []))} ticker subscriptions"
                 )
@@ -379,13 +559,25 @@ def create_market(bot_service: BotService, state_manager: StateManager):
             last_size = hedge_metric.get('last_rebalance_size') or 0.0
             hedge_last_label.set_text(f'Last rebalance: {last_side} {last_size:.4f}')
         else:
-            if degraded_reason:
+            if not hedge_available:
+                hedge_status_label.set_text('UNAVAILABLE')
+                _set_status_tone(hedge_status_label, 'text-yellow-400')
+                hedge_status_desc.set_text('Delta hedge is unavailable in the current bot configuration')
+            elif not hedge_enabled:
+                hedge_status_label.set_text('DISABLED')
+                _set_status_tone(hedge_status_label, 'text-yellow-400')
+                hedge_status_desc.set_text('Delta hedge is paused from the dashboard control')
+            elif state_error:
+                hedge_status_label.set_text('UNAVAILABLE')
+                _set_status_tone(hedge_status_label, 'text-yellow-400')
+                hedge_status_desc.set_text(str(state_error))
+            elif degraded_reason:
                 hedge_status_label.set_text('DEGRADED')
-                hedge_status_label.classes('text-3xl font-bold text-red-400')
+                _set_status_tone(hedge_status_label, 'text-red-400')
                 hedge_status_desc.set_text(degraded_reason)
             else:
                 hedge_status_label.set_text('IDLE')
-                hedge_status_label.classes('text-3xl font-bold text-gray-400')
+                _set_status_tone(hedge_status_label, 'text-gray-400')
                 hedge_status_desc.set_text('No active hedge for this asset')
             hedge_target_label.set_text('Target: --')
             hedge_current_label.set_text('Current: --')
@@ -394,7 +586,11 @@ def create_market(bot_service: BotService, state_manager: StateManager):
 
     # Auto-refresh every 5 seconds
     ui.timer(5.0, update_market_data)
+    ui.timer(0.1, _bootstrap_market_snapshot, once=True)
 
     # Refresh on asset/interval change
-    asset_select.on('update:model-value', lambda: update_market_data())
-    interval_select.on('update:model-value', lambda: update_market_data())
+    async def _handle_market_selection_change(_=None):
+        await update_market_data()
+
+    asset_select.on('update:model-value', _handle_market_selection_change)
+    interval_select.on('update:model-value', _handle_market_selection_change)

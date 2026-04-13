@@ -12,12 +12,25 @@ from src.gui.services.state_manager import StateManager
 def create_history(bot_service: BotService, state_manager: StateManager):
     """Create history page with filters, table, and CSV export"""
 
+    def _format_price(value) -> str:
+        return f'${float(value):,.2f}' if value is not None else 'N/A'
+
+    def _format_pnl_detail(trade: dict) -> str:
+        pnl = trade.get('pnl')
+        pnl_pct = trade.get('pnl_pct')
+        if pnl is None:
+            return 'PnL: N/A'
+        if pnl_pct is None:
+            return f'PnL: ${pnl:+.2f}'
+        return f'PnL: ${pnl:+.2f} ({pnl_pct:+.2f}%)'
+
     with ui.column().classes('w-full items-start'):
         ui.label('Trade History').classes('text-3xl font-bold mb-4 text-white')
 
         # Filters section
         with ui.card().classes('w-full p-4 mb-4'):
             ui.label('Filters').classes('text-xl font-bold text-white mb-4')
+            ui.label('Source: local trade diary at data/diary.jsonl').classes('text-xs text-gray-400 mb-3')
 
             with ui.row().classes('w-full gap-4 items-center'):
                 # Asset filter
@@ -30,7 +43,7 @@ def create_history(bot_service: BotService, state_manager: StateManager):
                 # Action filter
                 action_filter = ui.select(
                     label='Action',
-                    options=['All', 'buy', 'sell', 'hold'],
+                    options=['All', 'buy', 'sell', 'hold', 'close', 'manual_close'],
                     value='All'
                 ).classes('flex-1')
 
@@ -125,8 +138,28 @@ def create_history(bot_service: BotService, state_manager: StateManager):
             table.add_slot('body-cell-rationale', '''
                 <q-td :props="props">
                     <div class="text-sm text-gray-400 truncate max-w-xs cursor-pointer" @click="$parent.$emit('detail', props.row)">
-                        {{ props.row.rationale ? props.row.rationale.substring(0, 50) + '...' : 'No rationale' }}
+                        {{ props.row.rationale ? (props.row.rationale.length > 50 ? props.row.rationale.substring(0, 50) + '...' : props.row.rationale) : 'No rationale' }}
                     </div>
+                </q-td>
+            ''')
+
+            table.add_slot('body-cell-entry_price', '''
+                <q-td :props="props">
+                    <span v-if="props.row.entry_price !== null">${{ props.row.entry_price.toFixed(2) }}</span>
+                    <span v-else class="text-gray-500">-</span>
+                </q-td>
+            ''')
+
+            table.add_slot('body-cell-exit_price', '''
+                <q-td :props="props">
+                    <span v-if="props.row.exit_price !== null">${{ props.row.exit_price.toFixed(2) }}</span>
+                    <span v-else class="text-gray-500">-</span>
+                </q-td>
+            ''')
+
+            table.add_slot('body-cell-size', '''
+                <q-td :props="props">
+                    <span>{{ props.row.size !== null ? props.row.size.toFixed(4) : '-' }}</span>
                 </q-td>
             ''')
 
@@ -151,15 +184,11 @@ def create_history(bot_service: BotService, state_manager: StateManager):
                 detail_action.text = f"Action: {trade['action'].upper()}"
 
                 # Handle None values for prices
-                entry_str = f"${trade['entry_price']:.2f}" if trade.get('entry_price') else 'N/A'
-                exit_str = f"${trade['exit_price']:.2f}" if trade.get('exit_price') else 'N/A'
+                entry_str = _format_price(trade.get('entry_price'))
+                exit_str = _format_price(trade.get('exit_price'))
                 detail_prices.text = f"Entry: {entry_str} | Exit: {exit_str}"
 
-                if trade.get('pnl') is not None:
-                    pnl_text = f"PnL: ${trade['pnl']:+.2f} ({trade['pnl_pct']:+.2f}%)"
-                    detail_pnl.text = pnl_text
-                else:
-                    detail_pnl.text = "PnL: N/A"
+                detail_pnl.text = _format_pnl_detail(trade)
 
                 detail_rationale.text = f"Rationale:\n{trade.get('rationale') or 'No rationale provided'}"
                 detail_dialog.open()
@@ -226,9 +255,9 @@ def create_history(bot_service: BotService, state_manager: StateManager):
                         'timestamp': timestamp_str,
                         'asset': trade.get('asset', 'N/A'),
                         'action': trade.get('action', 'N/A'),
-                        'entry_price': trade.get('entry_price', 0),
+                        'entry_price': trade.get('entry_price'),
                         'exit_price': trade.get('exit_price'),
-                        'size': trade.get('size', 0),
+                        'size': trade.get('size'),
                         'pnl': trade.get('pnl'),
                         'pnl_pct': trade.get('pnl_pct'),
                         'rationale': trade.get('rationale', ''),
@@ -241,6 +270,7 @@ def create_history(bot_service: BotService, state_manager: StateManager):
                 total_trades.text = '0'
                 win_rate.text = '0%'
                 total_pnl_label.text = '$0.00'
+                total_pnl_label.classes(remove='text-green-500 text-red-500', add='text-white')
 
         except Exception as e:
             ui.notify(f'Error updating history: {str(e)}', type='warning')

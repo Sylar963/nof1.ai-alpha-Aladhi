@@ -13,6 +13,10 @@ def create_header(state_manager: StateManager):
     Args:
         state_manager: Global state manager instance
     """
+    def _set_tone(label, tone: str):
+        label.classes(remove='text-green-500 text-red-500 text-gray-400')
+        label.classes(add=tone)
+
     with ui.row().classes('w-full bg-gray-900 px-6 py-3 shadow-lg items-center'):
         with ui.row().classes('w-full items-center justify-between'):
             # Logo and title
@@ -52,9 +56,9 @@ def create_header(state_manager: StateManager):
                 pnl_pct = state.total_return_pct
                 pnl_label.text = f"{pnl_pct:+.2f}%"
                 if pnl_pct >= 0:
-                    pnl_label.classes(remove='text-red-500', add='text-green-500')
+                    _set_tone(pnl_label, 'text-green-500')
                 else:
-                    pnl_label.classes(remove='text-green-500', add='text-red-500')
+                    _set_tone(pnl_label, 'text-red-500')
 
                 # Update Sharpe
                 sharpe_label.text = f"{state.sharpe_ratio:.2f}"
@@ -62,15 +66,15 @@ def create_header(state_manager: StateManager):
                 # Update status
                 if state.is_running:
                     status_label.text = '🟢 Running'
-                    status_label.classes(remove='text-gray-400', add='text-green-500')
+                    _set_tone(status_label, 'text-green-500')
                 else:
                     status_label.text = '⚫ Stopped'
-                    status_label.classes(remove='text-green-500', add='text-gray-400')
+                    _set_tone(status_label, 'text-gray-400')
 
                 # Error indicator
                 if state.error:
                     status_label.text = '🔴 Error'
-                    status_label.classes(remove='text-green-500 text-gray-400', add='text-red-500')
+                    _set_tone(status_label, 'text-red-500')
 
             # Refresh every second
             ui.timer(1.0, update_header)

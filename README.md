@@ -182,6 +182,20 @@ The system can **dynamically switch the active AI model** if:
 
 > On first run, the bot will prompt to connect API keys, select a model, and set trading limits.
 
+### Run From Source on Linux / WSL
+
+If you are running the repo locally instead of using the packaged release, use the GTK-backed launcher prepared for this workspace:
+
+```bash
+./run-desktop.sh
+```
+
+Notes:
+- This launcher uses the project's `venv-gtk` environment automatically.
+- On Linux it uses the `GTK` desktop backend and prefers `Wayland` when available.
+- On WSL it falls back to normal browser mode, because `pywebview`/GTK can leave the NiceGUI server running without opening a native window.
+- You do not need to manually activate a virtualenv before running it.
+
 ---
 
 # ⚡️ Extended Concept: Alpha Arena
