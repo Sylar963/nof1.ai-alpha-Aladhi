@@ -781,6 +781,23 @@ class ThalexAPI(ExchangeAdapter):
                     continue
                 spec = parse_instrument_name(instrument_name)
                 underlying = spec.underlying if spec else instrument_name.split("-", 1)[0]
+                entry_price = float(entry.get("average_price", 0.0) or 0.0)
+                mark_price = float(entry.get("mark_price", 0.0) or 0.0)
+
+                # Thalex uses British spelling "unrealised_pnl" in some responses
+                raw_pnl = (
+                    entry.get("unrealised_pnl")
+                    or entry.get("unrealized_pnl")
+                    or entry.get("pnl")
+                )
+                if raw_pnl is not None:
+                    pos_pnl = float(raw_pnl)
+                elif entry_price and mark_price:
+                    # Compute from mark vs entry
+                    pos_pnl = (mark_price - entry_price) * size  # size is signed
+                else:
+                    pos_pnl = 0.0
+
                 positions.append(
                     PositionSnapshot(
                         venue=self.venue,
@@ -788,9 +805,9 @@ class ThalexAPI(ExchangeAdapter):
                         instrument_name=instrument_name,
                         side="long" if size > 0 else "short",
                         size=abs(size),
-                        entry_price=float(entry.get("average_price", 0.0) or 0.0),
-                        current_price=float(entry.get("mark_price", 0.0) or 0.0),
-                        unrealized_pnl=float(entry.get("unrealized_pnl", 0.0) or 0.0),
+                        entry_price=entry_price,
+                        current_price=mark_price,
+                        unrealized_pnl=pos_pnl,
                         delta=float(entry.get("delta", 0.0) or 0.0) if "delta" in entry else None,
                         raw=entry,
                     )

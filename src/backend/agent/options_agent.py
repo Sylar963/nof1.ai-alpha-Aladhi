@@ -8,8 +8,9 @@ JSON schema, different cadence.
 Why a separate agent
 --------------------
 Vol/options reasoning is fundamentally different from spot/perp reasoning.
-The perps agent uses TAAPI indicators, RSI/MACD vocabulary, and reasons
-about trend continuation. The options agent reasons about IV regime, vol
+The perps agent uses locally-computed structure indicators (SMA99,
+Keltner, AVWAP, opening range) and reasons about trend continuation.
+The options agent reasons about IV regime, vol
 surface skew, term structure, and the gamma/vega/theta of multi-leg
 positions. Cramming both into one prompt makes both worse — separating
 them gives each agent a focused mental model.

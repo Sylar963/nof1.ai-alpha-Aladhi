@@ -256,6 +256,14 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
         """Refresh market data from Hyperliquid without starting bot"""
         nonlocal last_refresh_time, refresh_seconds_ago
 
+        def _ui_ok():
+            """Return False if the client/slot has been deleted (user navigated away)."""
+            try:
+                _ = refresh_data_btn.client
+                return True
+            except RuntimeError:
+                return False
+
         try:
             refresh_data_btn.enabled = False
             refresh_data_loading.text = '⏳ Fetching...'
@@ -264,28 +272,34 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
             # Call bot service to refresh data
             success = await bot_service.refresh_market_data(include_indicators=True)
 
+            if not _ui_ok():
+                return
+
             if success:
                 last_refresh_time = time.time()
                 refresh_data_loading.text = '✅ Done'
                 activity_log.push('✅ Market data refreshed successfully!')
                 ui.notify('Market data refreshed!', type='positive')
-
-                # Update dashboard immediately after refresh
                 await update_dashboard()
             else:
                 refresh_data_loading.text = '❌ Failed'
                 activity_log.push('❌ Failed to refresh market data')
                 ui.notify('Failed to refresh market data', type='negative')
 
+        except RuntimeError:
+            return  # client navigated away
         except Exception as e:
+            if not _ui_ok():
+                return
             activity_log.push(f'❌ Refresh error: {str(e)}')
             ui.notify(f'Error: {str(e)}', type='negative')
             refresh_data_loading.text = '❌ Error'
         finally:
-            refresh_data_btn.enabled = True
-            # Clear loading message after 2 seconds
-            await asyncio.sleep(2.0)
-            refresh_data_loading.text = ''
+            if _ui_ok():
+                refresh_data_btn.enabled = True
+                await asyncio.sleep(2.0)
+                if _ui_ok():
+                    refresh_data_loading.text = ''
 
     async def update_dashboard():
         """Update all dashboard components with latest data"""

@@ -18,12 +18,13 @@ state_manager = StateManager()
 bot_service.state_manager = state_manager
 
 
+@ui.page('/')
 def create_app():
     """Initialize and configure the NiceGUI application as single page"""
 
     # Add Material Icons font
     ui.add_head_html('<link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">')
-    
+
     # Add global styles
     ui.add_head_html('''
         <style>
@@ -64,6 +65,30 @@ def create_app():
         </style>
     ''')
 
+    # Per-client content container (captured by navigate closure)
+    content_container = None
+
+    def navigate(page: str):
+        """Navigate to different page by clearing and recreating content"""
+        nonlocal content_container
+        content_container.clear()
+
+        with content_container:
+            if page == 'Dashboard':
+                dashboard.create_dashboard(bot_service, state_manager)
+            elif page == 'Recommendations':
+                recommendations.create_recommendations(bot_service, state_manager)
+            elif page == 'Positions':
+                positions.create_positions(bot_service, state_manager)
+            elif page == 'History':
+                history.create_history(bot_service, state_manager)
+            elif page == 'Market':
+                market.create_market(bot_service, state_manager)
+            elif page == 'Reasoning':
+                reasoning.create_reasoning(bot_service, state_manager)
+            elif page == 'Settings':
+                settings.create_settings(bot_service, state_manager)
+
     # Main layout
     with ui.column().classes('w-full h-screen overflow-hidden'):
         create_header(state_manager)
@@ -97,33 +122,9 @@ def create_app():
                     ui.label('Version 1.0.0').classes('text-xs text-gray-500 text-center')
                     ui.label('Powered by NiceGUI').classes('text-xs text-gray-600 text-center')
 
-            # Main content area (will be updated by navigation)
-            global content_container
+            # Main content area (per-client, captured by navigate closure)
             content_container = ui.column().classes('flex-grow min-w-0 h-full w-full p-6 overflow-auto items-start')
 
     # Load default page
     with content_container:
         dashboard.create_dashboard(bot_service, state_manager)
-
-
-def navigate(page: str):
-    """Navigate to different page by clearing and recreating content"""
-    global content_container
-
-    content_container.clear()
-
-    with content_container:
-        if page == 'Dashboard':
-            dashboard.create_dashboard(bot_service, state_manager)
-        elif page == 'Recommendations':
-            recommendations.create_recommendations(bot_service, state_manager)
-        elif page == 'Positions':
-            positions.create_positions(bot_service, state_manager)
-        elif page == 'History':
-            history.create_history(bot_service, state_manager)
-        elif page == 'Market':
-            market.create_market(bot_service, state_manager)
-        elif page == 'Reasoning':
-            reasoning.create_reasoning(bot_service, state_manager)
-        elif page == 'Settings':
-            settings.create_settings(bot_service, state_manager)

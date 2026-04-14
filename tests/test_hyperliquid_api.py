@@ -103,3 +103,42 @@ async def test_hyperliquid_get_user_state_prefers_account_value_for_balance(monk
     state = await adapter.get_user_state()
 
     assert state == {"balance": 100.0, "total_value": 100.0, "positions": []}
+
+
+@pytest.mark.asyncio
+async def test_hyperliquid_get_user_state_falls_back_to_margin_summary_account_value(monkeypatch):
+    import src.backend.trading.hyperliquid_api as hyperliquid_api_module
+
+    class FakeWallet:
+        address = "0x123"
+
+    class FakeInfo:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def user_state(self, address):
+            assert address == "0x123"
+            return {
+                "withdrawable": 0.0,
+                "marginSummary": {"accountValue": "272.470437"},
+                "crossMarginSummary": {"accountValue": "272.470437"},
+                "assetPositions": [],
+            }
+
+    class FakeExchange:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setitem(hyperliquid_api_module.CONFIG, "hyperliquid_private_key", "0xabc")
+    monkeypatch.setitem(hyperliquid_api_module.CONFIG, "mnemonic", None)
+    monkeypatch.setitem(hyperliquid_api_module.CONFIG, "hyperliquid_base_url", None)
+    monkeypatch.setitem(hyperliquid_api_module.CONFIG, "hyperliquid_network", "mainnet")
+    monkeypatch.setattr(hyperliquid_api_module.Account, "from_key", lambda _: FakeWallet())
+    monkeypatch.setattr(hyperliquid_api_module, "Info", FakeInfo)
+    monkeypatch.setattr(hyperliquid_api_module, "Exchange", FakeExchange)
+
+    adapter = hyperliquid_api_module.HyperliquidAPI()
+
+    state = await adapter.get_user_state()
+
+    assert state == {"balance": 272.470437, "total_value": 272.470437, "positions": []}
