@@ -152,15 +152,19 @@ def create_settings(bot_service: BotService, state_manager: StateManager):
 
                     # LLM Model selection
                     ui.label('LLM Model').classes('text-lg font-semibold text-white')
+                    _llm_options = [
+                        'x-ai/grok-4',
+                        'openai/gpt-4',
+                        'anthropic/claude-3.5-sonnet',
+                        'deepseek/deepseek-chat-v3.1',
+                    ]
+                    _current_llm = config_data['strategy']['llm_model']
+                    if _current_llm not in _llm_options:
+                        _llm_options.append(_current_llm)
                     llm_model_select = ui.select(
                         label='Model',
-                        options=[
-                            'x-ai/grok-4',
-                            'openai/gpt-4',
-                            'anthropic/claude-3.5-sonnet',
-                            'deepseek/deepseek-chat-v3.1'
-                        ],
-                        value=config_data['strategy']['llm_model']
+                        options=_llm_options,
+                        value=_current_llm,
                     ).classes('w-full')
                     ui.label('LLM model for trading decisions').classes('text-xs text-gray-400')
 
@@ -214,7 +218,11 @@ def create_settings(bot_service: BotService, state_manager: StateManager):
                             loaded_config = load_config()
                             assets_input.value = loaded_config['strategy']['assets']
                             interval_select.value = loaded_config['strategy']['interval']
-                            llm_model_select.value = loaded_config['strategy']['llm_model']
+                            _loaded_llm = loaded_config['strategy']['llm_model']
+                            if _loaded_llm not in llm_model_select.options:
+                                llm_model_select.options.append(_loaded_llm)
+                                llm_model_select.update()
+                            llm_model_select.value = _loaded_llm
                             reasoning_enabled.value = loaded_config['strategy']['reasoning_enabled']
                             reasoning_effort.value = loaded_config['strategy']['reasoning_effort']
                             ui.notify('Configuration loaded successfully!', type='positive')
@@ -620,7 +628,11 @@ def create_settings(bot_service: BotService, state_manager: StateManager):
                 # Update UI with current config
                 assets_input.value = _assets_to_text(current_config.get('assets')) or assets_input.value
                 interval_select.value = current_config.get('interval', interval_select.value)
-                llm_model_select.value = current_config.get('llm_model', llm_model_select.value)
+                _cfg_llm = current_config.get('llm_model', llm_model_select.value)
+                if _cfg_llm not in llm_model_select.options:
+                    llm_model_select.options.append(_cfg_llm)
+                    llm_model_select.update()
+                llm_model_select.value = _cfg_llm
                 reasoning_enabled.value = bool(current_config.get('reasoning_enabled', reasoning_enabled.value))
                 reasoning_effort.value = current_config.get('reasoning_effort', reasoning_effort.value)
 

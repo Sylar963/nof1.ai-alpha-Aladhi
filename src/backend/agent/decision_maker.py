@@ -18,13 +18,8 @@ class TradingAgent:
         self.base_url = f"{base}/chat/completions"
         self.referer = CONFIG.get("openrouter_referer")
         self.app_title = CONFIG.get("openrouter_app_title")
-        self.taapi = TAAPIClient()
         # Fast/cheap sanitizer model to normalize outputs on parse failures
         self.sanitize_model = CONFIG.get("sanitize_model") or "openai/gpt-5"
-
-        # Warn if using a model that may not support tools
-        if ":free" in self.model.lower() or "deepseek" in self.model.lower():
-            logging.info(f"[INFO] Using model {self.model} - dynamic tool use may not be available. Bot will work with pre-fetched indicators only.")
 
     def decide_trade(self, assets, context):
         """Decide for multiple assets in one call.
@@ -96,10 +91,6 @@ class TradingAgent:
             "- YOU CAN USE LEVERAGE, ATLEAST 3X LEVERAGE TO GET BETTER RETURN, KEEP IT WITHIN 10X IN TOTAL\n"
             "- In high volatility (very wide Keltner envelope) or during funding spikes, reduce or avoid leverage.\n"
             "- Treat allocation_usd as notional exposure; keep it consistent with safe leverage and available margin.\n\n"
-            "Tool usage\n"
-            "- Aggressively leverage fetch_taapi_indicator whenever an additional datapoint could sharpen your thesis; keep parameters minimal (indicator, symbol like \"BTC/USDT\", interval \"5m\"/\"4h\", optional period).\n"
-            "- Incorporate tool findings into your reasoning, but NEVER paste raw tool responses into the final JSON—summarize the insight instead.\n"
-            "- Use tools to upgrade your analysis; lack of confidence is a cue to query them before deciding."
             "Reasoning recipe (first principles)\n"
             "- Structure (price vs SMA99, anchored AVWAP, Keltner location, opening-range acceptance/rejection), Liquidity/volatility (Keltner width), Positioning tilt (funding, OI).\n"
             "- Favor alignment across 4h and 5m. Counter-trend scalps require stronger intraday confirmation and tighter risk.\n\n"
@@ -117,30 +108,6 @@ class TradingAgent:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
-
-        tools = [{
-            "type": "function",
-            "function": {
-                "name": "fetch_taapi_indicator",
-                "description": ("Fetch any TAAPI indicator. Available: ema, sma, rsi, macd, bbands, stochastic, stochrsi, "
-                    "adx, atr, cci, dmi, ichimoku, supertrend, vwap, obv, mfi, willr, roc, mom, sar (parabolic), "
-                    "fibonacci, pivotpoints, keltner, donchian, awesome, gator, alligator, and 200+ more. "
-                    "See https://taapi.io/indicators/ for full list and parameters."),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "indicator": {"type": "string"},
-                        "symbol": {"type": "string"},
-                        "interval": {"type": "string"},
-                        "period": {"type": "integer"},
-                        "backtrack": {"type": "integer"},
-                        "other_params": {"type": "object", "additionalProperties": {"type": ["string", "number", "boolean"]}},
-                    },
-                    "required": ["indicator", "symbol", "interval"],
-                    "additionalProperties": False,
-                },
-            },
-        }]
 
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -260,7 +227,6 @@ class TradingAgent:
                 logging.error("Sanitize failed: %s", se)
                 return {"reasoning": "", "trade_decisions": []}
 
-        allow_tools = True
         allow_structured = True
 
         def _build_schema():
@@ -338,7 +304,7 @@ class TradingAgent:
                 "additionalProperties": False,
             }
 
-        for _ in range(6):
+        for _ in range(3):
             data = {"model": self.model, "messages": messages}
             if allow_structured:
                 data["response_format"] = {
@@ -349,9 +315,6 @@ class TradingAgent:
                         "schema": _build_schema(),
                     },
                 }
-            if allow_tools:
-                data["tools"] = tools
-                data["tool_choice"] = "auto"
             if CONFIG.get("reasoning_enabled"):
                 data["reasoning"] = {
                     "enabled": True,
@@ -372,23 +335,6 @@ class TradingAgent:
                     err = e.response.json()
                 except (json.JSONDecodeError, ValueError, AttributeError):
                     err = {}
-                raw = (err.get("error", {}).get("metadata", {}) or {}).get("raw", "")
-                provider = (err.get("error", {}).get("metadata", {}) or {}).get("provider_name", "")
-                error_message = err.get("error", {}).get("message", "")
-
-                # OpenRouter: Model doesn't support tool use
-                if "no endpoints found" in error_message.lower() and "tool" in error_message.lower():
-                    logging.warning(f"Model {self.model} doesn't support tool use on OpenRouter; retrying without tools.")
-                    if allow_tools:
-                        allow_tools = False
-                        continue
-
-                # xAI: Rejected tool schema
-                if e.response.status_code == 422 and provider.lower().startswith("xai") and "deserialize" in raw.lower():
-                    logging.warning("xAI rejected tool schema; retrying without tools.")
-                    if allow_tools:
-                        allow_tools = False
-                        continue
                 # Provider may not support structured outputs / response_format
                 err_text = json.dumps(err)
                 if allow_structured and ("response_format" in err_text or "structured" in err_text or e.response.status_code in (400, 422)):
@@ -397,43 +343,14 @@ class TradingAgent:
                     continue
                 raise
 
-            choice = resp_json["choices"][0]
+            choices = resp_json.get("choices")
+            if not choices:
+                error_info = resp_json.get("error", {})
+                logging.error("OpenRouter returned no choices: %s", error_info.get("message", resp_json))
+                continue
+            choice = choices[0]
             message = choice["message"]
             messages.append(message)
-
-            tool_calls = message.get("tool_calls") or []
-            if allow_tools and tool_calls:
-                for tc in tool_calls:
-                    if tc.get("type") == "function" and tc.get("function", {}).get("name") == "fetch_taapi_indicator":
-                        args = json.loads(tc["function"].get("arguments") or "{}")
-                        try:
-                            params = {
-                                "secret": self.taapi.api_key,
-                                "exchange": "binance",
-                                "symbol": args["symbol"],
-                                "interval": args["interval"],
-                            }
-                            if args.get("period") is not None:
-                                params["period"] = args["period"]
-                            if args.get("backtrack") is not None:
-                                params["backtrack"] = args["backtrack"]
-                            if isinstance(args.get("other_params"), dict):
-                                params.update(args["other_params"])
-                            ind_resp = requests.get(f"{self.taapi.base_url}{args['indicator']}", params=params, timeout=30).json()
-                            messages.append({
-                                "role": "tool",
-                                "tool_call_id": tc.get("id"),
-                                "name": "fetch_taapi_indicator",
-                                "content": json.dumps(ind_resp),
-                            })
-                        except (requests.RequestException, json.JSONDecodeError, KeyError, ValueError) as ex:
-                            messages.append({
-                                "role": "tool",
-                                "tool_call_id": tc.get("id"),
-                                "name": "fetch_taapi_indicator",
-                                "content": f"Error: {str(ex)}",
-                            })
-                continue
 
             try:
                 # Prefer parsed field from structured outputs if present
@@ -500,7 +417,7 @@ class TradingAgent:
                 }
 
         return {
-            "reasoning": "tool loop cap",
+            "reasoning": "retry cap",
             "trade_decisions": [{
                 "asset": a,
                 "action": "hold",
@@ -508,6 +425,6 @@ class TradingAgent:
                 "tp_price": None,
                 "sl_price": None,
                 "exit_plan": "",
-                "rationale": "tool loop cap"
+                "rationale": "retry cap"
             } for a in assets]
         }

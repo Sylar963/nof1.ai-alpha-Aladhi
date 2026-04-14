@@ -104,3 +104,90 @@ async def test_place_take_profit_submits_reduce_only_gtc_limit():
     assert calls[0]["time_in_force"] == TimeInForce.GTC
     assert calls[0]["reduce_only"] is True
     assert order.price == pytest.approx(1400.0)
+
+
+@pytest.mark.asyncio
+async def test_place_stop_loss_submits_native_conditional_order():
+    from thalex import Direction, Target
+
+    adapter = thalex_module.ThalexAPI.__new__(thalex_module.ThalexAPI)
+    adapter.venue = "thalex"
+    adapter._client = SimpleNamespace(create_conditional_order=object())
+
+    calls = []
+
+    async def _fake_request_with_retry(sender, **kwargs):
+        assert sender is adapter._client.create_conditional_order
+        calls.append(kwargs)
+        return {"status": "open", "order_id": "sl1"}
+
+    adapter._request_with_retry = _fake_request_with_retry
+
+    order = await thalex_module.ThalexAPI.place_stop_loss(adapter, "BTC-10MAY26-65000-C", True, 0.05, 900.0)
+
+    assert calls[0]["direction"] == Direction.SELL
+    assert calls[0]["stop_price"] == pytest.approx(900.0)
+    assert calls[0]["reduce_only"] is True
+    assert calls[0]["target"] == Target.MARK
+    assert order.order_id == "sl1"
+
+
+@pytest.mark.asyncio
+async def test_place_bracket_order_submits_native_bracket():
+    from thalex import Direction
+
+    adapter = thalex_module.ThalexAPI.__new__(thalex_module.ThalexAPI)
+    adapter.venue = "thalex"
+    adapter._client = SimpleNamespace(create_conditional_order=object())
+
+    calls = []
+
+    async def _fake_request_with_retry(sender, **kwargs):
+        assert sender is adapter._client.create_conditional_order
+        calls.append(kwargs)
+        return {"status": "open", "order_id": "br1"}
+
+    adapter._request_with_retry = _fake_request_with_retry
+
+    order = await thalex_module.ThalexAPI.place_bracket_order(
+        adapter,
+        "BTC-10MAY26-65000-C",
+        True,
+        0.05,
+        900.0,
+        1400.0,
+    )
+
+    assert calls[0]["direction"] == Direction.SELL
+    assert calls[0]["stop_price"] == pytest.approx(900.0)
+    assert calls[0]["bracket_price"] == pytest.approx(1400.0)
+    assert order.order_id == "br1"
+
+
+@pytest.mark.asyncio
+async def test_place_trailing_stop_submits_native_trailing_order():
+    adapter = thalex_module.ThalexAPI.__new__(thalex_module.ThalexAPI)
+    adapter.venue = "thalex"
+    adapter._client = SimpleNamespace(create_conditional_order=object())
+
+    calls = []
+
+    async def _fake_request_with_retry(sender, **kwargs):
+        assert sender is adapter._client.create_conditional_order
+        calls.append(kwargs)
+        return {"status": "open", "order_id": "tr1"}
+
+    adapter._request_with_retry = _fake_request_with_retry
+
+    order = await thalex_module.ThalexAPI.place_trailing_stop_order(
+        adapter,
+        "BTC-10MAY26-65000-C",
+        True,
+        0.05,
+        950.0,
+        0.02,
+    )
+
+    assert calls[0]["stop_price"] == pytest.approx(950.0)
+    assert calls[0]["trailing_stop_callback_rate"] == pytest.approx(0.02)
+    assert order.order_id == "tr1"

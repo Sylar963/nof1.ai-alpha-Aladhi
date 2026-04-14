@@ -17,6 +17,7 @@ from src.backend.agent.decision_schema import DecisionParseError, parse_decision
 from src.backend.agent.options_llm_lifecycle import OptionsLLMLifecycle
 from src.backend.config_loader import CONFIG
 from src.backend.indicators.taapi_client import TAAPIClient
+from src.backend.indicators.indicator_engine import build_indicator_bundle
 from src.backend.models.trade_proposal import TradeProposal
 from src.backend.trading.delta_hedge_manager import DeltaHedgeManager
 from src.backend.trading.hyperliquid_api import HyperliquidAPI
@@ -245,11 +246,6 @@ class TradingBotEngine:
             self.logger.error("%s — %s", message, decision_payload)
             return False, message
 
-        if decision.sl_price is not None:
-            message = "Thalex options do not support native stop-loss triggers; refusing unprotected SL order"
-            self.logger.error("%s — %s", message, decision_payload)
-            return False, message
-
         try:
             # Ensure WS is connected before the first request.
             await self.thalex.connect()
@@ -288,17 +284,52 @@ class TradingBotEngine:
             execution_price = await self._resolve_thalex_execution_price(
                 [name for name in instrument_names if name]
             )
+            single_instrument_names = [name for name in instrument_names if name]
+            exit_amount = 0.0
+            if len(single_instrument_names) == 1:
+                exit_amount = float(
+                    getattr(result.thalex_orders[0], "amount", None)
+                    or decision.contracts
+                    or 0.0
+                )
 
-            if decision.tp_price is not None and len([name for name in instrument_names if name]) == 1:
+            if decision.tp_price is not None and decision.sl_price is not None and len(single_instrument_names) == 1:
                 try:
-                    await self.thalex.place_take_profit(
-                        instrument_names[0],
+                    await self.thalex.place_bracket_order(
+                        single_instrument_names[0],
                         decision.action == "buy",
-                        float(decision.contracts or 0.0),
+                        exit_amount,
+                        float(decision.sl_price),
                         float(decision.tp_price),
                     )
                 except Exception as exc:  # pylint: disable=broad-except
-                    self.logger.warning("Failed to place Thalex take-profit for %s: %s", instrument_names[0], exc)
+                    self.logger.warning("Failed to place Thalex bracket exit for %s: %s", single_instrument_names[0], exc)
+            elif decision.tp_price is not None and len(single_instrument_names) == 1:
+                try:
+                    await self.thalex.place_take_profit(
+                        single_instrument_names[0],
+                        decision.action == "buy",
+                        exit_amount,
+                        float(decision.tp_price),
+                    )
+                except Exception as exc:  # pylint: disable=broad-except
+                    self.logger.warning("Failed to place Thalex take-profit for %s: %s", single_instrument_names[0], exc)
+            elif decision.sl_price is not None and len(single_instrument_names) == 1:
+                try:
+                    await self.thalex.place_stop_loss(
+                        single_instrument_names[0],
+                        decision.action == "buy",
+                        exit_amount,
+                        float(decision.sl_price),
+                    )
+                except Exception as exc:  # pylint: disable=broad-except
+                    self.logger.warning("Failed to place Thalex stop-loss for %s: %s", single_instrument_names[0], exc)
+            elif (decision.tp_price is not None or decision.sl_price is not None) and len(single_instrument_names) != 1:
+                self.logger.warning(
+                    "Skipping native Thalex TP/SL placement for multi-leg strategy %s (instruments=%s)",
+                    decision.strategy,
+                    single_instrument_names,
+                )
 
             self._last_thalex_execution = {
                 "instrument_names": [name for name in instrument_names if name],
@@ -860,6 +891,78 @@ class TradingBotEngine:
             'total_value_breakdown': total_value_breakdown,
         }
 
+    async def _fetch_indicators_hl_first(self, asset: str, interval: str, current_price: float) -> dict:
+        """Fetch indicators using Hyperliquid candles (primary) with TAAPI fallback.
+
+        Pulls OHLCV candles from Hyperliquid's ``candles_snapshot`` endpoint and
+        computes SMA99, Keltner(130,130,4), anchored VWAP, and opening range
+        locally.  Falls back to the TAAPI bulk API only when Hyperliquid candle
+        fetch fails.
+        """
+        from datetime import timezone, timedelta
+
+        AVWAP_ANCHOR_MS = int(datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp()) * 1000
+
+        try:
+            now = datetime.now(timezone.utc)
+            now_ms = int(now.timestamp() * 1000)
+
+            # We need enough 5m candles for Keltner(130,130,4) + SMA(99):
+            # ~131 candles × 5min = ~11 hours of 5m data
+            candles_needed_5m = 200  # generous buffer
+            start_5m_ms = now_ms - candles_needed_5m * 5 * 60 * 1000
+
+            # Daily candles from the AVWAP anchor (2026-01-01)
+            start_daily_ms = AVWAP_ANCHOR_MS
+
+            # Long-term candles: need ~131 bars at the configured interval
+            interval_minutes = {"1m": 1, "5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440}
+            lt_bar_mins = interval_minutes.get(interval, 240)
+            start_long_ms = now_ms - 200 * lt_bar_mins * 60 * 1000
+
+            # Fetch all three candle sets in parallel from Hyperliquid
+            candles_5m, candles_daily, candles_long = await asyncio.gather(
+                self.hyperliquid.get_candles(asset, "5m", start_5m_ms, now_ms),
+                self.hyperliquid.get_candles(asset, "1d", start_daily_ms, now_ms),
+                self.hyperliquid.get_candles(asset, interval, start_long_ms, now_ms),
+            )
+
+            if not candles_5m:
+                raise ValueError(f"Hyperliquid returned no 5m candles for {asset}")
+
+            self.logger.info(
+                "Hyperliquid candles for %s: 5m=%d, 1d=%d, %s=%d",
+                asset, len(candles_5m), len(candles_daily), interval, len(candles_long),
+            )
+
+            indicators = build_indicator_bundle(
+                candles_5m=candles_5m,
+                candles_daily=candles_daily,
+                candles_long=candles_long,
+                long_interval=interval,
+                current_spot=current_price,
+            )
+            return indicators
+
+        except Exception as e:
+            self.logger.warning(
+                "Hyperliquid candle fetch failed for %s, falling back to TAAPI: %s", asset, e,
+            )
+            # Fall back to TAAPI (sync, run in thread)
+            loop = asyncio.get_running_loop()
+
+            def _pause_for_taapi_rate_limit() -> None:
+                future = asyncio.run_coroutine_threadsafe(asyncio.sleep(15), loop)
+                future.result()
+
+            indicators = await asyncio.to_thread(
+                self.taapi.fetch_asset_indicators,
+                asset,
+                current_spot=current_price,
+                request_pause=_pause_for_taapi_rate_limit,
+            )
+            return indicators
+
     async def _main_loop(self):
         """
         Main trading loop.
@@ -914,7 +1017,7 @@ class TradingBotEngine:
                                 'entry_price': float(pos.get('entryPx', 0) or 0),
                                 'current_price': current_price,
                                 'liquidation_price': float(pos.get('liquidationPx', 0) or 0),
-                                'unrealized_pnl': pos.get('pnl', 0.0),
+                                'unrealized_pnl': pos.get('unrealized_pnl') or pos.get('pnl', 0.0),
                                 'leverage': pos.get('leverage', {}).get('value', 1) if isinstance(pos.get('leverage'), dict) else pos.get('leverage', 1)
                             })
                         except Exception as e:
@@ -1018,26 +1121,11 @@ class TradingBotEngine:
                             prev_day_price = await self.hyperliquid.get_prev_day_price(asset)
                             volume_24h = await self.hyperliquid.get_daily_notional_volume(asset)
 
-                            # Fetch the curated TAAPI bundle off the event loop so
-                            # sync requests + pacing do not stall hedge audits or shutdown.
-                            loop = asyncio.get_running_loop()
-
-                            def _pause_for_taapi_rate_limit() -> None:
-                                future = asyncio.run_coroutine_threadsafe(asyncio.sleep(15), loop)
-                                future.result()
-
-                            indicators = await asyncio.to_thread(
-                                self.taapi.fetch_asset_indicators,
-                                asset,
-                                current_spot=current_price,
-                                request_pause=_pause_for_taapi_rate_limit,
+                            # --- Hyperliquid-first indicator fetch ---
+                            interval = CONFIG.get("interval", "4h")
+                            indicators = await self._fetch_indicators_hl_first(
+                                asset, interval, current_price,
                             )
-                            
-                            # Add delay between assets to respect TAAPI rate limit (1 req/15s)
-                            # Only wait if this is not the last asset
-                            if idx < len(self.assets) - 1:
-                                self.logger.info(f"Waiting 15s before fetching next asset (TAAPI rate limit)...")
-                                await asyncio.sleep(15)
                             
                             # Extract 5m indicators
                             sma99_5m_series = indicators["5m"].get("sma99", [])
@@ -1046,7 +1134,6 @@ class TradingBotEngine:
                             opening_range = indicators["5m"].get("opening_range", {})
 
                             # Extract long-term indicators (interval from config: 1h, 4h, etc.)
-                            interval = CONFIG.get("interval", "4h")
                             lt_indicators = indicators.get(interval, {})
                             lt_sma99_series = lt_indicators.get("sma99", [])
                             lt_avwap = lt_indicators.get("avwap")

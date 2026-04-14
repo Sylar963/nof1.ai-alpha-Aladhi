@@ -138,7 +138,7 @@ class BotService:
         if current_price is None:
             current_price = price_map.get(asset) or price_map.get(symbol)
         current_price = float(current_price or 0)
-        unrealized_pnl = _field('unrealized_pnl', 'pnl')
+        unrealized_pnl = _field('unrealized_pnl', 'unrealizedPnl', 'pnl')
         liquidation_price = float(_field('liquidation_price', 'liquidationPx') or 0)
         leverage = _field('leverage') or 1
         if isinstance(leverage, dict):
@@ -462,21 +462,7 @@ class BotService:
             from src.backend.trading.hyperliquid_api import HyperliquidAPI
 
             hyperliquid = HyperliquidAPI()
-            taapi = None
             indicator_payloads: Dict[str, Dict] = {}
-            rate_limit_pause = None
-
-            if include_indicators and CONFIG.get('taapi_api_key'):
-                from src.backend.indicators.taapi_client import TAAPIClient
-
-                taapi = TAAPIClient()
-                loop = asyncio.get_running_loop()
-
-                def _pause_for_taapi_rate_limit() -> None:
-                    future = asyncio.run_coroutine_threadsafe(asyncio.sleep(15), loop)
-                    future.result()
-
-                rate_limit_pause = _pause_for_taapi_rate_limit
 
             # Fetch account state (balance, positions)
             user_state = await hyperliquid.get_user_state()
@@ -502,20 +488,32 @@ class BotService:
                         'timestamp': datetime.now(UTC).isoformat()
                     }
 
-                    if taapi:
+                    if include_indicators:
                         try:
-                            indicator_payloads[asset] = await asyncio.to_thread(
-                                taapi.fetch_asset_indicators,
-                                asset,
+                            from src.backend.indicators.indicator_engine import build_indicator_bundle
+                            from datetime import timezone, timedelta
+
+                            interval = CONFIG.get("interval", "4h")
+                            now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+                            avwap_anchor_ms = int(datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp()) * 1000
+                            interval_minutes = {"1m": 1, "5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440}
+                            lt_bar_mins = interval_minutes.get(interval, 240)
+
+                            candles_5m, candles_daily, candles_long = await asyncio.gather(
+                                hyperliquid.get_candles(asset, "5m", now_ms - 200 * 5 * 60 * 1000, now_ms),
+                                hyperliquid.get_candles(asset, "1d", avwap_anchor_ms, now_ms),
+                                hyperliquid.get_candles(asset, interval, now_ms - 200 * lt_bar_mins * 60 * 1000, now_ms),
+                            )
+                            indicator_payloads[asset] = build_indicator_bundle(
+                                candles_5m=candles_5m,
+                                candles_daily=candles_daily,
+                                candles_long=candles_long,
+                                long_interval=interval,
                                 current_spot=price,
-                                request_pause=rate_limit_pause,
-                                include_chart_data=True,
                             )
                         except Exception as e:
                             self.logger.warning(f"Failed to fetch indicators for {asset}: {e}")
                             indicator_payloads[asset] = {}
-                        if idx < len(assets) - 1:
-                            await asyncio.sleep(15)
                 except Exception as e:
                     self.logger.warning(f"Failed to fetch market data for {asset}: {e}")
                     market_data[asset] = {

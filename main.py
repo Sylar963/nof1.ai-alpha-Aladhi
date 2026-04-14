@@ -58,14 +58,11 @@ if __name__ in {"__main__", "__mp_main__"}:
     # Register cleanup on exit
     atexit.register(cleanup)
 
-    # Import and setup app on startup
-    from src.gui.app import create_app, bot_service
+    # Import app module to register the @ui.page('/') handler
+    from src.gui.app import bot_service
 
     # Save reference to bot_service for cleanup
     bot_service_ref = bot_service
-
-    # Call create_app to register all pages
-    create_app()
 
     # Register shutdown handler with NiceGUI app
     async def on_app_shutdown():

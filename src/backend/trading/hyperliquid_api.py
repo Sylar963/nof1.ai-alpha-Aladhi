@@ -351,10 +351,20 @@ class HyperliquidAPI(ExchangeAdapter):
             pos = pos_wrap["position"]
             entry_px = float(pos.get("entryPx", 0) or 0)
             size = float(pos.get("szi", 0) or 0)
-            side = "long" if size > 0 else "short"
-            current_px = await self.get_current_price(pos["coin"]) if entry_px and size else 0.0
-            pnl = (current_px - entry_px) * abs(size) if side == "long" else (entry_px - current_px) * abs(size)
-            pos["pnl"] = pnl
+
+            # Use the SDK's native unrealizedPnl (already accounts for funding)
+            native_pnl = pos.get("unrealizedPnl")
+            if native_pnl is not None:
+                pos["unrealized_pnl"] = float(native_pnl)
+            else:
+                # Fallback: compute manually
+                side = "long" if size > 0 else "short"
+                current_px = await self.get_current_price(pos["coin"]) if entry_px and size else 0.0
+                pos["unrealized_pnl"] = (
+                    (current_px - entry_px) * abs(size) if side == "long"
+                    else (entry_px - current_px) * abs(size)
+                )
+            pos["pnl"] = pos["unrealized_pnl"]
             pos["notional_entry"] = abs(size) * entry_px
             enriched_positions.append(pos)
         balance = float(
@@ -380,6 +390,32 @@ class HyperliquidAPI(ExchangeAdapter):
         """
         mids = await self._retry(self.info.all_mids)
         return float(mids.get(asset, 0.0))
+
+    async def get_candles(self, asset: str, interval: str, start_ms: int, end_ms: int) -> list[dict]:
+        """Fetch OHLCV candle data from Hyperliquid.
+
+        Args:
+            asset: Market symbol (e.g. "BTC").
+            interval: Candle interval (e.g. "5m", "1h", "4h", "1d").
+            start_ms: Start time in milliseconds (Unix epoch).
+            end_ms: End time in milliseconds (Unix epoch).
+
+        Returns:
+            List of candle dicts with float-converted OHLCV fields:
+            ``{"t": int, "o": float, "h": float, "l": float, "c": float, "v": float}``
+        """
+        raw = await self._retry(self.info.candles_snapshot, asset, interval, start_ms, end_ms)
+        candles = []
+        for c in raw:
+            candles.append({
+                "t": c["t"],
+                "o": float(c["o"]),
+                "h": float(c["h"]),
+                "l": float(c["l"]),
+                "c": float(c["c"]),
+                "v": float(c["v"]),
+            })
+        return candles
 
     async def get_meta_and_ctxs(self):
         """Return cached meta/context information, fetching once per lifecycle.
