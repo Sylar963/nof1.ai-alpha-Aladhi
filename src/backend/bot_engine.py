@@ -1270,6 +1270,7 @@ class TradingBotEngine:
                         self.logger.info(f"LLM Reasoning: {reasoning[:200]}...")
 
                     self.state.last_reasoning = decisions
+                    self._notify_state_update()
 
                     # ===== PHASE 11: Execute Trades or Create Proposals =====
                     for decision in trade_decisions:
@@ -1352,10 +1353,52 @@ class TradingBotEngine:
                                     
                                 continue  # Skip execution in manual mode
                             
-                            # AUTO MODE: Execute immediately (original behavior)
+                            # AUTO MODE: Execute immediately (position-aware)
                             try:
                                 current_price = await self.hyperliquid.get_current_price(asset)
-                                amount = allocation / current_price if current_price > 0 else 0
+                                desired_notional = allocation / current_price if current_price > 0 else 0
+
+                                # --- Cancel stale orders for this asset ---
+                                cancel_result = await self.hyperliquid.cancel_all_orders(asset)
+                                if cancel_result.get('cancelled_count', 0) > 0:
+                                    self.logger.info(f"Cancelled {cancel_result['cancelled_count']} stale order(s) for {asset}")
+
+                                # --- Position-aware sizing ---
+                                # Look up existing position so we account for
+                                # closing it before opening the new direction.
+                                existing_pos = 0.0
+                                for pos in self.state.positions:
+                                    if pos.get('symbol') == asset:
+                                        existing_pos = float(pos.get('quantity', 0) or 0)
+                                        break
+
+                                # Determine required order size.
+                                # BUY with existing short (-0.165): must buy
+                                #   |short| to flatten + desired_notional for
+                                #   the new long.
+                                # BUY with existing long: just add desired_notional.
+                                # (mirror logic for SELL)
+                                if action == 'buy' and existing_pos < 0:
+                                    # Close the short first, then go long with remainder
+                                    amount = abs(existing_pos) + desired_notional
+                                    self.logger.info(
+                                        f"{asset}: closing short ({existing_pos:.6f}) + new long ({desired_notional:.6f}) = total buy {amount:.6f}"
+                                    )
+                                elif action == 'sell' and existing_pos > 0:
+                                    # Close the long first, then go short with remainder
+                                    amount = existing_pos + desired_notional
+                                    self.logger.info(
+                                        f"{asset}: closing long ({existing_pos:.6f}) + new short ({desired_notional:.6f}) = total sell {amount:.6f}"
+                                    )
+                                else:
+                                    amount = desired_notional
+
+                                # The resulting position size is the new
+                                # directional exposure (after closing the old
+                                # position).  TP/SL should protect only this.
+                                net_new_amount = desired_notional
+                                order_result = None
+                                filled = False
 
                                 if amount > 0:
                                     # Place market order
@@ -1375,45 +1418,46 @@ class TradingBotEngine:
                                         for f in recent_fills_check
                                     )
 
-                                    # Place TP/SL orders
-                                    tp_oid = None
-                                    sl_oid = None
+                                # Place TP/SL orders on the NEW position only
+                                tp_oid = None
+                                sl_oid = None
 
-                                    if tp_price:
-                                        try:
-                                            is_buy = (action == 'buy')
-                                            tp_order = await self.hyperliquid.place_take_profit(
-                                                asset, is_buy, amount, tp_price
-                                            )
-                                            oids = self.hyperliquid.extract_oids(tp_order)
-                                            tp_oid = oids[0] if oids else None
-                                            self.logger.info(f"Placed TP order for {asset} @ {tp_price}")
-                                        except Exception as e:
-                                            self.logger.error(f"Failed to place TP: {e}")
+                                if tp_price and net_new_amount > 0:
+                                    try:
+                                        is_buy = (action == 'buy')
+                                        tp_order = await self.hyperliquid.place_take_profit(
+                                            asset, is_buy, net_new_amount, tp_price
+                                        )
+                                        oids = self.hyperliquid.extract_oids(tp_order)
+                                        tp_oid = oids[0] if oids else None
+                                        self.logger.info(f"Placed TP order for {asset} @ {tp_price}")
+                                    except Exception as e:
+                                        self.logger.error(f"Failed to place TP: {e}")
 
-                                    if sl_price:
-                                        try:
-                                            is_buy = (action == 'buy')
-                                            sl_order = await self.hyperliquid.place_stop_loss(
-                                                asset, is_buy, amount, sl_price
-                                            )
-                                            oids = self.hyperliquid.extract_oids(sl_order)
-                                            sl_oid = oids[0] if oids else None
-                                            self.logger.info(f"Placed SL order for {asset} @ {sl_price}")
-                                        except Exception as e:
-                                            self.logger.error(f"Failed to place SL: {e}")
+                                if sl_price and net_new_amount > 0:
+                                    try:
+                                        is_buy = (action == 'buy')
+                                        sl_order = await self.hyperliquid.place_stop_loss(
+                                            asset, is_buy, net_new_amount, sl_price
+                                        )
+                                        oids = self.hyperliquid.extract_oids(sl_order)
+                                        sl_oid = oids[0] if oids else None
+                                        self.logger.info(f"Placed SL order for {asset} @ {sl_price}")
+                                    except Exception as e:
+                                        self.logger.error(f"Failed to place SL: {e}")
 
-                                    # Update active trades
-                                    self.active_trades = [
-                                        t for t in self.active_trades if t['asset'] != asset
-                                    ]
+                                # Update active trades
+                                self.active_trades = [
+                                    t for t in self.active_trades if t['asset'] != asset
+                                ]
+                                if net_new_amount > 0:
                                     self.active_trades.append({
                                         'venue': 'hyperliquid',
                                         'asset': asset,
                                         'instrument_name': asset,
                                         'instrument_names': [asset],
                                         'is_long': (action == 'buy'),
-                                        'amount': amount,
+                                        'amount': net_new_amount,
                                         'entry_price': current_price,
                                         'tp_oid': tp_oid,
                                         'sl_oid': sl_oid,
@@ -1421,37 +1465,36 @@ class TradingBotEngine:
                                         'opened_at': datetime.now(UTC).isoformat()
                                     })
 
-                                    # Write to diary
-                                    self._write_diary_entry({
-                                        'timestamp': datetime.now(UTC).isoformat(),
+                                # Write to diary
+                                self._write_diary_entry({
+                                    'timestamp': datetime.now(UTC).isoformat(),
+                                    'asset': asset,
+                                    'action': action,
+                                    'allocation_usd': allocation,
+                                    'amount': amount,
+                                    'existing_position': existing_pos,
+                                    'net_new_amount': net_new_amount,
+                                    'entry_price': current_price,
+                                    'tp_price': tp_price,
+                                    'tp_oid': tp_oid,
+                                    'sl_price': sl_price,
+                                    'sl_oid': sl_oid,
+                                    'exit_plan': exit_plan,
+                                    'rationale': rationale,
+                                    'order_result': str(order_result) if order_result else 'no-order',
+                                    'opened_at': datetime.now(UTC).isoformat(),
+                                    'filled': filled
+                                })
+
+                                # Notify GUI of trade
+                                if self.on_trade_executed:
+                                    self.on_trade_executed({
                                         'asset': asset,
                                         'action': action,
-                                        'allocation_usd': allocation,
                                         'amount': amount,
-                                        'entry_price': current_price,
-                                        'tp_price': tp_price,
-                                        'tp_oid': tp_oid,
-                                        'sl_price': sl_price,
-                                        'sl_oid': sl_oid,
-                                        'exit_plan': exit_plan,
-                                        'rationale': rationale,
-                                        'order_result': str(order_result),
-                                        'opened_at': datetime.now(UTC).isoformat(),
-                                        'filled': filled
+                                        'price': current_price,
+                                        'timestamp': datetime.now(UTC).isoformat()
                                     })
-
-                                    # Notify GUI of trade
-                                    if self.on_trade_executed:
-                                        self.on_trade_executed({
-                                            'asset': asset,
-                                            'action': action,
-                                            'amount': amount,
-                                            'price': current_price,
-                                            'timestamp': datetime.now(UTC).isoformat()
-                                        })
-
-                                    # Track PnL for Sharpe
-                                    # (Simplified - actual PnL tracked on position close)
 
                             except Exception as e:
                                 self.logger.error(f"Error executing {action} for {asset}: {e}")
@@ -1477,6 +1520,8 @@ class TradingBotEngine:
                 except Exception as e:
                     self.logger.error(f"Error in main loop iteration: {e}", exc_info=True)
                     self.state.error = str(e)
+                    self.state.last_update = datetime.now(UTC).isoformat()
+                    self._notify_state_update()
                     if self.on_error:
                         self.on_error(str(e))
 
