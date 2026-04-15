@@ -8,6 +8,7 @@ from datetime import datetime
 from nicegui import ui
 from src.gui.services.bot_service import BotService
 from src.gui.services.state_manager import StateManager
+from src.gui.services.ui_utils import is_ui_alive
 
 
 def create_reasoning(bot_service: BotService, state_manager: StateManager):
@@ -87,9 +88,14 @@ def create_reasoning(bot_service: BotService, state_manager: StateManager):
     # Historical decisions storage
     historical_decisions = []
 
+    def _ui_ok() -> bool:
+        return is_ui_alive(action_filter)
+
     # ===== AUTO-REFRESH LOGIC =====
     async def update_reasoning():
         """Update JSON editor and timeline with latest reasoning data"""
+        if not _ui_ok():
+            return
         state = state_manager.get_state()
 
         # Update JSON editor
@@ -213,12 +219,19 @@ def create_reasoning(bot_service: BotService, state_manager: StateManager):
     # Action filter change handler
     def on_filter_change(value):
         """Handle filter change"""
+        if not _ui_ok():
+            return
         asyncio.create_task(update_reasoning())
 
     action_filter.on('update:model-value', on_filter_change)
 
+    async def _guarded_update_reasoning():
+        if not _ui_ok():
+            return
+        await update_reasoning()
+
     # Auto-refresh every 3 seconds
-    ui.timer(3.0, update_reasoning)
+    ui.timer(3.0, _guarded_update_reasoning)
 
     # Initial update
     asyncio.create_task(update_reasoning())

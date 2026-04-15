@@ -96,7 +96,7 @@ def create_market(bot_service: BotService, state_manager: StateManager):
     # ===== PRICE CHART =====
     with ui.card().classes('w-full p-4 mb-6'):
         ui.label('Price Chart').classes('text-xl font-bold text-white mb-2')
-        ui.label('Indicators use TAAPI. Price candles fall back to Hyperliquid mids when OHLC is unavailable.').classes('text-xs text-gray-400 mb-3')
+        ui.label('Indicators (SMA/Keltner/AVWAP) are computed locally. Price candles fall back to Hyperliquid mids when OHLC is unavailable.').classes('text-xs text-gray-400 mb-3')
 
         # Candlestick chart
         price_chart = ui.plotly(go.Figure(
@@ -412,6 +412,8 @@ def create_market(bot_service: BotService, state_manager: StateManager):
 
         if (not market_data or not _has_indicator_payload(market_data)) and not bot_service.is_running():
             await _bootstrap_market_snapshot()
+            if not _ui_ok():
+                return
             state = state_manager.get_state()
             market_data = _lookup_market_data(state)
 

@@ -375,14 +375,26 @@ class TradingBotEngine:
         self.start_time = datetime.now(UTC)
         self.invocation_count = 0
 
-        # Get initial account value
+        # Get initial account value.
+        # Run Hyperliquid + Thalex fetches in parallel and bound the Thalex call
+        # so a flaky options venue can never stall the UI on "Starting...". The
+        # 5s cap is well over normal round-trip time (~1s) but short enough
+        # that auth/whitelist failures don't block the transition to Running.
         try:
-            user_state = await self.hyperliquid.get_user_state()
-            thalex_state = None
+            hl_task = asyncio.create_task(self.hyperliquid.get_user_state())
             if self.thalex is not None:
+                thalex_task = asyncio.create_task(
+                    asyncio.wait_for(self.thalex.get_user_state(), timeout=5.0)
+                )
+            else:
+                thalex_task = None
+
+            user_state = await hl_task
+            thalex_state = None
+            if thalex_task is not None:
                 try:
-                    thalex_state = await self.thalex.get_user_state()
-                except Exception as exc:  # pylint: disable=broad-except
+                    thalex_state = await thalex_task
+                except (asyncio.TimeoutError, Exception) as exc:  # pylint: disable=broad-except
                     self.logger.warning("Failed to load Thalex initial account value: %s", exc)
             snapshot = self._account_snapshot(user_state, thalex_state)
             self.initial_account_value = snapshot['total_value']
@@ -407,8 +419,8 @@ class TradingBotEngine:
 
         if self.hedge_manager is not None:
             try:
-                await self.hedge_manager.reconcile()
-            except Exception as exc:  # pylint: disable=broad-except
+                await asyncio.wait_for(self.hedge_manager.reconcile(), timeout=8.0)
+            except (asyncio.TimeoutError, Exception) as exc:  # pylint: disable=broad-except
                 self.logger.warning("Initial delta hedge reconcile failed: %s", exc)
             self._hedge_audit_task = asyncio.create_task(self._hedge_audit_loop())
 
@@ -1362,7 +1374,7 @@ class TradingBotEngine:
                             # AUTO MODE: Execute immediately (position-aware)
                             try:
                                 current_price = await self.hyperliquid.get_current_price(asset)
-                                desired_notional = allocation / current_price if current_price > 0 else 0
+                                desired_size = allocation / current_price if current_price > 0 else 0
 
                                 # --- Cancel stale orders for this asset ---
                                 cancel_result = await self.hyperliquid.cancel_all_orders(asset)
@@ -1380,29 +1392,29 @@ class TradingBotEngine:
 
                                 # Determine required order size.
                                 # BUY with existing short (-0.165): must buy
-                                #   |short| to flatten + desired_notional for
+                                #   |short| to flatten + desired_size for
                                 #   the new long.
-                                # BUY with existing long: just add desired_notional.
+                                # BUY with existing long: just add desired_size.
                                 # (mirror logic for SELL)
                                 if action == 'buy' and existing_pos < 0:
                                     # Close the short first, then go long with remainder
-                                    amount = abs(existing_pos) + desired_notional
+                                    amount = abs(existing_pos) + desired_size
                                     self.logger.info(
-                                        f"{asset}: closing short ({existing_pos:.6f}) + new long ({desired_notional:.6f}) = total buy {amount:.6f}"
+                                        f"{asset}: closing short ({existing_pos:.6f}) + new long ({desired_size:.6f}) = total buy {amount:.6f}"
                                     )
                                 elif action == 'sell' and existing_pos > 0:
                                     # Close the long first, then go short with remainder
-                                    amount = existing_pos + desired_notional
+                                    amount = existing_pos + desired_size
                                     self.logger.info(
-                                        f"{asset}: closing long ({existing_pos:.6f}) + new short ({desired_notional:.6f}) = total sell {amount:.6f}"
+                                        f"{asset}: closing long ({existing_pos:.6f}) + new short ({desired_size:.6f}) = total sell {amount:.6f}"
                                     )
                                 else:
-                                    amount = desired_notional
+                                    amount = desired_size
 
                                 # The resulting position size is the new
                                 # directional exposure (after closing the old
                                 # position).  TP/SL should protect only this.
-                                net_new_amount = desired_notional
+                                net_new_amount = desired_size
                                 order_result = None
                                 filled = False
 

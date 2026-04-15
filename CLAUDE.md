@@ -29,7 +29,7 @@ There is no linter, formatter, or type-checker configured. No CI/CD pipeline exi
 
 ## Architecture
 
-```
+```text
 main.py                          # Entry point — NiceGUI desktop app (browser mode on WSL)
 src/
 ├── backend/
@@ -87,7 +87,14 @@ src/
 ```python
 VALID_VENUES = {"hyperliquid", "thalex"}
 VALID_ACTIONS = {"buy", "sell", "hold"}
-VALID_STRATEGIES = {"credit_put", "credit_spread", "long_call_delta_hedged", "long_put_delta_hedged"}
+VALID_STRATEGIES = {
+    "credit_put_spread",
+    "credit_call_spread",
+    "iron_condor",
+    "long_call_delta_hedged",
+    "long_put_delta_hedged",
+    "vol_arb",
+}
 ```
 
 ## Development notes
@@ -103,4 +110,4 @@ VALID_STRATEGIES = {"credit_put", "credit_spread", "long_call_delta_hedged", "lo
 
 
 # CODE POLICY
-DO NOT write on the footer " Co authored by"..
+Do not add a footer with the trailer 'Co-authored-by'.

@@ -2,6 +2,9 @@
 Dashboard Page - Main dashboard with metrics and charts
 """
 
+import asyncio
+import time
+
 import plotly.graph_objects as go
 from nicegui import ui
 from src.gui.services.bot_service import BotService
@@ -186,21 +189,16 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
 
     async def start_bot():
         """Start the trading bot"""
-        try:
+        # Snapshot alive-state up front so we know whether any element writes
+        # after the await are still safe to issue. If the user navigated away
+        # during bot_service.start(), status_indicator is gone and any .text
+        # assignment raises RuntimeError before we can reach the _ui_ok guard.
+        if _ui_ok():
             status_indicator.text = '🟡 Starting...'
             activity_log.push('Starting bot...')
 
+        try:
             await bot_service.start()
-
-            status_indicator.text = '🟢 Running'
-            _set_status_indicator_tone('text-green-500')
-            start_btn.props('disable')
-            stop_btn.props(remove='disable')
-
-            activity_log.push('✅ Bot started successfully!')
-            if _ui_ok():
-                ui.notify('Bot started!', type='positive')
-
         except Exception as e:
             if not _ui_ok():
                 return
@@ -208,28 +206,39 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
             _set_status_indicator_tone('text-red-500')
             activity_log.push(f'❌ Error starting bot: {str(e)}')
             ui.notify(f'Failed to start: {str(e)}', type='negative')
+            return
+
+        if not _ui_ok():
+            return
+        status_indicator.text = '🟢 Running'
+        _set_status_indicator_tone('text-green-500')
+        start_btn.props('disable')
+        stop_btn.props(remove='disable')
+        activity_log.push('✅ Bot started successfully!')
+        ui.notify('Bot started!', type='positive')
 
     async def stop_bot():
         """Stop the trading bot"""
-        try:
+        if _ui_ok():
             status_indicator.text = '🟡 Stopping...'
             activity_log.push('Stopping bot...')
 
+        try:
             await bot_service.stop()
-
-            status_indicator.text = '⚫ Stopped'
-            _set_status_indicator_tone('text-gray-400')
-            start_btn.props(remove='disable')
-            stop_btn.props('disable')
-
-            activity_log.push('✅ Bot stopped successfully!')
-            if _ui_ok():
-                ui.notify('Bot stopped!', type='info')
-
         except Exception as e:
             if _ui_ok():
                 activity_log.push(f'❌ Error stopping bot: {str(e)}')
                 ui.notify(f'Failed to stop: {str(e)}', type='negative')
+            return
+
+        if not _ui_ok():
+            return
+        status_indicator.text = '⚫ Stopped'
+        _set_status_indicator_tone('text-gray-400')
+        start_btn.props(remove='disable')
+        stop_btn.props('disable')
+        activity_log.push('✅ Bot stopped successfully!')
+        ui.notify('Bot stopped!', type='info')
 
     async def toggle_delta_hedge():
         """Enable or disable live delta hedging from the dashboard."""
@@ -261,8 +270,6 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
 
     # ===== AUTO-REFRESH FUNCTIONS =====
 
-    import time
-    import asyncio
     last_refresh_time = None
     refresh_seconds_ago = 0
     displayed_events = set()
@@ -270,10 +277,6 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
     async def refresh_market_data():
         """Refresh market data from Hyperliquid without starting bot"""
         nonlocal last_refresh_time, refresh_seconds_ago
-
-        def _ui_ok_refresh():
-            """Return False if the client/slot has been deleted (user navigated away)."""
-            return _ui_ok()
 
         try:
             refresh_data_btn.enabled = False
@@ -300,16 +303,16 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
         except RuntimeError:
             return  # client navigated away
         except Exception as e:
-            if not _ui_ok_refresh():
+            if not _ui_ok():
                 return
             activity_log.push(f'❌ Refresh error: {str(e)}')
             ui.notify(f'Error: {str(e)}', type='negative')
             refresh_data_loading.text = '❌ Error'
         finally:
-            if _ui_ok_refresh():
+            if _ui_ok():
                 refresh_data_btn.enabled = True
                 await asyncio.sleep(2.0)
-                if _ui_ok_refresh():
+                if _ui_ok():
                     refresh_data_loading.text = ''
 
     async def update_dashboard():

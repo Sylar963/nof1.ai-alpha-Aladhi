@@ -213,9 +213,11 @@ def create_settings(bot_service: BotService, state_manager: StateManager):
                                     'reasoning_enabled': config_data['strategy']['reasoning_enabled'],
                                     'reasoning_effort': config_data['strategy']['reasoning_effort'],
                                 })
-                                ui.notify('Strategy configuration saved successfully!', type='positive')
+                                if _ui_ok():
+                                    ui.notify('Strategy configuration saved successfully!', type='positive')
                             else:
-                                ui.notify('Failed to save configuration', type='negative')
+                                if _ui_ok():
+                                    ui.notify('Failed to save configuration', type='negative')
                         except Exception as e:
                             if _ui_ok():
                                 ui.notify(f'Error saving config: {str(e)}', type='negative')
@@ -347,6 +349,9 @@ def create_settings(bot_service: BotService, state_manager: StateManager):
 
                             # Test connections via bot service
                             results = await bot_service.test_api_connections()
+
+                            if not _ui_ok():
+                                return
 
                             # Update status indicators
                             _set_api_status(taapi_status, 'TAAPI', bool(results.get('TAAPI', False)))
@@ -651,6 +656,8 @@ def create_settings(bot_service: BotService, state_manager: StateManager):
             return
         try:
             current_config = await bot_service.get_current_config() if hasattr(bot_service, 'get_current_config') else None
+            if not _ui_ok():
+                return
             if current_config:
                 # Update UI with current config
                 assets_input.value = _assets_to_text(current_config.get('assets')) or assets_input.value
