@@ -94,7 +94,11 @@ def create_reasoning(bot_service: BotService, state_manager: StateManager):
 
         # Update JSON editor
         reasoning_data = state.last_reasoning
-        if reasoning_data and (reasoning_data.get('reasoning') or reasoning_data.get('trade_decisions')):
+        has_data = bool(reasoning_data) and (
+            reasoning_data.get('reasoning')
+            or reasoning_data.get('trade_decisions') is not None
+        )
+        if has_data:
             json_editor.content = {'json': reasoning_data}
             json_editor.update()
 

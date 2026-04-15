@@ -565,6 +565,9 @@ class BotService:
 
             account_snapshot = self._aggregate_account_state(user_state, thalex_state)
 
+            # Preserve reasoning data across refreshes
+            prev_reasoning = state.last_reasoning
+
             # Update with fresh market data
             state.balance = account_snapshot['balance']
             state.total_value = account_snapshot['total_value']
@@ -573,6 +576,27 @@ class BotService:
             state.positions = normalized_positions
             state.market_data = self._build_market_sections(assets, market_data, indicator_payloads)
             state.last_update = datetime.now(UTC).isoformat()
+
+            # Restore reasoning if the refresh created a fresh BotState
+            if not state.last_reasoning and prev_reasoning:
+                state.last_reasoning = prev_reasoning
+
+            self.equity_history.append({
+                'time': state.last_update or datetime.now(UTC).isoformat(),
+                'value': state.total_value
+            })
+            if len(self.equity_history) > 500:
+                self.equity_history = self.equity_history[-500:]
+
+            if len(self.equity_history) >= 3:
+                values = [e['value'] for e in self.equity_history if e['value'] and e['value'] > 0]
+                if len(values) >= 3:
+                    returns = [(values[i] - values[i - 1]) / values[i - 1] for i in range(1, len(values))]
+                    if len(returns) >= 2:
+                        import statistics
+                        mean_r = statistics.mean(returns)
+                        std_r = statistics.stdev(returns)
+                        state.sharpe_ratio = mean_r / std_r if std_r > 0 else 0.0
 
             # Update state manager
             if self.state_manager:

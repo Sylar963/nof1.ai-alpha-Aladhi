@@ -9,11 +9,15 @@ from pathlib import Path
 from nicegui import ui
 from src.gui.services.bot_service import BotService
 from src.gui.services.state_manager import StateManager
+from src.gui.services.ui_utils import is_ui_alive
 from src.backend.config_loader import CONFIG
 
 
 def create_settings(bot_service: BotService, state_manager: StateManager):
     """Create settings page with 4 tabs for configuration"""
+
+    def _ui_ok():
+        return is_ui_alive(assets_input)
 
     def _assets_to_text(raw_assets) -> str:
         if isinstance(raw_assets, list):
@@ -188,6 +192,8 @@ def create_settings(bot_service: BotService, state_manager: StateManager):
 
                     # Save and Load buttons
                     async def save_strategy_config():
+                        if not _ui_ok():
+                            return
                         try:
                             # Update config data
                             config_data['strategy']['assets'] = assets_input.value
@@ -211,9 +217,12 @@ def create_settings(bot_service: BotService, state_manager: StateManager):
                             else:
                                 ui.notify('Failed to save configuration', type='negative')
                         except Exception as e:
-                            ui.notify(f'Error saving config: {str(e)}', type='negative')
+                            if _ui_ok():
+                                ui.notify(f'Error saving config: {str(e)}', type='negative')
 
                     async def load_strategy_config():
+                        if not _ui_ok():
+                            return
                         try:
                             loaded_config = load_config()
                             assets_input.value = loaded_config['strategy']['assets']
@@ -227,7 +236,8 @@ def create_settings(bot_service: BotService, state_manager: StateManager):
                             reasoning_effort.value = loaded_config['strategy']['reasoning_effort']
                             ui.notify('Configuration loaded successfully!', type='positive')
                         except Exception as e:
-                            ui.notify(f'Error loading config: {str(e)}', type='negative')
+                            if _ui_ok():
+                                ui.notify(f'Error loading config: {str(e)}', type='negative')
 
                     with ui.row().classes('gap-2'):
                         ui.button('Save Configuration', on_click=save_strategy_config, icon='save').props('color=primary')
@@ -328,6 +338,8 @@ def create_settings(bot_service: BotService, state_manager: StateManager):
                     # Test connections button
                     async def test_api_connections():
                         """Test all API connections"""
+                        if not _ui_ok():
+                            return
                         try:
                             ui.notify('Testing API connections...', type='info')
 
@@ -360,10 +372,13 @@ def create_settings(bot_service: BotService, state_manager: StateManager):
                                 ui.notify('All connections failed. Check your API keys.', type='negative')
 
                         except Exception as e:
-                            ui.notify(f'Error testing connections: {str(e)}', type='negative')
+                            if _ui_ok():
+                                ui.notify(f'Error testing connections: {str(e)}', type='negative')
 
                     async def save_api_keys():
                         """Save API keys to configuration"""
+                        if not _ui_ok():
+                            return
                         try:
                             # Update config data
                             config_data['api_keys']['taapi_api_key'] = taapi_input.value
@@ -385,7 +400,8 @@ def create_settings(bot_service: BotService, state_manager: StateManager):
                             else:
                                 ui.notify('Failed to save API keys', type='negative')
                         except Exception as e:
-                            ui.notify(f'Error saving API keys: {str(e)}', type='negative')
+                            if _ui_ok():
+                                ui.notify(f'Error saving API keys: {str(e)}', type='negative')
 
                     with ui.row().classes('gap-2'):
                         ui.button('Save API Keys', on_click=save_api_keys, icon='save').props('color=primary')
@@ -502,6 +518,8 @@ def create_settings(bot_service: BotService, state_manager: StateManager):
 
                     # Save button
                     async def save_risk_config():
+                        if not _ui_ok():
+                            return
                         try:
                             # Update config data
                             config_data['risk_management']['max_position_size'] = int(max_position_slider.value)
@@ -516,7 +534,8 @@ def create_settings(bot_service: BotService, state_manager: StateManager):
                             else:
                                 ui.notify('Failed to save risk settings', type='negative')
                         except Exception as e:
-                            ui.notify(f'Error saving risk config: {str(e)}', type='negative')
+                            if _ui_ok():
+                                ui.notify(f'Error saving risk config: {str(e)}', type='negative')
 
                     ui.button('Save Risk Settings', on_click=save_risk_config, icon='save').props('color=primary')
 
@@ -579,6 +598,8 @@ def create_settings(bot_service: BotService, state_manager: StateManager):
 
                     # Test Notification button
                     async def test_notification():
+                        if not _ui_ok():
+                            return
                         try:
                             if desktop_enabled_checkbox.value:
                                 ui.notify('Test notification sent! This is how trade alerts will look.', type='info')
@@ -589,10 +610,13 @@ def create_settings(bot_service: BotService, state_manager: StateManager):
                                 ui.notify('Telegram delivery test is not implemented in the GUI yet.', type='warning')
 
                         except Exception as e:
-                            ui.notify(f'Error sending test notification: {str(e)}', type='negative')
+                            if _ui_ok():
+                                ui.notify(f'Error sending test notification: {str(e)}', type='negative')
 
                     # Save button
                     async def save_notification_config():
+                        if not _ui_ok():
+                            return
                         try:
                             # Update config data
                             config_data['notifications']['desktop_enabled'] = desktop_enabled_checkbox.value
@@ -606,7 +630,8 @@ def create_settings(bot_service: BotService, state_manager: StateManager):
                             else:
                                 ui.notify('Failed to save notification settings', type='negative')
                         except Exception as e:
-                            ui.notify(f'Error saving notification config: {str(e)}', type='negative')
+                            if _ui_ok():
+                                ui.notify(f'Error saving notification config: {str(e)}', type='negative')
 
                     with ui.row().classes('gap-2'):
                         ui.button('Save Notification Settings', on_click=save_notification_config, icon='save').props('color=primary')
@@ -622,6 +647,8 @@ def create_settings(bot_service: BotService, state_manager: StateManager):
     # Load current configuration on page load
     async def load_initial_config():
         """Load current bot configuration on page initialization"""
+        if not _ui_ok():
+            return
         try:
             current_config = await bot_service.get_current_config() if hasattr(bot_service, 'get_current_config') else None
             if current_config:
