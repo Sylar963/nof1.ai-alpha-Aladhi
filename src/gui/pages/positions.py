@@ -5,10 +5,14 @@ Positions Page - Active trading positions with real-time PnL tracking
 from nicegui import ui
 from src.gui.services.bot_service import BotService
 from src.gui.services.state_manager import StateManager
+from src.gui.services.ui_utils import is_ui_alive
 
 
 def create_positions(bot_service: BotService, state_manager: StateManager):
     """Create positions page with live table and action buttons"""
+
+    def _ui_ok():
+        return is_ui_alive(table)
 
     def _format_price(value) -> str:
         return f'${float(value):,.2f}' if value is not None else 'N/A'
@@ -195,6 +199,8 @@ def create_positions(bot_service: BotService, state_manager: StateManager):
 
         async def confirm_close():
             """Confirm position closing"""
+            if not _ui_ok():
+                return
             target = current_position['target']
             label = current_position['label'] or target
             if target:
@@ -209,7 +215,8 @@ def create_positions(bot_service: BotService, state_manager: StateManager):
                     else:
                         ui.notify(f'Failed to close {label} position', type='negative')
                 except Exception as e:
-                    ui.notify(f'Error closing position: {str(e)}', type='negative')
+                    if _ui_ok():
+                        ui.notify(f'Error closing position: {str(e)}', type='negative')
         
         # Wire up event handlers
         table.on('chart', show_chart)
@@ -223,6 +230,8 @@ def create_positions(bot_service: BotService, state_manager: StateManager):
     # Update function
     async def update_positions():
         """Update positions table with latest data"""
+        if not _ui_ok():
+            return
         try:
             state = state_manager.get_state()
             positions = state.positions or []
@@ -292,7 +301,8 @@ def create_positions(bot_service: BotService, state_manager: StateManager):
                 total_pnl.classes(remove='text-green-500 text-red-500', add='text-white')
         
         except Exception as e:
-            ui.notify(f'Error updating positions: {str(e)}', type='warning')
+            if _ui_ok():
+                ui.notify(f'Error updating positions: {str(e)}', type='warning')
     
     # Auto-refresh every 2 seconds
     ui.timer(2.0, update_positions)

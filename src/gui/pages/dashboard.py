@@ -6,10 +6,15 @@ import plotly.graph_objects as go
 from nicegui import ui
 from src.gui.services.bot_service import BotService
 from src.gui.services.state_manager import StateManager
+from src.gui.services.ui_utils import is_ui_alive
 
 
 def create_dashboard(bot_service: BotService, state_manager: StateManager):
     """Create dashboard page with real-time metrics, charts, and controls"""
+
+    def _ui_ok() -> bool:
+        """Helper to check if this page is still the active one."""
+        return is_ui_alive(status_indicator)
 
     def _format_compact_number(value: float | int | None, prefix: str = '') -> str:
         if value is None:
@@ -193,9 +198,12 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
             stop_btn.props(remove='disable')
 
             activity_log.push('✅ Bot started successfully!')
-            ui.notify('Bot started!', type='positive')
+            if _ui_ok():
+                ui.notify('Bot started!', type='positive')
 
         except Exception as e:
+            if not _ui_ok():
+                return
             status_indicator.text = '🔴 Error'
             _set_status_indicator_tone('text-red-500')
             activity_log.push(f'❌ Error starting bot: {str(e)}')
@@ -215,22 +223,27 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
             stop_btn.props('disable')
 
             activity_log.push('✅ Bot stopped successfully!')
-            ui.notify('Bot stopped!', type='info')
+            if _ui_ok():
+                ui.notify('Bot stopped!', type='info')
 
         except Exception as e:
-            activity_log.push(f'❌ Error stopping bot: {str(e)}')
-            ui.notify(f'Failed to stop: {str(e)}', type='negative')
+            if _ui_ok():
+                activity_log.push(f'❌ Error stopping bot: {str(e)}')
+                ui.notify(f'Failed to stop: {str(e)}', type='negative')
 
     async def toggle_delta_hedge():
         """Enable or disable live delta hedging from the dashboard."""
         if not bot_service.supports_delta_hedge():
-            ui.notify('Delta hedge is unavailable until Thalex is configured', type='warning')
+            if _ui_ok():
+                ui.notify('Delta hedge is unavailable until Thalex is configured', type='warning')
             return
 
         desired_state = not bot_service.is_delta_hedge_enabled()
         hedge_toggle_btn.enabled = False
         try:
             success = await bot_service.set_delta_hedge_enabled(desired_state)
+            if not _ui_ok():
+                return
             if success:
                 ui.notify(
                     'Delta hedge enabled' if desired_state else 'Delta hedge disabled',
@@ -240,9 +253,11 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
             else:
                 ui.notify('Unable to change delta hedge state', type='negative')
         except Exception as e:
-            ui.notify(f'Failed to update delta hedge: {str(e)}', type='negative')
+            if _ui_ok():
+                ui.notify(f'Failed to update delta hedge: {str(e)}', type='negative')
         finally:
-            hedge_toggle_btn.enabled = True
+            if _ui_ok():
+                hedge_toggle_btn.enabled = True
 
     # ===== AUTO-REFRESH FUNCTIONS =====
 
@@ -256,13 +271,9 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
         """Refresh market data from Hyperliquid without starting bot"""
         nonlocal last_refresh_time, refresh_seconds_ago
 
-        def _ui_ok():
+        def _ui_ok_refresh():
             """Return False if the client/slot has been deleted (user navigated away)."""
-            try:
-                _ = refresh_data_btn.client
-                return True
-            except RuntimeError:
-                return False
+            return _ui_ok()
 
         try:
             refresh_data_btn.enabled = False
@@ -289,20 +300,22 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
         except RuntimeError:
             return  # client navigated away
         except Exception as e:
-            if not _ui_ok():
+            if not _ui_ok_refresh():
                 return
             activity_log.push(f'❌ Refresh error: {str(e)}')
             ui.notify(f'Error: {str(e)}', type='negative')
             refresh_data_loading.text = '❌ Error'
         finally:
-            if _ui_ok():
+            if _ui_ok_refresh():
                 refresh_data_btn.enabled = True
                 await asyncio.sleep(2.0)
-                if _ui_ok():
+                if _ui_ok_refresh():
                     refresh_data_loading.text = ''
 
     async def update_dashboard():
         """Update all dashboard components with latest data"""
+        if not _ui_ok():
+            return
         nonlocal refresh_seconds_ago
 
         try:

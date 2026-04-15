@@ -5,11 +5,15 @@ Recommendations Page - AI trade proposals for manual approval
 from nicegui import ui
 from src.gui.services.bot_service import BotService
 from src.gui.services.state_manager import StateManager
+from src.gui.services.ui_utils import is_ui_alive
 
 
 def create_recommendations(bot_service: BotService, state_manager: StateManager):
     """Create recommendations page with pending AI proposals"""
     
+    def _ui_ok():
+        return is_ui_alive(proposals_container)
+
     ui.label('🤖 AI Recommendations').classes('text-3xl font-bold mb-4 text-white')
     
     # Info banner
@@ -28,6 +32,8 @@ def create_recommendations(bot_service: BotService, state_manager: StateManager)
     
     async def update_proposals():
         """Update list of pending proposals"""
+        if not _ui_ok():
+            return
         state = state_manager.get_state()
         proposals = state.pending_proposals or []
         
@@ -194,6 +200,8 @@ def create_recommendations(bot_service: BotService, state_manager: StateManager)
     
     async def approve_proposal(proposal_id: str):
         """Approve and execute a proposal"""
+        if not _ui_ok():
+            return
         try:
             success = bot_service.approve_proposal(proposal_id)
             if success:
@@ -202,10 +210,13 @@ def create_recommendations(bot_service: BotService, state_manager: StateManager)
             else:
                 ui.notify('❌ Failed to approve trade', type='negative')
         except Exception as e:
-            ui.notify(f'Error: {str(e)}', type='negative')
+            if _ui_ok():
+                ui.notify(f'Error: {str(e)}', type='negative')
     
     async def reject_proposal(proposal_id: str):
         """Reject a proposal"""
+        if not _ui_ok():
+            return
         try:
             success = bot_service.reject_proposal(proposal_id, reason="Rejected by user via GUI")
             if success:
@@ -214,7 +225,8 @@ def create_recommendations(bot_service: BotService, state_manager: StateManager)
             else:
                 ui.notify('Failed to reject proposal', type='negative')
         except Exception as e:
-            ui.notify(f'Error: {str(e)}', type='negative')
+            if _ui_ok():
+                ui.notify(f'Error: {str(e)}', type='negative')
     
     # Auto-refresh every 2 seconds
     ui.timer(2.0, update_proposals)

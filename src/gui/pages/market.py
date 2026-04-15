@@ -6,10 +6,14 @@ import plotly.graph_objects as go
 from nicegui import ui
 from src.gui.services.bot_service import BotService
 from src.gui.services.state_manager import StateManager
+from src.gui.services.ui_utils import is_ui_alive
 
 
 def create_market(bot_service: BotService, state_manager: StateManager):
     """Create market data page with live prices and technical indicators"""
+
+    def _ui_ok():
+        return is_ui_alive(asset_select)
 
     def _format_compact_number(value: float | int | None, prefix: str = '') -> str:
         if value is None:
@@ -363,6 +367,8 @@ def create_market(bot_service: BotService, state_manager: StateManager):
 
     async def _bootstrap_market_snapshot():
         """Fetch indicators on demand when the bot is not supplying them."""
+        if not _ui_ok():
+            return
         nonlocal refresh_in_flight
         if refresh_in_flight or bot_service.is_running():
             return
@@ -380,6 +386,8 @@ def create_market(bot_service: BotService, state_manager: StateManager):
     # ===== AUTO-REFRESH LOGIC =====
     async def update_market_data():
         """Update market data and indicators from real bot data"""
+        if not _ui_ok():
+            return
         state = state_manager.get_state()
         selected_asset = asset_select.value
         selected_interval = str(interval_select.value or '5m')
@@ -590,6 +598,8 @@ def create_market(bot_service: BotService, state_manager: StateManager):
 
     # Refresh on asset/interval change
     async def _handle_market_selection_change(_=None):
+        if not _ui_ok():
+            return
         await update_market_data()
 
     asset_select.on('update:model-value', _handle_market_selection_change)
