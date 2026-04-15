@@ -174,6 +174,7 @@ class TradingBotEngine:
         self.start_time: Optional[datetime] = None
         self.invocation_count = 0
         self.trade_log: List[float] = []  # For Sharpe calculation
+        self._previous_total_value: Optional[float] = None
         self.active_trades: List[Dict] = []  # Local tracking of open positions
         self.recent_events: deque = deque(maxlen=200)
         self.initial_account_value: Optional[float] = None
@@ -992,6 +993,11 @@ class TradingBotEngine:
                     total_return_pct = 0.0
                     if initial_balance > 0:
                         total_return_pct = ((total_value - initial_balance) / initial_balance) * 100
+
+                    if self._previous_total_value is not None and self._previous_total_value > 0:
+                        period_return = (total_value - self._previous_total_value) / self._previous_total_value
+                        self.trade_log.append(period_return)
+                    self._previous_total_value = total_value
 
                     sharpe_ratio = self._calculate_sharpe(self.trade_log)
                     
