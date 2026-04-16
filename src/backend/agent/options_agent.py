@@ -75,6 +75,55 @@ NAKED LEGS ARE FORBIDDEN. Every short premium position MUST be wrapped as a
 vertical (credit_*_spread) or as both legs of an iron condor."""
 
 
+_STRATEGY_SELECTION = """\
+STRATEGY SELECTION — decision tree
+
+Read vol_regime, skew_25d_by_tenor, keltner position, and opening_range to
+pick the right strategy. Walk the tree top-down; stop at the first matching
+leaf.
+
+WHEN vol_regime == "rich" (IV >> RV, realized_iv_ratio_15d < 0.8):
+  Spot ranging (keltner position "inside", opening_range position "inside"):
+    - skew_25d negative (puts expensive)  → credit_put_spread
+    - skew_25d positive (calls expensive) → credit_call_spread
+    - skew_25d near zero                  → iron_condor (sell both wings)
+  Spot trending (keltner "above" or "below", or opening_range breakout):
+    - Uptrend  → credit_call_spread (fade the overpriced calls into strength)
+    - Downtrend → credit_put_spread (fade the overpriced puts into weakness)
+
+WHEN vol_regime == "cheap" (IV << RV, realized_iv_ratio_15d > 1.2):
+  Spot trending up   → long_call_delta_hedged (buy gamma, scalp delta on perps)
+  Spot trending down → long_put_delta_hedged
+  Spot ranging       → long_call_delta_hedged + long_put_delta_hedged
+                        (synthetic straddle via gamma — wait for breakout)
+
+WHEN vol_regime == "fair" (realized_iv_ratio_15d between 0.8 and 1.2):
+  top_mispricings_vs_deribit with edge > 200 bps → vol_arb
+  term_structure_slope steep (|slope| > 0.002)   → vol_arb across tenors
+                        (short the expensive tenor, long the cheap one)
+  Directional conviction from keltner/opening_range → delta-hedged long
+                        in that direction (use direction when vol gives no edge)
+
+If vol_regime_confidence is low, weight mispricings and portfolio greeks more
+heavily. Never use regime uncertainty as an excuse to skip analysis — reason
+from the data you have.
+
+TENOR SELECTION
+- Premium selling (credit spreads, iron condors): 7-21 DTE, sweet spot 14 DTE.
+  Theta decay accelerates inside 21 DTE — this is where short premium earns.
+- Directional gamma (delta-hedged longs): 21-45 DTE. Enough time for the move
+  to develop, slower theta bleed while you wait.
+- Vol arb: match the mispriced tenor exactly from top_mispricings_vs_deribit.
+
+STRIKE SELECTION
+- credit_put_spread:  short strike at or below 15-delta put (below support),
+                      long strike 5-10% further OTM for defined risk.
+- credit_call_spread: short strike at or above 15-delta call (above resistance),
+                      long strike 5-10% further OTM.
+- iron_condor:        both wings equidistant from spot for balanced risk.
+- delta-hedged longs: ATM or slight OTM (25-40 delta) for best gamma/premium."""
+
+
 _OUTPUT_CONTRACT = """\
 OUTPUT CONTRACT
 Return a strict JSON object with two keys, in order:
@@ -105,6 +154,7 @@ warranted right now, return an empty trade_decisions array."""
 
 _OPTIONS_SYSTEM_PROMPT = "\n\n".join([
     _PREAMBLE,
+    _STRATEGY_SELECTION,
     _OUTPUT_CONTRACT,
 ])
 
