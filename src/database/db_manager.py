@@ -347,16 +347,22 @@ class DatabaseManager:
 
     def get_recent_diary(self, limit: int = 10) -> List[Dict[str, Any]]:
         """Get recent diary entries in format compatible with bot_engine."""
-        entries = self.get_diary_entries(limit=limit)
-        return [
-            {
-                'timestamp': entry.timestamp.isoformat() if entry.timestamp else None,
-                'asset': entry.asset,
-                'action': entry.action,
-                'rationale': entry.rationale,
-            }
-            for entry in entries
-        ]
+        with self.session_scope() as session:
+            entries = (
+                session.query(DiaryEntry)
+                .order_by(desc(DiaryEntry.timestamp))
+                .limit(limit)
+                .all()
+            )
+            return [
+                {
+                    'timestamp': entry.timestamp.isoformat() if entry.timestamp else None,
+                    'asset': entry.asset,
+                    'action': entry.action,
+                    'rationale': entry.rationale,
+                }
+                for entry in entries
+            ]
 
     # ==================== BOT STATE OPERATIONS ====================
 
@@ -432,17 +438,20 @@ class DatabaseManager:
     def get_equity_curve(self, days: int = 30) -> List[Dict[str, Any]]:
         """Get equity curve data for charting."""
         start_date = datetime.utcnow() - timedelta(days=days)
-        states = self.get_bot_states(start_date=start_date, limit=10000)
+        with self.session_scope() as session:
+            query = session.query(BotState).filter(
+                BotState.timestamp >= start_date
+            ).order_by(desc(BotState.timestamp)).limit(10000)
 
-        return [
-            {
-                'timestamp': state.timestamp.isoformat() if state.timestamp else None,
-                'equity': state.equity,
-                'balance': state.balance,
-                'total_value': state.total_value,
-            }
-            for state in reversed(states)
-        ]
+            return [
+                {
+                    'timestamp': state.timestamp.isoformat() if state.timestamp else None,
+                    'equity': state.equity,
+                    'balance': state.balance,
+                    'total_value': state.total_value,
+                }
+                for state in reversed(query.all())
+            ]
 
     # ==================== TRADE PROPOSAL OPERATIONS ====================
 

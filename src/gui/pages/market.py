@@ -243,7 +243,7 @@ def create_market(bot_service: BotService, state_manager: StateManager):
 
                 with ui.row().classes('items-center gap-2'):
                     volume_icon = ui.label('○').classes('text-2xl text-gray-400')
-                    ui.label('Volume Signal').classes('text-gray-300')
+                    ui.label('Funding Signal').classes('text-gray-300')
 
     # ===== HEDGE STATUS =====
     with ui.card().classes('w-full p-4 mt-6'):
@@ -366,15 +366,14 @@ def create_market(bot_service: BotService, state_manager: StateManager):
                 fillcolor='rgba(156,163,175,0.25)',
                 line=dict(color='rgba(156,163,175,0.6)', width=1),
             ))
-            # Extend the OR high/low as horizontal dashed lines across the chart
+            # Extend the OR high/low as horizontal dashed lines from OR start to chart end
             if dt_times:
-                chart_x0 = dt_times[0]
                 chart_x1 = dt_times[-1]
                 for lvl, clr in [(or_high, 'rgba(156,163,175,0.4)'),
                                  (or_low, 'rgba(156,163,175,0.4)')]:
                     shapes.append(dict(
                         type='line', xref='x', yref='y',
-                        x0=chart_x0, x1=chart_x1, y0=lvl, y1=lvl,
+                        x0=or_x0, x1=chart_x1, y0=lvl, y1=lvl,
                         line=dict(color=clr, width=1, dash='dash'),
                     ))
 
@@ -382,7 +381,8 @@ def create_market(bot_service: BotService, state_manager: StateManager):
 
         # OR mid trace (trace 4)
         if or_mid is not None and dt_times:
-            price_chart.figure.data[4].x = [dt_times[0], dt_times[-1]]
+            or_mid_start = or_x0 if (or_start is not None) else dt_times[0]
+            price_chart.figure.data[4].x = [or_mid_start, dt_times[-1]]
             price_chart.figure.data[4].y = [or_mid, or_mid]
         else:
             price_chart.figure.data[4].x = []
@@ -631,10 +631,29 @@ def create_market(bot_service: BotService, state_manager: StateManager):
             _set_status_tone(sentiment_label, 'text-gray-500')
             sentiment_desc.set_text('Waiting for market data from bot...')
 
-        momentum_icon.set_text('○')
-        _set_status_tone(momentum_icon, 'text-gray-400')
-        volume_icon.set_text('○')
-        _set_status_tone(volume_icon, 'text-gray-400')
+        # Momentum signal — Keltner channel position
+        keltner_position = keltner.get('position')
+        if keltner_position == 'above':
+            momentum_icon.set_text('●')
+            _set_status_tone(momentum_icon, 'text-green-400')
+        elif keltner_position == 'below':
+            momentum_icon.set_text('●')
+            _set_status_tone(momentum_icon, 'text-red-400')
+        else:
+            momentum_icon.set_text('○')
+            _set_status_tone(momentum_icon, 'text-gray-400')
+
+        # Funding signal — rate pressure (overleveraged positioning)
+        funding_rate = market_data.get('funding_rate')
+        if funding_rate is not None and funding_rate > 0.0005:
+            volume_icon.set_text('●')
+            _set_status_tone(volume_icon, 'text-red-400')
+        elif funding_rate is not None and funding_rate < -0.0002:
+            volume_icon.set_text('●')
+            _set_status_tone(volume_icon, 'text-green-400')
+        else:
+            volume_icon.set_text('○')
+            _set_status_tone(volume_icon, 'text-gray-400')
 
         if hedge_metric:
             hedge_status_label.set_text(str(hedge_metric.get('status', 'unknown')).upper())

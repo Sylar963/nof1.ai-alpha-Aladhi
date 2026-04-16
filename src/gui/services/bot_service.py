@@ -437,22 +437,6 @@ class BotService:
             self.logger.error(f"Failed to close position: {e}")
             return False
 
-    def update_config(self, config: Dict):
-        """
-        Update bot configuration.
-
-        Args:
-            config: Dict with 'assets', 'interval', 'model' keys
-        """
-        if 'assets' in config:
-            self.config['assets'] = config['assets']
-        if 'interval' in config:
-            self.config['interval'] = config['interval']
-        if 'model' in config:
-            self.config['model'] = config['model']
-
-        self.logger.info(f"Configuration updated: {self.config}")
-
     def get_assets(self) -> List[str]:
         """Get configured assets list"""
         if self.bot_engine:

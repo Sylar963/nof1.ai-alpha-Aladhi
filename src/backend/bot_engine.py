@@ -659,11 +659,11 @@ class TradingBotEngine:
     async def _run_options_decision_cycle(self) -> None:
         """Background task: run the options agent against the cached snapshot.
 
-        Reads ``self._latest_options_context`` (populated by the 15m refresh
-        task), calls the OptionsAgent, parses decisions, and routes each one
-        through ``_execute_thalex_decision``. Skips silently if no snapshot
-        is available yet (typical on first run before the surface refresh
-        has had a chance to populate it).
+        Reads ``self._latest_options_context`` (populated by the vol surface
+        refresh), calls the OptionsAgent, parses decisions, and routes each
+        one through ``_execute_thalex_decision``. The scheduler's bootstrap
+        sequence guarantees the surface is fetched before the first decision,
+        but we still guard against None in case the refresh itself failed.
         """
         if self._latest_options_context is None:
             self.logger.info("OptionsContext not yet available; skipping decision cycle")
@@ -998,11 +998,14 @@ class TradingBotEngine:
             )
             return indicators
 
+    _MAX_CONSECUTIVE_ERRORS = 5
+
     async def _main_loop(self):
         """
         Main trading loop.
         Adapted from ai-trading-agent/src/main.py lines 88-455
         """
+        consecutive_errors = 0
         try:
             while self.is_running:
                 self.invocation_count += 1
@@ -1575,21 +1578,39 @@ class TradingBotEngine:
 
                     # Update market data in state for dashboard
                     self.state.market_data = market_sections
-                    
+
                     # Update state timestamp
                     self.state.last_update = datetime.now(UTC).isoformat()
                     self._notify_state_update()
+                    consecutive_errors = 0  # successful iteration
 
                 except Exception as e:
-                    self.logger.error(f"Error in main loop iteration: {e}", exc_info=True)
+                    consecutive_errors += 1
+                    self.logger.error(
+                        "Error in main loop iteration (%d/%d consecutive): %s",
+                        consecutive_errors, self._MAX_CONSECUTIVE_ERRORS, e,
+                        exc_info=True,
+                    )
                     self.state.error = str(e)
                     self.state.last_update = datetime.now(UTC).isoformat()
                     self._notify_state_update()
                     if self.on_error:
                         self.on_error(str(e))
+                    if consecutive_errors >= self._MAX_CONSECUTIVE_ERRORS:
+                        self.logger.error(
+                            "Stopping bot after %d consecutive failures", consecutive_errors,
+                        )
+                        self.is_running = False
+                        self.state.is_running = False
+                        self.state.error = (
+                            f"Bot stopped: {consecutive_errors} consecutive failures — last: {e}"
+                        )
+                        self._notify_state_update()
+                        break
 
                 # ===== PHASE 12: Sleep Until Next Interval =====
-                await asyncio.sleep(self._get_interval_seconds())
+                backoff = min(consecutive_errors, 3) * 30  # 0s, 30s, 60s, 90s
+                await asyncio.sleep(self._get_interval_seconds() + backoff)
 
         except asyncio.CancelledError:
             self.logger.info("Bot loop cancelled")
