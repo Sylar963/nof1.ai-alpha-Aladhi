@@ -168,9 +168,16 @@ def create_reasoning(bot_service: BotService, state_manager: StateManager):
                                     color = 'grey'
                                     icon = '⏸️'
 
+                                # Tag venue so options decisions are visually distinct
+                                # from perps in the merged timeline.
+                                venue = (decision.get('venue') or 'hyperliquid').lower()
+                                venue_tag = '🟣 OPTIONS' if venue == 'thalex' else '🟠 PERPS'
+                                strategy = decision.get('strategy')
+                                title_suffix = f' · {strategy}' if strategy else ''
+
                                 # Timeline entry with enhanced details
                                 with ui.timeline_entry(
-                                    f'{icon} {asset} - {action}',
+                                    f'{icon} [{venue_tag}] {asset} - {action}{title_suffix}',
                                     color=color,
                                     icon='science'
                                 ):

@@ -47,7 +47,9 @@ class BotState:
     hedge_status: Dict = field(default_factory=dict)
     hedge_metrics: List[Dict] = field(default_factory=list)
     pending_proposals: List[Dict] = field(default_factory=list)  # Pending trade proposals (manual mode)
-    last_reasoning: Dict = field(default_factory=dict)
+    last_reasoning: Dict = field(default_factory=dict)  # Composite view (perps + options) consumed by GUI
+    last_perps_reasoning: Dict = field(default_factory=dict)
+    last_options_reasoning: Dict = field(default_factory=dict)
     last_update: str = ""
     error: Optional[str] = None
     invocation_count: int = 0
@@ -676,6 +678,12 @@ class TradingBotEngine:
             decisions = await agent.decide(self._latest_options_context)
             self.logger.info("OptionsAgent emitted %d decisions", len(decisions))
 
+            # Surface options reasoning + decisions on the GUI alongside perps.
+            # ``getattr`` keeps tests that swap in a minimal fake OptionsAgent
+            # (no ``last_payload`` attribute) green.
+            options_payload = getattr(agent, "last_payload", None) or {}
+            options_decision_payloads: List[Dict[str, Any]] = []
+
             for decision in decisions:
                 decision_payload = {
                     "asset": decision.asset,
@@ -704,6 +712,7 @@ class TradingBotEngine:
                     "vol_view": decision.vol_view,
                     "target_gamma_btc": decision.target_gamma_btc,
                 }
+                options_decision_payloads.append(decision_payload)
                 if self.trading_mode == "manual":
                     try:
                         proposal = self._create_thalex_proposal(decision_payload)
@@ -726,6 +735,17 @@ class TradingBotEngine:
                         )
                     continue
                 await self._execute_thalex_decision(decision_payload)
+
+            # Always publish — even an empty trade_decisions array carries the
+            # LLM's reasoning text, which the operator wants to see on the
+            # Reasoning page.
+            self.state.last_options_reasoning = {
+                "reasoning": (options_payload.get("reasoning") if isinstance(options_payload, dict) else "") or "",
+                "trade_decisions": options_decision_payloads,
+                "cycle_at": datetime.now(UTC).isoformat(),
+            }
+            self._compose_last_reasoning()
+            self._notify_state_update()
         except Exception as exc:  # pylint: disable=broad-except
             self.logger.error("options decision cycle failed: %s", exc)
 
@@ -1166,6 +1186,22 @@ class TradingBotEngine:
                             recent_price_points = list(self.price_history[asset])[-10:]
                             recent_timestamps = [p["t"] for p in recent_price_points]
 
+                            price_candles_5m = indicators["5m"].get("price_candles", {}) or {}
+                            price_candles_lt = lt_indicators.get("price_candles", {}) or {}
+                            # Prefer candle close timestamps so indicator & price charts share an x-axis
+                            candle_times_5m = price_candles_5m.get("time") or []
+                            candle_times_lt = price_candles_lt.get("time") or []
+                            keltner_5m_timestamps = (
+                                candle_times_5m[-len(keltner_5m_middle):]
+                                if keltner_5m_middle and len(candle_times_5m) >= len(keltner_5m_middle)
+                                else (recent_timestamps[-len(keltner_5m_middle):] if keltner_5m_middle else [])
+                            )
+                            lt_keltner_timestamps = (
+                                candle_times_lt[-len(lt_keltner_middle):]
+                                if lt_keltner_middle and len(candle_times_lt) >= len(lt_keltner_middle)
+                                else (recent_timestamps[-len(lt_keltner_middle):] if lt_keltner_middle else [])
+                            )
+
                             def _latest(series):
                                 return series[-1] if series else None
 
@@ -1202,8 +1238,8 @@ class TradingBotEngine:
                                         "keltner_middle": keltner_5m_middle,
                                         "keltner_upper": keltner_5m_upper,
                                         "keltner_lower": keltner_5m_lower,
-                                        "timestamps": recent_timestamps[-len(keltner_5m_middle):] if keltner_5m_middle else [],
-                                        "price_candles": {},
+                                        "timestamps": keltner_5m_timestamps,
+                                        "price_candles": price_candles_5m,
                                     }
                                 },
                                 "long_term": {
@@ -1216,8 +1252,8 @@ class TradingBotEngine:
                                         "keltner_middle": lt_keltner_middle,
                                         "keltner_upper": lt_keltner_upper,
                                         "keltner_lower": lt_keltner_lower,
-                                        "timestamps": recent_timestamps[-len(lt_keltner_middle):] if lt_keltner_middle else [],
-                                        "price_candles": {},
+                                        "timestamps": lt_keltner_timestamps,
+                                        "price_candles": price_candles_lt,
                                     },
                                 },
                                 "open_interest": oi,
@@ -1287,7 +1323,8 @@ class TradingBotEngine:
                     if reasoning:
                         self.logger.info(f"LLM Reasoning: {reasoning[:200]}...")
 
-                    self.state.last_reasoning = decisions
+                    self.state.last_perps_reasoning = decisions
+                    self._compose_last_reasoning()
                     self._notify_state_update()
 
                     # ===== PHASE 11: Execute Trades or Create Proposals =====
@@ -1631,6 +1668,54 @@ class TradingBotEngine:
         elif self.interval.endswith('d'):
             return int(self.interval[:-1]) * 86400
         return 300  # default 5 minutes
+
+    def _compose_last_reasoning(self) -> None:
+        """Rebuild ``state.last_reasoning`` as the merged perps + options view.
+
+        The Reasoning page reads ``state.last_reasoning`` directly. Perps fire
+        every 5 min while options fire every 3 h, so a wholesale assignment in
+        either cycle would erase the other. We instead keep both halves on
+        their own fields and recompose the GUI-facing dict here.
+
+        Trade decisions from both venues are concatenated; each item already
+        carries a ``venue`` field so the timeline can colour and filter them
+        appropriately. Reasoning text is exposed as a ``per_venue`` mapping
+        plus a top-level ``reasoning`` summary that prefers the more recent
+        cycle so the JSON editor isn't empty.
+        """
+        perps = getattr(self.state, "last_perps_reasoning", None) or {}
+        options = getattr(self.state, "last_options_reasoning", None) or {}
+
+        perps_decisions = list(perps.get("trade_decisions") or [])
+        options_decisions = list(options.get("trade_decisions") or [])
+        for decision in perps_decisions:
+            decision.setdefault("venue", "hyperliquid")
+        for decision in options_decisions:
+            decision.setdefault("venue", "thalex")
+
+        perps_text = perps.get("reasoning") or ""
+        options_text = options.get("reasoning") or ""
+        summary_parts = []
+        if perps_text:
+            summary_parts.append(f"[PERPS]\n{perps_text}")
+        if options_text:
+            summary_parts.append(f"[OPTIONS]\n{options_text}")
+
+        self.state.last_reasoning = {
+            "reasoning": "\n\n".join(summary_parts),
+            "trade_decisions": perps_decisions + options_decisions,
+            "per_venue": {
+                "hyperliquid": {
+                    "reasoning": perps_text,
+                    "trade_decisions": perps_decisions,
+                },
+                "thalex": {
+                    "reasoning": options_text,
+                    "trade_decisions": options_decisions,
+                    "cycle_at": options.get("cycle_at"),
+                },
+            },
+        }
 
     def _notify_state_update(self):
         """Notify GUI of state update via callback"""

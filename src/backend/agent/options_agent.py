@@ -113,6 +113,10 @@ class OptionsAgent:
         """``llm`` must expose
         ``async chat_json(system_prompt, user_prompt, schema) -> dict``."""
         self.llm = llm
+        # Most recent raw LLM payload ({reasoning, trade_decisions}). The GUI
+        # surfaces this so the operator can inspect the options-cycle reasoning
+        # text alongside the perps cycle. Reset to an empty dict on failure.
+        self.last_payload: dict = {}
 
     async def decide(self, context: OptionsContext) -> list[TradeDecision]:
         """Run one decision cycle against the supplied options context.
@@ -132,7 +136,10 @@ class OptionsAgent:
             )
         except Exception as exc:  # pylint: disable=broad-except
             logger.error("OptionsAgent LLM call failed: %s", exc)
+            self.last_payload = {}
             return []
+
+        self.last_payload = payload if isinstance(payload, dict) else {}
 
         raw_decisions = []
         if isinstance(payload, dict):

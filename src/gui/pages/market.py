@@ -131,11 +131,11 @@ def create_market(bot_service: BotService, state_manager: StateManager):
                 # SMA 99
                 with ui.row().classes('w-full justify-between items-center'):
                     ui.label('SMA 99 (5m)').classes('text-gray-300')
-                    ema20_label = ui.label('$0.00').classes('text-white font-semibold')
+                    sma99_intraday_label = ui.label('$0.00').classes('text-white font-semibold')
 
                 with ui.row().classes('w-full justify-between items-center'):
                     ui.label('SMA 99 (HTF)').classes('text-gray-300')
-                    ema50_label = ui.label('$0.00').classes('text-white font-semibold')
+                    sma99_htf_label = ui.label('$0.00').classes('text-white font-semibold')
 
                 ui.separator()
 
@@ -168,15 +168,8 @@ def create_market(bot_service: BotService, state_manager: StateManager):
 
                 ui.separator()
 
-                # Long-term AVWAP
-                with ui.row().classes('w-full justify-between items-center'):
-                    ui.label('AVWAP Anchor').classes('text-gray-300')
-                    atr_label = ui.label('$0.00').classes('text-white font-semibold')
-
-                ui.separator()
-
                 # Opening Range
-                ui.label('Opening Range').classes('text-lg font-bold text-white mt-2')
+                ui.label('Opening Range (20:00–20:15 Tijuana)').classes('text-lg font-bold text-white mt-2')
                 with ui.row().classes('w-full justify-between items-center'):
                     ui.label('High').classes('text-gray-300')
                     opening_range_high_label = ui.label('50.00').classes('text-white font-semibold')
@@ -341,7 +334,13 @@ def create_market(bot_service: BotService, state_manager: StateManager):
         if len(timestamps) >= point_count:
             x_values = timestamps[-point_count:]
         else:
-            x_values = list(range(1, point_count + 1))
+            # No aligned timestamps available — clear chart rather than fake an
+            # integer x-axis that masks missing history.
+            for trace in indicator_chart.figure.data:
+                trace.x = []
+                trace.y = []
+            indicator_chart.update()
+            return
 
         def _align(values: list) -> list:
             if len(values) >= point_count:
@@ -477,14 +476,14 @@ def create_market(bot_service: BotService, state_manager: StateManager):
         keltner = selected_frame.get('keltner') or alternate_frame.get('keltner', {})
         
         if sma99_selected:
-            ema20_label.set_text(f'${sma99_selected:,.2f}')
+            sma99_intraday_label.set_text(f'${sma99_selected:,.2f}')
         else:
-            ema20_label.set_text('--')
-        
+            sma99_intraday_label.set_text('--')
+
         if sma99_alt:
-            ema50_label.set_text(f'${sma99_alt:,.2f}')
+            sma99_htf_label.set_text(f'${sma99_alt:,.2f}')
         else:
-            ema50_label.set_text('--')
+            sma99_htf_label.set_text('--')
         
         selected_series = selected_frame.get('series') or alternate_frame.get('series') or {}
         _set_price_chart(selected_series.get('price_candles') or {}, market_data)
@@ -506,11 +505,6 @@ def create_market(bot_service: BotService, state_manager: StateManager):
         else:
             avwap_label.set_text('--')
             avwap_progress.set_value(0.5)
-
-        if avwap:
-            atr_label.set_text(f'${avwap:,.2f}')
-        else:
-            atr_label.set_text('--')
 
         or_high = opening_range.get('high')
         or_low = opening_range.get('low')
@@ -600,6 +594,14 @@ def create_market(bot_service: BotService, state_manager: StateManager):
 
     # Refresh on asset/interval change
     async def _handle_market_selection_change(_=None):
+        if not _ui_ok():
+            return
+        selected_asset = asset_select.value
+        selected_interval = str(interval_select.value or '5m')
+        try:
+            await bot_service.refresh_chart_candles(selected_asset, selected_interval)
+        except Exception:  # pylint: disable=broad-except
+            pass
         if not _ui_ok():
             return
         await update_market_data()

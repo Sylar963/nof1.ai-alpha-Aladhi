@@ -8,8 +8,48 @@ source (from Hyperliquid candles) with TAAPI kept only as a fallback.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
+
+
+# Opening Range window: 20:00–20:15 America/Tijuana (DST-aware)
+TIJUANA_TZ = ZoneInfo("America/Tijuana")
+OR_START_HOUR = 20
+OR_DURATION_MINUTES = 15
+
+
+def _or_window_ms(now_utc: datetime) -> tuple[int, int]:
+    """Return the (start_ms, end_ms) of the most recent 20:00–20:15 Tijuana window.
+
+    If the current Tijuana time is before 20:00, returns yesterday's window.
+    """
+    now_tj = now_utc.astimezone(TIJUANA_TZ)
+    start_tj = now_tj.replace(hour=OR_START_HOUR, minute=0, second=0, microsecond=0)
+    if now_tj < start_tj:
+        start_tj = start_tj - timedelta(days=1)
+    end_tj = start_tj + timedelta(minutes=OR_DURATION_MINUTES)
+    start_ms = int(start_tj.astimezone(timezone.utc).timestamp() * 1000)
+    end_ms = int(end_tj.astimezone(timezone.utc).timestamp() * 1000)
+    return start_ms, end_ms
+
+
+def to_price_candles(candles: list[dict], max_bars: int = 200) -> dict:
+    """Transform Hyperliquid ``{t,o,h,l,c,v}`` candle dicts into Plotly-ready arrays.
+
+    Returns ``{}`` when ``candles`` is empty so downstream callers can treat
+    "no OHLC" as falsy.
+    """
+    if not candles:
+        return {}
+    tail = candles[-max_bars:]
+    return {
+        "time": [int(c["t"]) for c in tail],
+        "open": [float(c["o"]) for c in tail],
+        "high": [float(c["h"]) for c in tail],
+        "low": [float(c["l"]) for c in tail],
+        "close": [float(c["c"]) for c in tail],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +150,9 @@ def compute_keltner_series(
     n = len(closes)
     needed = max(period, atr_length + 1)
     if n < needed:
+        logging.warning(
+            "Keltner: only %d bars, need %d — returning empty series", n, needed,
+        )
         return {"lower": [], "middle": [], "upper": []}
 
     # Compute full EMA series for the middle band
@@ -263,12 +306,13 @@ def build_indicator_bundle(
         period=130, atr_length=130, multiplier=4.0, results=5,
     )
 
-    # Opening range: filter 5m candles to first hour of UTC day
-    now = datetime.now(timezone.utc)
-    day_start_ms = int(datetime(now.year, now.month, now.day, tzinfo=timezone.utc).timestamp()) * 1000
-    day_first_hour_end_ms = day_start_ms + 3600 * 1000
-    or_candles = [c for c in candles_5m if c["t"] >= day_start_ms and c["t"] < day_first_hour_end_ms]
+    # Opening range: 20:00–20:15 America/Tijuana (most recent completed window)
+    or_start_ms, or_end_ms = _or_window_ms(datetime.now(timezone.utc))
+    or_candles = [c for c in candles_5m if or_start_ms <= c["t"] < or_end_ms]
     result["5m"]["opening_range"] = compute_opening_range(or_candles, current_spot)
+
+    # Raw OHLC for the chart (both intraday 5m and long-term frame)
+    result["5m"]["price_candles"] = to_price_candles(candles_5m, max_bars=200)
 
     # Anchored VWAP from daily candles
     avwap = compute_avwap(candles_daily)
@@ -285,6 +329,7 @@ def build_indicator_bundle(
         period=130, atr_length=130, multiplier=4.0, results=5,
     )
     result[long_interval]["avwap"] = avwap
+    result[long_interval]["price_candles"] = to_price_candles(candles_long, max_bars=200)
 
     logging.info(
         "Local indicators: 5m sma99=%d vals, keltner=%d vals, OR=%s | %s sma99=%d vals, keltner=%d vals",
