@@ -1138,7 +1138,10 @@ class TradingBotEngine:
                         'balance': balance,
                         'account_value': total_value,
                         'sharpe_ratio': sharpe_ratio,
-                        'positions': combined_positions,
+                        'positions': [
+                            {k: v for k, v in pos.items() if k not in ("closable", "row_id")}
+                            for pos in combined_positions
+                        ],
                         'active_trades': self.active_trades,
                         'open_orders': open_orders,
                         'recent_diary': recent_diary,
@@ -1286,6 +1289,17 @@ class TradingBotEngine:
                             "note": "Follow the system prompt guidelines strictly"
                         })
                     ])
+
+                    # Inject compact options book summary when available so the
+                    # perps agent can factor in the options desk's net exposure.
+                    if self._latest_options_context is not None:
+                        ctx = self._latest_options_context
+                        context_payload["options_book_summary"] = {
+                            "vol_regime": ctx.vol_regime,
+                            "portfolio_greeks": ctx.portfolio_greeks,
+                            "open_position_count": ctx.open_position_count,
+                        }
+
                     context = json.dumps(context_payload, default=json_default, indent=2)
 
                     # Log prompt
