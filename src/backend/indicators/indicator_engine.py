@@ -248,10 +248,12 @@ def compute_opening_range(candles: list[dict], current_spot: Optional[float] = N
             continue
 
     if not highs or not lows:
-        return {"high": None, "low": None, "position": "unknown"}
+        return {"high": None, "low": None, "mid": None, "position": "unknown",
+                "or_start_ms": None, "or_end_ms": None}
 
     high = max(highs)
     low = min(lows)
+    mid = round((high + low) / 2.0, 4)
     position = "unknown"
     if current_spot is not None:
         try:
@@ -264,7 +266,8 @@ def compute_opening_range(candles: list[dict], current_spot: Optional[float] = N
                 position = "inside"
         except (TypeError, ValueError):
             pass
-    return {"high": round(high, 4), "low": round(low, 4), "position": position}
+    return {"high": round(high, 4), "low": round(low, 4), "mid": mid,
+            "position": position, "or_start_ms": None, "or_end_ms": None}
 
 
 # ---------------------------------------------------------------------------
@@ -300,19 +303,33 @@ def build_indicator_bundle(
     highs_5m = [c["h"] for c in candles_5m]
     lows_5m = [c["l"] for c in candles_5m]
 
-    result["5m"]["sma99"] = compute_sma_series(closes_5m, period=99, results=5)
+    n_5m = len(candles_5m)
+    result["5m"]["sma99"] = compute_sma_series(closes_5m, period=99, results=n_5m)
     result["5m"]["keltner"] = compute_keltner_series(
         highs_5m, lows_5m, closes_5m,
-        period=130, atr_length=130, multiplier=4.0, results=5,
+        period=130, atr_length=130, multiplier=4.0, results=n_5m,
     )
 
     # Opening range: 20:00–20:15 America/Tijuana (most recent completed window)
     or_start_ms, or_end_ms = _or_window_ms(datetime.now(timezone.utc))
     or_candles = [c for c in candles_5m if or_start_ms <= c["t"] < or_end_ms]
-    result["5m"]["opening_range"] = compute_opening_range(or_candles, current_spot)
+    or_result = compute_opening_range(or_candles, current_spot)
+    or_result["or_start_ms"] = or_start_ms
+    or_result["or_end_ms"] = or_end_ms
+    result["5m"]["opening_range"] = or_result
 
     # Raw OHLC for the chart (both intraday 5m and long-term frame)
-    result["5m"]["price_candles"] = to_price_candles(candles_5m, max_bars=200)
+    price_candles_5m = to_price_candles(candles_5m, max_bars=200)
+    result["5m"]["price_candles"] = price_candles_5m
+
+    keltner_5m_middle = result["5m"]["keltner"].get("middle", [])
+    candle_times_5m = price_candles_5m.get("time", [])
+    if keltner_5m_middle and len(candle_times_5m) >= len(keltner_5m_middle):
+        result["5m"]["timestamps"] = candle_times_5m[-len(keltner_5m_middle):]
+    elif candle_times_5m:
+        result["5m"]["timestamps"] = candle_times_5m
+    else:
+        result["5m"]["timestamps"] = []
 
     # Anchored VWAP from daily candles
     avwap = compute_avwap(candles_daily)
@@ -323,13 +340,24 @@ def build_indicator_bundle(
     highs_long = [c["h"] for c in candles_long]
     lows_long = [c["l"] for c in candles_long]
 
-    result[long_interval]["sma99"] = compute_sma_series(closes_long, period=99, results=5)
+    n_long = len(candles_long)
+    result[long_interval]["sma99"] = compute_sma_series(closes_long, period=99, results=n_long)
     result[long_interval]["keltner"] = compute_keltner_series(
         highs_long, lows_long, closes_long,
-        period=130, atr_length=130, multiplier=4.0, results=5,
+        period=130, atr_length=130, multiplier=4.0, results=n_long,
     )
     result[long_interval]["avwap"] = avwap
-    result[long_interval]["price_candles"] = to_price_candles(candles_long, max_bars=200)
+    price_candles_long = to_price_candles(candles_long, max_bars=200)
+    result[long_interval]["price_candles"] = price_candles_long
+
+    lt_keltner_middle = result[long_interval]["keltner"].get("middle", [])
+    candle_times_long = price_candles_long.get("time", [])
+    if lt_keltner_middle and len(candle_times_long) >= len(lt_keltner_middle):
+        result[long_interval]["timestamps"] = candle_times_long[-len(lt_keltner_middle):]
+    elif candle_times_long:
+        result[long_interval]["timestamps"] = candle_times_long
+    else:
+        result[long_interval]["timestamps"] = []
 
     logging.info(
         "Local indicators: 5m sma99=%d vals, keltner=%d vals, OR=%s | %s sma99=%d vals, keltner=%d vals",

@@ -196,6 +196,8 @@ class TradingBotEngine:
         """Build a manual-approval proposal for a Thalex decision payload."""
         decision = parse_decision(decision_payload)
         size = float(decision.contracts or decision.target_gamma_btc or 0.0)
+        if size <= 0:
+            raise ValueError(f"Thalex proposal has zero size: contracts={decision.contracts}, target_gamma_btc={decision.target_gamma_btc}")
         return TradeProposal(
             venue="thalex",
             asset=decision.asset,
@@ -1370,7 +1372,10 @@ class TradingBotEngine:
                             if self.trading_mode == "manual":
                                 try:
                                     current_price = await self.hyperliquid.get_current_price(asset)
-                                    size = allocation / current_price if current_price > 0 else 0
+                                    if not current_price or current_price <= 0:
+                                        self.logger.error(f"Skipping proposal for {asset}: invalid price {current_price}")
+                                        continue
+                                    size = allocation / current_price
                                     
                                     # Calculate risk/reward
                                     risk_reward = None
@@ -1411,7 +1416,10 @@ class TradingBotEngine:
                             # AUTO MODE: Execute immediately (position-aware)
                             try:
                                 current_price = await self.hyperliquid.get_current_price(asset)
-                                desired_size = allocation / current_price if current_price > 0 else 0
+                                if not current_price or current_price <= 0:
+                                    self.logger.error(f"Skipping {action} {asset}: invalid price {current_price}")
+                                    continue
+                                desired_size = allocation / current_price
 
                                 # --- Cancel stale orders for this asset ---
                                 cancel_result = await self.hyperliquid.cancel_all_orders(asset)

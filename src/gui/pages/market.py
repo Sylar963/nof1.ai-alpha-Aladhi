@@ -2,11 +2,24 @@
 Market Data Page - Live market data and technical indicators
 """
 
+from datetime import datetime, timezone
+
 import plotly.graph_objects as go
 from nicegui import ui
 from src.gui.services.bot_service import BotService
 from src.gui.services.state_manager import StateManager
 from src.gui.services.ui_utils import is_ui_alive
+
+
+def _ms_to_dt(ms_values: list) -> list:
+    """Convert epoch-ms integers to ISO datetime strings for Plotly axes."""
+    out = []
+    for v in ms_values:
+        try:
+            out.append(datetime.fromtimestamp(int(v) / 1000, tz=timezone.utc).isoformat())
+        except (TypeError, ValueError, OSError):
+            out.append(None)
+    return out
 
 
 def create_market(bot_service: BotService, state_manager: StateManager):
@@ -64,7 +77,7 @@ def create_market(bot_service: BotService, state_manager: StateManager):
         interval_select = ui.select(
             label='Interval',
             options=['1m', '5m', '15m', '1h', '4h', '1d'],
-            value='5m'
+            value='15m'
         ).classes('w-32')
 
     # ===== PRICE CARDS =====
@@ -96,28 +109,33 @@ def create_market(bot_service: BotService, state_manager: StateManager):
     # ===== PRICE CHART =====
     with ui.card().classes('w-full p-4 mb-6'):
         ui.label('Price Chart').classes('text-xl font-bold text-white mb-2')
-        ui.label('Indicators (SMA/Keltner/AVWAP) are computed locally. Price candles fall back to Hyperliquid mids when OHLC is unavailable.').classes('text-xs text-gray-400 mb-3')
+        ui.label('15 min candles with Keltner(130,4) overlay. Gray box = Opening Range 20:00–20:15 Tijuana.').classes('text-xs text-gray-400 mb-3')
 
-        # Candlestick chart
         price_chart = ui.plotly(go.Figure(
-            data=[go.Candlestick(
-                x=[],
-                open=[],
-                high=[],
-                low=[],
-                close=[],
-                name='Price'
-            )],
+            data=[
+                go.Candlestick(x=[], open=[], high=[], low=[], close=[], name='Price',
+                               increasing_line_color='#22c55e', decreasing_line_color='#ef4444'),
+                go.Scatter(x=[], y=[], mode='lines', name='Keltner Upper',
+                           line=dict(color='#ef4444', width=1, dash='dot')),
+                go.Scatter(x=[], y=[], mode='lines', name='Keltner Middle',
+                           line=dict(color='#3b82f6', width=1.5)),
+                go.Scatter(x=[], y=[], mode='lines', name='Keltner Lower',
+                           line=dict(color='#10b981', width=1, dash='dot')),
+                go.Scatter(x=[], y=[], mode='lines', name='OR Mid',
+                           line=dict(color='#9ca3af', width=1, dash='dash')),
+            ],
             layout=go.Layout(
                 template='plotly_dark',
-                height=400,
+                height=550,
                 margin=dict(l=50, r=20, t=20, b=40),
-                xaxis=dict(title='Time', showgrid=True, gridcolor='#374151'),
+                xaxis=dict(title='Time', showgrid=True, gridcolor='#374151',
+                           type='date', rangeslider=dict(visible=False)),
                 yaxis=dict(title='Price ($)', showgrid=True, gridcolor='#374151'),
                 paper_bgcolor='#1f2937',
                 plot_bgcolor='#1f2937',
                 font=dict(color='#e5e7eb'),
-                showlegend=True
+                showlegend=True,
+                legend=dict(orientation='h', y=1.02, x=0.5, xanchor='center'),
             )
         )).classes('w-full')
 
@@ -270,45 +288,106 @@ def create_market(bot_service: BotService, state_manager: StateManager):
         return False
 
     def _clear_price_chart():
-        candle_trace = price_chart.figure.data[0]
-        candle_trace.x = []
-        candle_trace.open = []
-        candle_trace.high = []
-        candle_trace.low = []
-        candle_trace.close = []
+        for trace in price_chart.figure.data:
+            trace.x = []
+            if hasattr(trace, 'open'):
+                trace.open = []
+                trace.high = []
+                trace.low = []
+                trace.close = []
+            else:
+                trace.y = []
+        price_chart.figure.layout.shapes = []
         price_chart.update()
 
-    def _set_price_chart(price_candles: dict, market_snapshot: dict):
-        """Render recent OHLC candles when available."""
+    def _set_price_chart(price_candles: dict, series: dict,
+                         opening_range: dict, market_snapshot: dict):
+        """Render OHLC candles with Keltner overlay and OR rectangle."""
         time_values = list(price_candles.get('time') or [])
         open_values = list(price_candles.get('open') or [])
         high_values = list(price_candles.get('high') or [])
         low_values = list(price_candles.get('low') or [])
         close_values = list(price_candles.get('close') or [])
 
-        if not time_values or not open_values or not high_values or not low_values or not close_values:
+        if not time_values or not open_values:
             fallback_times = list(market_snapshot.get('recent_timestamps') or [])
             fallback_prices = list(market_snapshot.get('recent_mid_prices') or [])
             if fallback_times and fallback_prices:
-                point_count = min(len(fallback_times), len(fallback_prices))
-                aligned_prices = fallback_prices[-point_count:]
-                time_values = fallback_times[-point_count:]
-                open_values = aligned_prices
-                high_values = aligned_prices
-                low_values = aligned_prices
-                close_values = aligned_prices
+                n = min(len(fallback_times), len(fallback_prices))
+                time_values = fallback_times[-n:]
+                open_values = high_values = low_values = close_values = fallback_prices[-n:]
 
-        point_count = min(len(time_values), len(open_values), len(high_values), len(low_values), len(close_values))
-
-        if point_count == 0:
+        n = min(len(time_values), len(open_values), len(high_values),
+                len(low_values), len(close_values))
+        if n == 0:
             _clear_price_chart()
             return
 
-        price_chart.figure.data[0].x = time_values[-point_count:]
-        price_chart.figure.data[0].open = open_values[-point_count:]
-        price_chart.figure.data[0].high = high_values[-point_count:]
-        price_chart.figure.data[0].low = low_values[-point_count:]
-        price_chart.figure.data[0].close = close_values[-point_count:]
+        # Convert epoch-ms to ISO strings for proper Plotly datetime axis
+        raw_times = time_values[-n:]
+        needs_convert = raw_times and isinstance(raw_times[0], (int, float))
+        dt_times = _ms_to_dt(raw_times) if needs_convert else raw_times
+
+        price_chart.figure.data[0].x = dt_times
+        price_chart.figure.data[0].open = open_values[-n:]
+        price_chart.figure.data[0].high = high_values[-n:]
+        price_chart.figure.data[0].low = low_values[-n:]
+        price_chart.figure.data[0].close = close_values[-n:]
+
+        # --- Keltner overlay (traces 1-3) ---
+        kelt_upper = list(series.get('keltner_upper') or [])
+        kelt_middle = list(series.get('keltner_middle') or [])
+        kelt_lower = list(series.get('keltner_lower') or [])
+        kelt_times = list(series.get('timestamps') or [])
+        kelt_needs_convert = kelt_times and isinstance(kelt_times[0], (int, float))
+        dt_kelt = _ms_to_dt(kelt_times) if kelt_needs_convert else kelt_times
+
+        price_chart.figure.data[1].x = dt_kelt
+        price_chart.figure.data[1].y = kelt_upper
+        price_chart.figure.data[2].x = dt_kelt
+        price_chart.figure.data[2].y = kelt_middle
+        price_chart.figure.data[3].x = dt_kelt
+        price_chart.figure.data[3].y = kelt_lower
+
+        # --- Opening Range rectangle + mid line (trace 4) ---
+        or_high = opening_range.get('high')
+        or_low = opening_range.get('low')
+        or_mid = opening_range.get('mid')
+        or_start = opening_range.get('or_start_ms')
+        or_end = opening_range.get('or_end_ms')
+
+        shapes = []
+        if all(v is not None for v in (or_high, or_low, or_start, or_end)):
+            or_x0 = _ms_to_dt([or_start])[0]
+            or_x1 = _ms_to_dt([or_end])[0]
+            shapes.append(dict(
+                type='rect', xref='x', yref='y',
+                x0=or_x0, x1=or_x1, y0=or_low, y1=or_high,
+                fillcolor='rgba(156,163,175,0.25)',
+                line=dict(color='rgba(156,163,175,0.6)', width=1),
+            ))
+            # Extend the OR high/low as horizontal dashed lines across the chart
+            if dt_times:
+                chart_x0 = dt_times[0]
+                chart_x1 = dt_times[-1]
+                for lvl, clr in [(or_high, 'rgba(156,163,175,0.4)'),
+                                 (or_low, 'rgba(156,163,175,0.4)')]:
+                    shapes.append(dict(
+                        type='line', xref='x', yref='y',
+                        x0=chart_x0, x1=chart_x1, y0=lvl, y1=lvl,
+                        line=dict(color=clr, width=1, dash='dash'),
+                    ))
+
+        price_chart.figure.layout.shapes = shapes
+
+        # OR mid trace (trace 4)
+        if or_mid is not None and dt_times:
+            price_chart.figure.data[4].x = [dt_times[0], dt_times[-1]]
+            price_chart.figure.data[4].y = [or_mid, or_mid]
+        else:
+            price_chart.figure.data[4].x = []
+            price_chart.figure.data[4].y = []
+
         price_chart.update()
 
     def _set_indicator_chart(series: dict, opening_range: dict, market_snapshot: dict):
@@ -316,7 +395,15 @@ def create_market(bot_service: BotService, state_manager: StateManager):
         keltner_upper = list(series.get('keltner_upper') or [])
         keltner_middle = list(series.get('keltner_middle') or [])
         keltner_lower = list(series.get('keltner_lower') or [])
-        timestamps = list(series.get('timestamps') or market_snapshot.get('recent_timestamps') or [])
+        timestamps = list(series.get('timestamps') or [])
+
+        # Fallback: derive timestamps from price candle times
+        if not timestamps:
+            price_candles = series.get('price_candles') or {}
+            timestamps = list(price_candles.get('time') or [])
+        if not timestamps:
+            timestamps = list(market_snapshot.get('recent_timestamps') or [])
+
         point_count = max(
             len(keltner_upper),
             len(keltner_middle),
@@ -331,16 +418,21 @@ def create_market(bot_service: BotService, state_manager: StateManager):
             indicator_chart.update()
             return
 
+        needs_convert = timestamps and isinstance(timestamps[0], (int, float))
+
         if len(timestamps) >= point_count:
-            x_values = timestamps[-point_count:]
+            raw_x = timestamps[-point_count:]
+        elif timestamps:
+            raw_x = timestamps
+            point_count = len(timestamps)
         else:
-            # No aligned timestamps available — clear chart rather than fake an
-            # integer x-axis that masks missing history.
             for trace in indicator_chart.figure.data:
                 trace.x = []
                 trace.y = []
             indicator_chart.update()
             return
+
+        x_values = _ms_to_dt(raw_x) if needs_convert else raw_x
 
         def _align(values: list) -> list:
             if len(values) >= point_count:
@@ -389,10 +481,10 @@ def create_market(bot_service: BotService, state_manager: StateManager):
             return
         state = state_manager.get_state()
         selected_asset = asset_select.value
-        selected_interval = str(interval_select.value or '5m')
+        selected_interval = str(interval_select.value or '15m')
         valid_intervals = {'1m', '5m', '15m', '1h', '4h', '1d'}
         if selected_interval not in valid_intervals:
-            selected_interval = '5m'
+            selected_interval = '15m'
         hedge_metric = next(
             (m for m in (getattr(state, 'hedge_metrics', []) or []) if m.get('underlying') == selected_asset),
             None,
@@ -486,7 +578,8 @@ def create_market(bot_service: BotService, state_manager: StateManager):
             sma99_htf_label.set_text('--')
         
         selected_series = selected_frame.get('series') or alternate_frame.get('series') or {}
-        _set_price_chart(selected_series.get('price_candles') or {}, market_data)
+        _set_price_chart(selected_series.get('price_candles') or {},
+                         selected_series, opening_range, market_data)
         middle = keltner.get('middle')
         upper = keltner.get('upper')
         lower = keltner.get('lower')

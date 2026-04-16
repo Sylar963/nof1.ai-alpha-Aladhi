@@ -79,7 +79,7 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
     with ui.row().classes('w-full gap-4 mb-6'):
         # Equity Curve Chart (left half)
         with ui.card().classes('flex-1 p-4'):
-            ui.label('Portfolio Value').classes('text-xl font-bold text-white mb-2')
+            ui.label('Portfolio Value (3 months)').classes('text-xl font-bold text-white mb-2')
 
             equity_chart = ui.plotly(go.Figure(
                 data=[go.Scatter(
@@ -87,13 +87,16 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
                     y=[],
                     mode='lines',
                     name='Value',
-                    line=dict(color='#667eea', width=3)
+                    line=dict(color='#667eea', width=2),
+                    fill='tozeroy',
+                    fillcolor='rgba(102,126,234,0.15)',
                 )],
                 layout=go.Layout(
                     template='plotly_dark',
                     height=300,
                     margin=dict(l=50, r=20, t=20, b=40),
-                    xaxis=dict(title='Time', showgrid=True, gridcolor='#374151'),
+                    xaxis=dict(title='Time', showgrid=True, gridcolor='#374151',
+                               type='date', rangeslider=dict(visible=False)),
                     yaxis=dict(title='Value ($)', showgrid=True, gridcolor='#374151'),
                     paper_bgcolor='#1f2937',
                     plot_bgcolor='#1f2937',
@@ -376,14 +379,24 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
             else:
                 hedge_health_value.classes(remove='text-green-500 text-red-500', add='text-gray-400')
 
-            # Update equity curve chart
-            equity_history = bot_service.get_equity_history()
-            if equity_history:
-                times = [d['time'] for d in equity_history]
-                values = [d['value'] for d in equity_history]
-
-                equity_chart.figure.data[0].x = times
-                equity_chart.figure.data[0].y = values
+            # Update equity curve chart — merge 3-month DB history with in-memory session data
+            db_curve = bot_service.get_equity_curve(days=90)
+            session_history = bot_service.get_equity_history(limit=500)
+            merged_times = []
+            merged_values = []
+            if db_curve:
+                merged_times.extend(d['timestamp'] for d in db_curve if d.get('total_value'))
+                merged_values.extend(d['total_value'] for d in db_curve if d.get('total_value'))
+            if session_history:
+                db_last_ts = merged_times[-1] if merged_times else ''
+                for d in session_history:
+                    ts = d.get('time', '')
+                    if ts > db_last_ts and d.get('value'):
+                        merged_times.append(ts)
+                        merged_values.append(d['value'])
+            if merged_times:
+                equity_chart.figure.data[0].x = merged_times
+                equity_chart.figure.data[0].y = merged_values
                 equity_chart.update()
 
             # Update asset allocation chart

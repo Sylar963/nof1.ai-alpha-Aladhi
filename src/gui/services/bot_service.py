@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 
 from src.backend.bot_engine import TradingBotEngine, BotState
 from src.backend.config_loader import CONFIG
+from src.database.db_manager import get_db_manager
 
 
 class BotService:
@@ -230,10 +231,12 @@ class BotService:
         price_candles = frame.get('price_candles') or {}
         keltner_middle = list(keltner.get('middle') or [])
         frame_timestamps = list(frame.get('timestamps') or [])
-        if not frame_timestamps and keltner_middle:
+        if not frame_timestamps:
             candle_times = list(price_candles.get('time') or [])
-            if len(candle_times) >= len(keltner_middle):
+            if keltner_middle and len(candle_times) >= len(keltner_middle):
                 frame_timestamps = candle_times[-len(keltner_middle):]
+            elif candle_times:
+                frame_timestamps = candle_times
         shaped = {
             'sma99': cls._latest(list(frame.get('sma99') or [])),
             'avwap': frame.get('avwap'),
@@ -618,6 +621,8 @@ class BotService:
             if len(self.equity_history) > 500:
                 self.equity_history = self.equity_history[-500:]
 
+            self._persist_bot_state(state)
+
             if len(self.equity_history) >= 3:
                 values = [e['value'] for e in self.equity_history if e['value'] and e['value'] > 0]
                 if len(values) >= 3:
@@ -810,6 +815,7 @@ class BotService:
             'value': state.total_value
         })
 
+        self._persist_bot_state(state)
         self._track_hedge_events(state)
 
         # Keep only last 500 points
@@ -854,6 +860,38 @@ class BotService:
 
         self._last_degraded_underlyings = degraded
         self._last_hedge_state_error = state_error
+
+    def _persist_bot_state(self, state: BotState):
+        """Save a bot state snapshot to the database for long-term equity tracking."""
+        try:
+            positions = state.positions or []
+            total_unrealized = sum(
+                float(p.get('unrealized_pnl', 0) or 0) for p in positions
+            )
+            get_db_manager().save_bot_state(
+                balance=state.balance,
+                total_value=state.total_value,
+                equity=state.total_value,
+                total_return_pct=state.total_return_pct,
+                sharpe_ratio=state.sharpe_ratio if state.sharpe_ratio else None,
+                open_positions_count=len(positions),
+                total_position_value=abs(sum(
+                    float(p.get('quantity', 0) or 0) * float(p.get('entry_price', 0) or 0)
+                    for p in positions
+                )),
+                total_unrealized_pnl=total_unrealized,
+                is_running=state.is_running,
+            )
+        except Exception as e:
+            self.logger.warning("Failed to persist bot state to DB: %s", e)
+
+    def get_equity_curve(self, days: int = 90) -> List[Dict]:
+        """Get equity curve from the database for long-term charting."""
+        try:
+            return get_db_manager().get_equity_curve(days=days)
+        except Exception as e:
+            self.logger.warning("Failed to load equity curve from DB: %s", e)
+            return []
 
     def _on_trade_executed(self, trade: Dict):
         """
