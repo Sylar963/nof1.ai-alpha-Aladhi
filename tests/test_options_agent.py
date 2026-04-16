@@ -187,3 +187,67 @@ async def test_agent_returns_empty_list_when_llm_returns_no_decisions():
     llm = FakeLLMClient({"trade_decisions": []})
     agent = OptionsAgent(llm=llm)
     assert await agent.decide(_basic_context()) == []
+
+
+# ---------------------------------------------------------------------------
+# Prompt knowledge sections
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_system_prompt_contains_strategy_selection():
+    """The prompt must contain strategy selection decision logic."""
+    llm = FakeLLMClient({"trade_decisions": []})
+    agent = OptionsAgent(llm=llm)
+    await agent.decide(_basic_context())
+
+    prompt = llm.calls[0]["system_prompt"]
+    lower = prompt.lower()
+    # Decision tree branches by regime
+    assert "skew" in lower
+    assert "realized_iv_ratio" in prompt or "realized" in lower
+    # Tenor guidance
+    assert "7" in prompt and "21" in prompt  # premium selling DTE range
+    assert "tenor" in lower
+
+
+@pytest.mark.asyncio
+async def test_system_prompt_contains_position_management():
+    """The prompt must contain rolling, profit-taking, and cut-loss rules."""
+    llm = FakeLLMClient({"trade_decisions": []})
+    agent = OptionsAgent(llm=llm)
+    await agent.decide(_basic_context())
+
+    prompt = llm.calls[0]["system_prompt"]
+    lower = prompt.lower()
+    assert "roll" in lower
+    assert "profit" in lower
+    assert "cut" in lower or "close" in lower
+
+
+@pytest.mark.asyncio
+async def test_system_prompt_contains_regime_playbook():
+    """The prompt must contain crypto-specific BTC vol knowledge."""
+    llm = FakeLLMClient({"trade_decisions": []})
+    agent = OptionsAgent(llm=llm)
+    await agent.decide(_basic_context())
+
+    prompt = llm.calls[0]["system_prompt"]
+    lower = prompt.lower()
+    assert "btc" in lower
+    assert "backwardation" in lower or "contango" in lower
+    assert "expiry" in lower or "gamma" in lower
+
+
+@pytest.mark.asyncio
+async def test_system_prompt_contains_risk_framework():
+    """The prompt must contain sizing and portfolio constraint rules."""
+    llm = FakeLLMClient({"trade_decisions": []})
+    agent = OptionsAgent(llm=llm)
+    await agent.decide(_basic_context())
+
+    prompt = llm.calls[0]["system_prompt"]
+    lower = prompt.lower()
+    assert "delta" in lower
+    assert "vega" in lower
+    assert "0.02" in prompt or "sizing" in lower
