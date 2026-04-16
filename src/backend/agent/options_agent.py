@@ -168,6 +168,48 @@ ACTION FIELD MAPPING
   so the operator can trace the logic."""
 
 
+_REGIME_PLAYBOOK = """\
+BTC VOL REGIME PLAYBOOK — crypto-specific knowledge
+
+BTC VOLATILITY STRUCTURE
+- BTC implied volatility typically trades 60-80% annualized in calm markets,
+  100-150%+ during events or liquidation cascades.
+- The key signal is realized_iv_ratio_15d: below 0.8 means IV is overpriced
+  relative to actual moves (sell premium). Above 1.2 means IV is underpriced
+  relative to actual moves (buy gamma).
+- BTC skew is structurally negative — puts trade richer than equidistant calls
+  because of persistent crash-hedging demand. A skew flip to positive (calls
+  more expensive than puts) signals euphoric positioning — fade it with
+  credit_call_spread.
+- Term structure is normally in contango (longer tenors carry higher IV).
+  Backwardation (near-term IV > long-term) signals a near-term event or panic.
+  When you see backwardation: short near-term premium, long back-month via
+  vol_arb to capture the term structure normalization.
+
+EVENT-DRIVEN PATTERNS
+- Pre-major-expiry (Friday quarterlies): gamma exposure concentrates near
+  popular strikes, spot tends to pin near max-pain. Short vol via iron_condor
+  placed around the max-pain strike 2-3 days before expiry.
+- Post-expiry: gamma unwind releases spot from pinning — expect a directional
+  move. Wait for the move to develop, then buy gamma via delta-hedged longs
+  if vol reprices cheap after the gamma flush.
+- Weekend: theta decays but spot can gap on low liquidity. Avoid opening new
+  short vol positions on Friday afternoon. Wait for Monday when the weekend
+  gap risk has resolved and fresh premium is available.
+- Macro events (FOMC, CPI, major crypto catalysts): IV typically gets bid
+  2-3 days before the event, then crushes after. Sell premium AFTER the event
+  when IV is still elevated but the catalyst has passed — not before.
+
+WHEN NOT TO TRADE
+- Portfolio already at max_open_positions: focus on managing existing book.
+  Emit management decisions (rolls, profit-takes) but no new openings.
+- realized_iv_ratio_15d between 0.9 and 1.1 AND no mispricings above 150 bps:
+  vol is fairly priced everywhere, there is genuinely no edge. Manage existing
+  positions only.
+- Net portfolio vega exceeds |500| USD/vol-point in either direction: the book
+  is overexposed. Rebalance existing positions before adding new ones."""
+
+
 _OUTPUT_CONTRACT = """\
 OUTPUT CONTRACT
 Return a strict JSON object with two keys, in order:
@@ -200,6 +242,7 @@ _OPTIONS_SYSTEM_PROMPT = "\n\n".join([
     _PREAMBLE,
     _STRATEGY_SELECTION,
     _POSITION_MANAGEMENT,
+    _REGIME_PLAYBOOK,
     _OUTPUT_CONTRACT,
 ])
 
