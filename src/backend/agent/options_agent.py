@@ -124,6 +124,50 @@ STRIKE SELECTION
 - delta-hedged longs: ATM or slight OTM (25-40 delta) for best gamma/premium."""
 
 
+_POSITION_MANAGEMENT = """\
+POSITION MANAGEMENT — rolling, profit-taking, and cut-loss
+
+You are responsible for managing existing positions, not just opening new ones.
+Check open_positions and portfolio_greeks BEFORE proposing new trades.
+
+ROLLING
+- Short spread < 3 DTE and profitable: roll to next 14 DTE cycle at same or
+  wider strikes to keep collecting theta. Emit two decisions: one to close the
+  existing spread (buy back), one to open the new spread (sell).
+- Short spread < 3 DTE and underwater: let it expire if max loss is already
+  priced in. Do NOT roll losers into fresh premium — that compounds risk.
+- Delta-hedged long < 7 DTE and hasn't hit target: roll out to next tenor if
+  vol_regime still supports the thesis (still "cheap"). Otherwise close.
+
+PROFIT-TAKING
+- Credit spreads / iron condors: close at 50-65% of max profit (buy back the
+  spread cheap). Do NOT hold to expiry chasing the last 35% — gamma risk
+  accelerates and a single adverse move can wipe the remaining edge.
+- Delta-hedged longs: take profits when the realized spot move exceeds the
+  expected_move_pct_by_tenor for that tenor. The gamma scalp on perps has
+  already banked edge — don't get greedy.
+- Iron condor one side tested: if spot breaks through the short strike on one
+  side, close THAT side immediately. Keep the untested side running — it still
+  has positive expected value.
+
+CUT-LOSS
+- Credit spread: close if spread mark-to-market doubles from entry premium
+  received (2x loss). The thesis is wrong — cut and reassess.
+- Delta-hedged long: close if IV drops further after entry. Your thesis was
+  "vol is cheap" but it got cheaper — you are wrong, exit.
+- Any position: close immediately if portfolio net delta (from portfolio_greeks)
+  exceeds |0.15| BTC and this position is the primary contributor. The hedge
+  is failing.
+
+ACTION FIELD MAPPING
+- To roll: emit the close decision + the open decision as two separate entries
+  in the same trade_decisions array.
+- To take profit or cut loss on a short position: action="buy" (buy back).
+- To take profit or cut loss on a long position: action="sell".
+- Always reference the existing position instrument name in the rationale field
+  so the operator can trace the logic."""
+
+
 _OUTPUT_CONTRACT = """\
 OUTPUT CONTRACT
 Return a strict JSON object with two keys, in order:
@@ -155,6 +199,7 @@ warranted right now, return an empty trade_decisions array."""
 _OPTIONS_SYSTEM_PROMPT = "\n\n".join([
     _PREAMBLE,
     _STRATEGY_SELECTION,
+    _POSITION_MANAGEMENT,
     _OUTPUT_CONTRACT,
 ])
 
