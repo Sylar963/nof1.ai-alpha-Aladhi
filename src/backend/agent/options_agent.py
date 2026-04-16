@@ -210,6 +210,41 @@ WHEN NOT TO TRADE
   is overexposed. Rebalance existing positions before adding new ones."""
 
 
+_RISK_FRAMEWORK = """\
+RISK FRAMEWORK — sizing, portfolio constraints, strike widths
+
+POSITION SIZING
+- Base size: 0.02-0.05 contracts per leg. This is the default range.
+- Scale up to max_contracts_per_trade (0.1) ONLY when vol_regime_confidence is
+  "high" AND realized_iv_ratio_15d confirms the regime (< 0.8 for rich,
+  > 1.2 for cheap).
+- When the portfolio already has same-direction exposure (e.g., existing short
+  vol position and you propose another credit spread): HALVE the base size to
+  avoid concentration.
+- When capital_available < 500 USD: use minimum size (0.01 contracts) only.
+  Preserve capital for margin and hedging needs.
+
+PORTFOLIO CONSTRAINTS
+- Net delta: keep portfolio delta between -0.10 and +0.10 BTC. Read the
+  portfolio_greeks.delta field. If adding a trade would push delta outside
+  this band, either size down or pick a more delta-neutral strategy.
+- Net vega: do not exceed 300 USD/vol-point short or 500 USD/vol-point long.
+  Short vega blows up faster than long vega decays — the asymmetry demands
+  tighter limits on the short side.
+- Theta targeting: aim for positive theta (collecting time decay) when
+  vol_regime is "rich". Accept negative theta when "cheap" — you are paying
+  for gamma and the expected move should cover the theta cost.
+- No contradictory positions: do NOT hold credit_put_spread and
+  long_put_delta_hedged simultaneously — they are opposite vol bets on the
+  same side. If you hold one and want the other, close the first.
+
+STRIKE WIDTH (defined risk verticals)
+- Minimum 5% distance between short and long strikes on any vertical spread.
+  Tighter spreads have poor fill quality on Thalex and excessive pin risk.
+- Maximum 15% distance — wider than that, the long protective leg is too far
+  OTM to provide meaningful risk definition at reasonable cost."""
+
+
 _OUTPUT_CONTRACT = """\
 OUTPUT CONTRACT
 Return a strict JSON object with two keys, in order:
@@ -243,6 +278,7 @@ _OPTIONS_SYSTEM_PROMPT = "\n\n".join([
     _STRATEGY_SELECTION,
     _POSITION_MANAGEMENT,
     _REGIME_PLAYBOOK,
+    _RISK_FRAMEWORK,
     _OUTPUT_CONTRACT,
 ])
 
