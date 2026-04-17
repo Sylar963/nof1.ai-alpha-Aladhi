@@ -39,6 +39,7 @@ from greekless legs will simply be zero.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import date
 from typing import Any, Iterable, Optional
@@ -68,10 +69,13 @@ async def aggregate_portfolio_greeks(
 
     Returns:
         ``{"open_positions": [...], "portfolio_greeks": {delta, gamma, vega, theta}}``
-    """
-    open_positions: list[dict] = []
-    totals = {key: 0.0 for key in _GREEKS_KEYS}
 
+    Greeks are fetched in parallel via ``asyncio.gather`` so the total wall
+    time for N positions is roughly one RPC, not N sequential RPCs.
+    """
+    # First pass: materialize all parsable positions and record the spec so
+    # we only fire one get_greeks call per valid instrument.
+    parsed: list[tuple[dict, Any, float, str, float]] = []
     for raw in positions:
         if not isinstance(raw, dict):
             continue
@@ -90,20 +94,32 @@ async def aggregate_portfolio_greeks(
             logger.debug("portfolio aggregator: skipping unparseable instrument %s", instrument_name)
             continue
 
-        try:
-            greeks = await greeks_source.get_greeks(instrument_name)
-        except Exception as exc:  # pylint: disable=broad-except
-            logger.warning("portfolio aggregator: get_greeks failed for %s: %s", instrument_name, exc)
+        side = (raw.get("side") or "long").lower()
+        signed_size = size if side == "long" else -size
+        parsed.append((raw, spec, size, side, signed_size))
+
+    # Second pass: fetch greeks for every leg concurrently. return_exceptions
+    # so one flaky instrument doesn't sink the whole aggregation.
+    greeks_results = await asyncio.gather(
+        *(greeks_source.get_greeks(raw["instrument_name"]) for raw, *_ in parsed),
+        return_exceptions=True,
+    )
+
+    open_positions: list[dict] = []
+    totals = {key: 0.0 for key in _GREEKS_KEYS}
+    for (raw, spec, size, side, signed_size), greeks in zip(parsed, greeks_results):
+        if isinstance(greeks, Exception):
+            logger.warning(
+                "portfolio aggregator: get_greeks failed for %s: %s",
+                raw["instrument_name"], greeks,
+            )
             greeks = {}
         if not isinstance(greeks, dict):
             greeks = {}
 
-        side = (raw.get("side") or "long").lower()
-        signed_size = size if side == "long" else -size
         days_to_expiry = (spec.expiry - today).days
-
         position_view = {
-            "instrument_name": instrument_name,
+            "instrument_name": raw["instrument_name"],
             "size": size,
             "side": side,
             "days_to_expiry": days_to_expiry,

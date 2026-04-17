@@ -328,6 +328,80 @@ class HyperliquidAPI(ExchangeAdapter):
             pass
         return oids
 
+    @staticmethod
+    def parse_order_response(resp):
+        """Inspect the SDK response and report success vs. rejection.
+
+        Hyperliquid can reject an order two ways: top-level ``status == "err"``
+        (network/validation failure) or a per-order ``{"error": "..."}`` entry
+        in ``response.data.statuses`` (e.g. "Insufficient margin", "Order size
+        too small"). Both shapes are treated as failures here so callers
+        cannot silently record a phantom trade.
+
+        Returns:
+            (ok, error_message). ``ok=True`` only when at least one status
+            entry carries a ``filled`` or ``resting`` block and no entry
+            carries an ``error``.
+        """
+        if not isinstance(resp, dict):
+            return False, f"order response is not a dict: {resp!r}"
+        top_status = str(resp.get("status") or "").lower()
+        if top_status in {"err", "error"}:
+            return False, f"order rejected at top-level: {resp.get('response') or resp}"
+        try:
+            statuses = resp["response"]["data"]["statuses"]
+        except (KeyError, TypeError):
+            return False, f"malformed order response (no statuses): {resp!r}"
+        errors: list[str] = []
+        has_fill_or_resting = False
+        for st in statuses:
+            if isinstance(st, dict):
+                if "error" in st:
+                    errors.append(str(st["error"]))
+                elif "filled" in st or "resting" in st:
+                    has_fill_or_resting = True
+            elif isinstance(st, str):
+                errors.append(st)
+        if errors:
+            return False, "order rejected: " + "; ".join(errors)
+        if not has_fill_or_resting:
+            return False, f"no filled/resting status returned: {statuses!r}"
+        return True, ""
+
+    async def get_max_leverage(self, asset: str) -> int:
+        """Return the venue's advertised max leverage for ``asset`` (fallback 1)."""
+        try:
+            data = await self.get_meta_and_ctxs()
+            meta = data[0] if isinstance(data, list) and data else (data or {})
+            for u in meta.get("universe", []) or []:
+                if u.get("name") == asset:
+                    return max(int(u.get("maxLeverage") or 1), 1)
+        except (RuntimeError, ValueError, KeyError, ConnectionError, TypeError) as e:
+            logging.warning("get_max_leverage(%s) failed: %s", asset, e)
+        return 1
+
+    async def get_free_margin_info(self) -> dict:
+        """Return withdrawable/free-margin snapshot for pre-trade margin checks.
+
+        ``withdrawable`` is what the venue will actually let you pull or open
+        new positions with; ``free_margin`` is a cross-margin proxy
+        (accountValue − totalMarginUsed). Both are reported so the caller can
+        pick the conservative one.
+        """
+        state = await self._retry(lambda: self.info.user_state(self.wallet.address))
+        if not isinstance(state, dict):
+            return {"withdrawable": 0.0, "account_value": 0.0, "total_margin_used": 0.0, "free_margin": 0.0}
+        margin_summary = state.get("marginSummary") if isinstance(state.get("marginSummary"), dict) else {}
+        withdrawable = float(state.get("withdrawable") or 0.0)
+        account_value = float(margin_summary.get("accountValue") or state.get("accountValue") or 0.0)
+        total_margin_used = float(margin_summary.get("totalMarginUsed") or 0.0)
+        return {
+            "withdrawable": withdrawable,
+            "account_value": account_value,
+            "total_margin_used": total_margin_used,
+            "free_margin": max(account_value - total_margin_used, 0.0),
+        }
+
     async def get_user_state(self):
         """Retrieve wallet state with enriched position PnL calculations.
 

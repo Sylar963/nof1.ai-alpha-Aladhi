@@ -29,7 +29,7 @@ There is no linter, formatter, or type-checker configured. No CI/CD pipeline exi
 
 ## Architecture
 
-```
+```text
 main.py                          # Entry point — NiceGUI desktop app (browser mode on WSL)
 src/
 ├── backend/
@@ -43,6 +43,8 @@ src/
 │   │   ├── decision_schema.py   # TradeDecision dataclass + parse_decision() validator
 │   │   ├── options_agent.py     # Options-specific LLM logic
 │   │   └── options_llm_lifecycle.py
+│   ├── models/
+│   │   └── trade_proposal.py    # In-memory TradeProposal dataclass (UUID ids, state-machine methods)
 │   ├── trading/
 │   │   ├── exchange_adapter.py  # ExchangeAdapter base class (OrderResult, PositionSnapshot)
 │   │   ├── exchange_factory.py  # Venue routing
@@ -52,18 +54,30 @@ src/
 │   │   ├── options_scheduler.py # Two-cadence scheduler
 │   │   ├── options.py           # Options intent dataclasses
 │   │   └── delta_hedge_manager.py
-│   ├── indicators/              # TAAPI.io technical indicators + caching
-│   └── options_intel/           # Vol surface builder, mispricing detection
+│   ├── utils/
+│   │   ├── formatting.py        # Numeric formatting helpers
+│   │   └── prompt_utils.py      # JSON serialization, safe_float, round helpers for LLM prompts
+│   ├── indicators/
+│   │   ├── indicator_engine.py  # Local EMA/ATR/Keltner computation (fallback from TAAPI)
+│   │   ├── taapi_client.py      # TAAPI.io HTTP client
+│   │   └── taapi_cache.py       # Indicator response caching
+│   └── options_intel/           # Vol surface builder, mispricing detection, Deribit data
 ├── database/
 │   ├── models.py                # SQLAlchemy ORM: Trade, Position, DiaryEntry, BotState, TradeProposal, MarketData
 │   └── db_manager.py            # DatabaseManager — CRUD with session context managers
+├── modules/                     # Experimental / standalone modules
+│   ├── polymarket_module.py     # Polymarket prediction-market integration
+│   └── trader_analytics.py      # Top-trader identification
 └── gui/
     ├── app.py                   # NiceGUI app setup, page routing
     ├── pages/                   # Dashboard, Recommendations, Positions, History, Market, Reasoning, Settings
-    ├── components/              # Reusable UI widgets (header)
+    ├── components/
+    │   ├── header.py            # Top navigation bar
+    │   └── sidebar.py           # Side navigation menu
     └── services/
         ├── bot_service.py       # BotService — bot lifecycle, GUI API layer
-        └── state_manager.py     # Per-client connection state
+        ├── state_manager.py     # Per-client connection state
+        └── ui_utils.py          # is_ui_alive() — NiceGUI element lifecycle guard
 ```
 
 ### Key patterns
@@ -72,6 +86,9 @@ src/
 - **Two-cadence scheduler**: Perps run on a 5-min loop; options on a separate 3-hour loop via `options_scheduler.py`.
 - **Multi-venue adapter**: All exchange interactions go through the `ExchangeAdapter` base class. `exchange_factory.py` routes by venue name (`hyperliquid` | `thalex`).
 - **LLM → structured output**: `TradingAgent.decide()` calls OpenRouter, then `parse_decision()` validates the JSON into a `TradeDecision` dataclass. Invalid payloads raise `DecisionParseError`.
+- **Dual trade-proposal model**: In-memory `TradeProposal` dataclass (`src/backend/models/trade_proposal.py`, UUID ids, state-machine methods) lives alongside the SQLAlchemy ORM model (`src/database/models.py`, auto-increment ids). The engine uses the dataclass; persistence goes through the ORM.
+- **UI lifecycle guard**: All GUI timer callbacks and async handlers call `is_ui_alive()` (from `ui_utils.py`) before touching NiceGUI elements to prevent stale-client errors in the SPA.
+- **DB session discipline**: Methods in `db_manager.py` that need to return data to callers must convert ORM objects to dicts **inside** the `session_scope()` block. Returning raw ORM objects causes "not bound to a Session" errors once the context manager closes.
 - **Config**: All runtime config comes from `.env` → `config_loader.py` → `CONFIG` dict. Access via `CONFIG.get("key")`.
 - **Imports**: Always use absolute imports from the repo root (e.g., `from src.backend.agent.decision_maker import TradingAgent`). The test `conftest.py` adds the repo root to `sys.path`.
 
@@ -87,7 +104,24 @@ src/
 ```python
 VALID_VENUES = {"hyperliquid", "thalex"}
 VALID_ACTIONS = {"buy", "sell", "hold"}
-VALID_STRATEGIES = {"credit_put", "credit_spread", "long_call_delta_hedged", "long_put_delta_hedged"}
+VALID_STRATEGIES = {
+    "credit_put_spread",
+    "credit_call_spread",
+    "iron_condor",
+    "long_call_delta_hedged",
+    "long_put_delta_hedged",
+    "vol_arb",
+}
+VALID_KINDS = {"call", "put"}
+VALID_VOL_VIEWS = {"short_vol", "long_vol", "neutral"}
+VALID_ENTRY_KINDS = {
+    "outright",
+    "vertical",
+    "calendar",
+    "diagonal",
+    "iron_condor",
+    "vol_arb",
+}
 ```
 
 ## Development notes
@@ -103,4 +137,4 @@ VALID_STRATEGIES = {"credit_put", "credit_spread", "long_call_delta_hedged", "lo
 
 
 # CODE POLICY
-DO NOT write on the footer " Co authored by"..
+Do not add a footer with the trailer 'Co-authored-by'.

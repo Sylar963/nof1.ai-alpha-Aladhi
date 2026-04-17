@@ -33,7 +33,7 @@ from src.backend.config_loader import CONFIG
 logger = logging.getLogger(__name__)
 
 
-_DEFAULT_TIMEOUT_SECONDS = 60.0
+_DEFAULT_TIMEOUT_SECONDS = 900.0  # 15 min — options reasoning with verbose output is slow
 _DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 
 
@@ -48,13 +48,18 @@ class AsyncOpenRouterClient:
         referer: Optional[str] = None,
         app_title: Optional[str] = None,
         timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
+        max_tokens: Optional[int] = None,
     ) -> None:
         self.api_key = api_key or CONFIG.get("openrouter_api_key")
         self.base_url = base_url or CONFIG.get("openrouter_base_url") or _DEFAULT_BASE_URL
-        self.model = model or CONFIG.get("llm_model") or "x-ai/grok-4"
+        self.model = model or CONFIG.get("llm_model") or "z-ai/glm-5.1"
         self.referer = referer or CONFIG.get("openrouter_referer")
         self.app_title = app_title or CONFIG.get("openrouter_app_title")
         self.timeout_seconds = timeout_seconds
+        # Options reasoning is more verbose than perps (vol surface analysis,
+        # multi-leg construction, greeks calculations, regime classification).
+        # Default to 32K to give room for full reasoning + multi-decision output.
+        self.max_tokens = max_tokens or int(CONFIG.get("options_llm_max_tokens") or 32768)
         self._session = None
 
     # ------------------------------------------------------------------
@@ -140,11 +145,17 @@ class AsyncOpenRouterClient:
                 "type": "json_schema",
                 "json_schema": {
                     "name": "options_decision",
-                    "strict": True,
+                    # Strict mode requires every nested object to fully spec
+                    # `additionalProperties: false`. The options schema is
+                    # intentionally permissive (legs[] varies wildly across
+                    # strategies); Python-side parse_decision() handles
+                    # validation. Strict=False keeps the LLM unblocked.
+                    "strict": False,
                     "schema": schema,
                 },
             },
             "temperature": 0.4,
+            "max_tokens": self.max_tokens,
         }
 
         try:

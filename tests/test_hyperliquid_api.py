@@ -142,3 +142,75 @@ async def test_hyperliquid_get_user_state_falls_back_to_margin_summary_account_v
     state = await adapter.get_user_state()
 
     assert state == {"balance": 272.470437, "total_value": 272.470437, "positions": []}
+
+
+# ---------------------------------------------------------------------------
+# parse_order_response — silent-failure guard against phantom trades
+# ---------------------------------------------------------------------------
+
+
+def test_parse_order_response_accepts_filled_status():
+    from src.backend.trading.hyperliquid_api import HyperliquidAPI
+
+    ok, reason = HyperliquidAPI.parse_order_response(
+        {"status": "ok", "response": {"type": "order", "data": {"statuses": [
+            {"filled": {"oid": 1, "totalSz": "0.01", "avgPx": "78000"}}
+        ]}}}
+    )
+    assert ok is True
+    assert reason == ""
+
+
+def test_parse_order_response_accepts_resting_status():
+    from src.backend.trading.hyperliquid_api import HyperliquidAPI
+
+    ok, _ = HyperliquidAPI.parse_order_response(
+        {"status": "ok", "response": {"type": "order", "data": {"statuses": [
+            {"resting": {"oid": 42}}
+        ]}}}
+    )
+    assert ok is True
+
+
+def test_parse_order_response_flags_insufficient_margin():
+    """The exact shape the venue returns when margin is insufficient —
+    top-level ``ok`` but a per-order ``error`` entry. The naive ``if result``
+    check passes this silently, which is the bug this helper exists to kill.
+    """
+    from src.backend.trading.hyperliquid_api import HyperliquidAPI
+
+    ok, reason = HyperliquidAPI.parse_order_response(
+        {"status": "ok", "response": {"type": "order", "data": {"statuses": [
+            {"error": "Insufficient margin to place order."}
+        ]}}}
+    )
+    assert ok is False
+    assert "Insufficient margin" in reason
+
+
+def test_parse_order_response_flags_top_level_err():
+    from src.backend.trading.hyperliquid_api import HyperliquidAPI
+
+    ok, reason = HyperliquidAPI.parse_order_response(
+        {"status": "err", "response": "price outside tick"}
+    )
+    assert ok is False
+    assert "tick" in reason
+
+
+def test_parse_order_response_rejects_non_dict():
+    from src.backend.trading.hyperliquid_api import HyperliquidAPI
+
+    ok, _ = HyperliquidAPI.parse_order_response(None)
+    assert ok is False
+    ok, _ = HyperliquidAPI.parse_order_response("ok")
+    assert ok is False
+
+
+def test_parse_order_response_rejects_empty_statuses():
+    from src.backend.trading.hyperliquid_api import HyperliquidAPI
+
+    ok, _ = HyperliquidAPI.parse_order_response(
+        {"status": "ok", "response": {"type": "order", "data": {"statuses": []}}}
+    )
+    assert ok is False

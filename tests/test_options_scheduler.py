@@ -4,6 +4,10 @@ The scheduler runs two background tasks alongside the main perps loop:
 - vol surface refresh: every 15 minutes (900s by default)
 - options decision: every 3 hours (10800s by default)
 
+On startup a bootstrap sequence runs the vol surface refresh first, then
+fires the initial options decision — guaranteeing the first decision always
+has fresh context. After that, both loops continue independently.
+
 Both are independent of the 5m perps loop and can be enabled / disabled
 separately. They only spawn when the Thalex venue is configured.
 
@@ -53,13 +57,48 @@ def test_scheduler_accepts_custom_cadences():
 
 
 # ---------------------------------------------------------------------------
+# Bootstrap
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_runs_surface_before_decision():
+    """Bootstrap must call vol surface first, then options decision, sequentially."""
+    order: list[str] = []
+
+    async def surface():
+        order.append("surface")
+
+    async def decision():
+        order.append("decision")
+
+    config = OptionsSchedulerConfig(
+        vol_surface_interval_seconds=10,
+        options_decision_interval_seconds=10,
+    )
+    scheduler = OptionsScheduler(
+        config=config,
+        refresh_vol_surface=surface,
+        run_options_decision=decision,
+    )
+
+    await scheduler.start()
+    # Give bootstrap time to complete.
+    await asyncio.sleep(0.05)
+    await scheduler.stop()
+
+    assert order[0] == "surface"
+    assert order[1] == "decision"
+
+
+# ---------------------------------------------------------------------------
 # Lifecycle
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_scheduler_runs_callbacks_at_expected_cadence():
-    """With a 0.05s cadence and a 0.18s sleep, both callbacks must fire 3+ times."""
+    """Bootstrap fires once, then the cadence loop fires additional times."""
     surface_cb = _RecordingCallback()
     decision_cb = _RecordingCallback()
     config = OptionsSchedulerConfig(
@@ -73,9 +112,12 @@ async def test_scheduler_runs_callbacks_at_expected_cadence():
     )
 
     await scheduler.start()
-    await asyncio.sleep(0.18)
+    # Bootstrap fires both once (~instant), then loops sleep 0.05s before
+    # each subsequent call. 0.25s gives enough time for bootstrap + several loop ticks.
+    await asyncio.sleep(0.25)
     await scheduler.stop()
 
+    # 1 (bootstrap) + at least 2 loop ticks = 3+
     assert len(surface_cb.calls) >= 3
     assert len(decision_cb.calls) >= 3
 
@@ -96,7 +138,7 @@ async def test_scheduler_stop_cancels_both_tasks():
     )
 
     await scheduler.start()
-    await asyncio.sleep(0.05)
+    await asyncio.sleep(0.08)
     await scheduler.stop()
     surface_count = len(surface_cb.calls)
     decision_count = len(decision_cb.calls)
@@ -127,16 +169,18 @@ async def test_scheduler_swallows_callback_exceptions_and_keeps_running():
     )
 
     await scheduler.start()
-    await asyncio.sleep(0.10)
+    await asyncio.sleep(0.15)
     await scheduler.stop()
 
-    assert fail_count["n"] >= 3  # kept retrying through the exceptions
-    assert len(decision_cb.calls) >= 3  # the other task is unaffected
+    # 1 (bootstrap fail) + at least 2 loop retries = 3+
+    assert fail_count["n"] >= 3
+    # decision_cb gets 1 from bootstrap + loop ticks
+    assert len(decision_cb.calls) >= 3
 
 
 @pytest.mark.asyncio
 async def test_scheduler_can_disable_options_decision_loop():
-    """Setting options_decision_interval_seconds=0 disables that loop."""
+    """Setting options_decision_interval_seconds=0 disables that loop and bootstrap skips it."""
     surface_cb = _RecordingCallback()
     decision_cb = _RecordingCallback()
     config = OptionsSchedulerConfig(
@@ -150,8 +194,9 @@ async def test_scheduler_can_disable_options_decision_loop():
     )
 
     await scheduler.start()
-    await asyncio.sleep(0.08)
+    await asyncio.sleep(0.10)
     await scheduler.stop()
 
+    # 1 (bootstrap) + loop ticks
     assert len(surface_cb.calls) >= 3
     assert decision_cb.calls == []

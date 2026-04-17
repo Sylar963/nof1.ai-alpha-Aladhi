@@ -23,8 +23,38 @@ from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional, TypeVar
 
 from src.backend.agent.decision_schema import TradeDecision
-from src.backend.trading.exchange_adapter import ExchangeAdapter
+from src.backend.trading.exchange_adapter import ExchangeAdapter, OrderResult
+from src.backend.trading.hyperliquid_api import HyperliquidAPI
 from src.backend.trading.options import OptionIntent
+
+
+# Status markers returned by Thalex when an order fails (e.g. insufficient
+# margin, instrument halted, IOC couldn't match). Anything NOT in the set of
+# accepted statuses is treated as a rejection so the bot never records a
+# phantom fill.
+_ACCEPTED_ORDER_STATUSES = {"ok", "open", "filled", "partially_filled"}
+
+
+def _order_ok(order) -> tuple[bool, str]:
+    """Return ``(ok, reason)`` for a submitted venue order.
+
+    Works for both normalized :class:`OrderResult` (Thalex) and the raw
+    Hyperliquid SDK dict — Hyperliquid rejections surface as a per-status
+    ``{"error": "..."}`` entry inside ``response.data.statuses`` with the
+    top-level status still ``"ok"``, which is exactly the shape
+    :meth:`HyperliquidAPI.parse_order_response` knows how to decode.
+    """
+    if order is None:
+        return False, "no order result returned"
+    if isinstance(order, OrderResult):
+        status = str(order.status or "").lower()
+        if status in _ACCEPTED_ORDER_STATUSES:
+            return True, ""
+        err = order.error or status or "unknown"
+        return False, f"status={status!r} error={err}"
+    if isinstance(order, dict):
+        return HyperliquidAPI.parse_order_response(order)
+    return False, f"unknown order type: {type(order).__name__}"
 
 
 # Default tenor ladder for the multi-tenor target_gamma_btc expansion path.
@@ -184,6 +214,9 @@ class OptionsExecutor:
             order = await self.thalex.place_sell_order(instrument_name, contracts)
         else:
             order = await self.thalex.place_buy_order(instrument_name, contracts)
+        ok_order, reason = _order_ok(order)
+        if not ok_order:
+            return ExecutionResult(ok=False, reason=f"thalex {side} {instrument_name} rejected: {reason}")
         return ExecutionResult(ok=True, thalex_orders=[order])
 
     async def _execute_delta_hedged(
@@ -222,6 +255,12 @@ class OptionsExecutor:
             )
 
         thalex_order = await self.thalex.place_buy_order(instrument_name, contracts)
+        ok_order, reason = _order_ok(thalex_order)
+        if not ok_order:
+            return ExecutionResult(
+                ok=False,
+                reason=f"thalex buy {instrument_name} rejected: {reason}",
+            )
 
         if not self._delta_hedge_enabled:
             return ExecutionResult(ok=True, thalex_orders=[thalex_order], hyperliquid_orders=[])
@@ -253,6 +292,16 @@ class OptionsExecutor:
                 return ExecutionResult(
                     ok=False,
                     reason=f"hyperliquid hedge failed for {hedge_asset}: {exc}",
+                )
+            # Exchange could have accepted the HTTP call but rejected the order
+            # (e.g. insufficient margin on perps). Validate + unwind the option
+            # leg if we can't actually run hedged.
+            ok_hedge, reason = _order_ok(hl_orders[-1]) if hl_orders else (False, "no hedge order")
+            if not ok_hedge:
+                await self._unwind_single_delta_hedged_leg(instrument_name, contracts)
+                return ExecutionResult(
+                    ok=False,
+                    reason=f"hyperliquid hedge rejected for {hedge_asset}: {reason}",
                 )
 
         return ExecutionResult(ok=True, thalex_orders=[thalex_order], hyperliquid_orders=hl_orders)
@@ -409,6 +458,19 @@ class OptionsExecutor:
                     ok=False,
                     reason=f"thalex submit failed for {instrument_name}: {exc}",
                 )
+            ok_order, reason = _order_ok(thalex_order)
+            if not ok_order:
+                logger.error(
+                    "thalex order rejected for %s: %s — unwinding prior legs",
+                    instrument_name, reason,
+                )
+                await self._unwind_multi_tenor_legs(
+                    submitted_thalex, submitted_hl, underlying, kind,
+                )
+                return ExecutionResult(
+                    ok=False,
+                    reason=f"thalex order rejected for {instrument_name}: {reason}",
+                )
             thalex_orders.append(thalex_order)
             submitted_thalex.append((instrument_name, per_leg_contracts))
 
@@ -448,6 +510,19 @@ class OptionsExecutor:
                 return ExecutionResult(
                     ok=False,
                     reason=f"hyperliquid hedge failed for {underlying}: {exc}",
+                )
+            ok_hedge, reason = _order_ok(hl_order)
+            if not ok_hedge:
+                logger.error(
+                    "hyperliquid hedge rejected for %s: %s — unwinding",
+                    underlying, reason,
+                )
+                await self._unwind_multi_tenor_legs(
+                    submitted_thalex, submitted_hl, underlying, kind,
+                )
+                return ExecutionResult(
+                    ok=False,
+                    reason=f"hyperliquid hedge rejected for {underlying}: {reason}",
                 )
             hl_orders.append(hl_order)
             submitted_hl.append((hedge_side, hedge_size))
@@ -564,6 +639,13 @@ class OptionsExecutor:
                 return ExecutionResult(
                     ok=False,
                     reason=f"thalex submit failed for {instrument_name}: {exc}",
+                )
+            ok_order, reason = _order_ok(order)
+            if not ok_order:
+                await self._unwind_multi_leg_orders(submitted_legs)
+                return ExecutionResult(
+                    ok=False,
+                    reason=f"thalex leg rejected ({side} {instrument_name}): {reason}",
                 )
             submitted_legs.append((instrument_name, side, contracts))
             thalex_orders.append(order)

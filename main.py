@@ -3,39 +3,31 @@ AI Trading Bot - NiceGUI Desktop Application
 Entry point for the application
 """
 
+import asyncio
+import os
 import signal
 import sys
-import asyncio
-import atexit
-import os
 from nicegui import ui, app
 
 # Global reference to bot_service for cleanup
 bot_service_ref = None
+_cleanup_done = False
+
 
 def signal_handler(signum, frame):
-    """Handle shutdown signals gracefully"""
+    """Handle shutdown signals by letting NiceGUI's own shutdown proceed."""
     print("\n[INFO] Shutting down gracefully...")
-    cleanup()
-    sys.exit(0)
-
-def cleanup():
-    """Cleanup function called on exit"""
-    global bot_service_ref
-    if bot_service_ref and bot_service_ref.is_running():
-        print("[INFO] Stopping bot engine...")
-        try:
-            # Run the async stop in a new event loop if needed
-            try:
-                loop = asyncio.get_running_loop()
-                # If we're here, we're in an async context
-                asyncio.create_task(bot_service_ref.stop())
-            except RuntimeError:
-                # No running loop, create one
-                asyncio.run(bot_service_ref.stop())
-            print("[INFO] Bot stopped successfully")
-        except Exception as e:
-            print(f"[WARN] Error stopping bot: {e}")
+    # Restore default handler so a second Ctrl+C force-kills immediately.
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    # Ask the running event loop to shut the app down instead of
+    # calling sys.exit(), which collides with uvloop teardown.
+    try:
+        loop = asyncio.get_running_loop()
+        loop.call_soon_threadsafe(app.shutdown)
+    except RuntimeError:
+        # No running loop — nothing left to shut down.
+        pass
 
 if __name__ in {"__main__", "__mp_main__"}:
     kernel_version = ""
@@ -55,9 +47,6 @@ if __name__ in {"__main__", "__mp_main__"}:
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # Register cleanup on exit
-    atexit.register(cleanup)
-
     # Import app module to register the @ui.page('/') handler
     from src.gui.app import bot_service
 
@@ -67,8 +56,18 @@ if __name__ in {"__main__", "__mp_main__"}:
     # Register shutdown handler with NiceGUI app
     async def on_app_shutdown():
         """Called when NiceGUI app is shutting down"""
+        global _cleanup_done
+        if _cleanup_done:
+            return
+        _cleanup_done = True
         print("[INFO] NiceGUI app shutdown event triggered")
-        cleanup()
+        if bot_service_ref and bot_service_ref.is_running():
+            print("[INFO] Stopping bot engine...")
+            try:
+                await bot_service_ref.stop()
+                print("[INFO] Bot stopped successfully")
+            except Exception as e:
+                print(f"[WARN] Error stopping bot: {e}")
 
     app.on_shutdown(on_app_shutdown)
 

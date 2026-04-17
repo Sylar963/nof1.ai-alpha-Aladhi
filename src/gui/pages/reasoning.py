@@ -8,6 +8,7 @@ from datetime import datetime
 from nicegui import ui
 from src.gui.services.bot_service import BotService
 from src.gui.services.state_manager import StateManager
+from src.gui.services.ui_utils import is_ui_alive
 
 
 def create_reasoning(bot_service: BotService, state_manager: StateManager):
@@ -87,9 +88,14 @@ def create_reasoning(bot_service: BotService, state_manager: StateManager):
     # Historical decisions storage
     historical_decisions = []
 
+    def _ui_ok() -> bool:
+        return is_ui_alive(action_filter)
+
     # ===== AUTO-REFRESH LOGIC =====
     async def update_reasoning():
         """Update JSON editor and timeline with latest reasoning data"""
+        if not _ui_ok():
+            return
         state = state_manager.get_state()
 
         # Update JSON editor
@@ -99,7 +105,11 @@ def create_reasoning(bot_service: BotService, state_manager: StateManager):
             or reasoning_data.get('trade_decisions') is not None
         )
         if has_data:
-            json_editor.content = {'json': reasoning_data}
+            # NiceGUI json_editor stores its config in _props['properties'].
+            # Setting `.content` just creates a dead attribute — we have to
+            # mutate the properties dict and call .update() so the new JSON
+            # is pushed to the Vue component.
+            json_editor._props['properties']['content'] = {'json': reasoning_data}
             json_editor.update()
 
             # Update timeline with filtering
@@ -162,9 +172,16 @@ def create_reasoning(bot_service: BotService, state_manager: StateManager):
                                     color = 'grey'
                                     icon = '⏸️'
 
+                                # Tag venue so options decisions are visually distinct
+                                # from perps in the merged timeline.
+                                venue = (decision.get('venue') or 'hyperliquid').lower()
+                                venue_tag = '🟣 OPTIONS' if venue == 'thalex' else '🟠 PERPS'
+                                strategy = decision.get('strategy')
+                                title_suffix = f' · {strategy}' if strategy else ''
+
                                 # Timeline entry with enhanced details
                                 with ui.timeline_entry(
-                                    f'{icon} {asset} - {action}',
+                                    f'{icon} [{venue_tag}] {asset} - {action}{title_suffix}',
                                     color=color,
                                     icon='science'
                                 ):
@@ -192,8 +209,8 @@ def create_reasoning(bot_service: BotService, state_manager: StateManager):
                 else:
                     ui.label('No trade decisions yet').classes('text-gray-400 text-center py-4')
         else:
-            # Empty state
-            json_editor.content = {'json': {}}
+            # Empty state — same properties-dict pattern as the has_data path.
+            json_editor._props['properties']['content'] = {'json': {}}
             json_editor.update()
             timeline_container.clear()
 
@@ -213,12 +230,19 @@ def create_reasoning(bot_service: BotService, state_manager: StateManager):
     # Action filter change handler
     def on_filter_change(value):
         """Handle filter change"""
+        if not _ui_ok():
+            return
         asyncio.create_task(update_reasoning())
 
     action_filter.on('update:model-value', on_filter_change)
 
+    async def _guarded_update_reasoning():
+        if not _ui_ok():
+            return
+        await update_reasoning()
+
     # Auto-refresh every 3 seconds
-    ui.timer(3.0, update_reasoning)
+    ui.timer(3.0, _guarded_update_reasoning)
 
     # Initial update
     asyncio.create_task(update_reasoning())

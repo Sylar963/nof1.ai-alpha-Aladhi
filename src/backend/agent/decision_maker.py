@@ -143,8 +143,16 @@ class TradingAgent:
             resp.raise_for_status()
             return resp.json()
 
+        _SANITIZE_MAX_CHARS = 100_000  # ~25K tokens — plenty for a valid decision payload
+
         def _sanitize_output(raw_content: str, assets_list):
             """Coerce arbitrary LLM output into the required reasoning + decisions schema."""
+            if len(raw_content) > _SANITIZE_MAX_CHARS:
+                logging.warning(
+                    "Sanitizer input too large (%d chars), truncating to %d",
+                    len(raw_content), _SANITIZE_MAX_CHARS,
+                )
+                raw_content = raw_content[:_SANITIZE_MAX_CHARS]
             try:
                 schema = {
                     "type": "object",
@@ -180,7 +188,21 @@ class TradingAgent:
                                     "target_strike": {"type": ["number", "null"]},
                                     "target_delta": {"type": ["number", "null"]},
                                     "contracts": {"type": ["number", "null"]},
-                                    "legs": {"type": ["array", "null"], "items": {"type": "object"}},
+                                    "legs": {
+                                        "type": ["array", "null"],
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "kind": {"type": "string", "enum": ["call", "put"]},
+                                                "side": {"type": "string", "enum": ["buy", "sell"]},
+                                                "contracts": {"type": "number"},
+                                                "target_strike": {"type": ["number", "null"]},
+                                                "target_delta": {"type": ["number", "null"]},
+                                            },
+                                            "required": ["kind", "side", "contracts", "target_strike", "target_delta"],
+                                            "additionalProperties": False,
+                                        },
+                                    },
                                     "rationale": {"type": "string"},
                                 },
                                 "required": [
@@ -313,6 +335,7 @@ class TradingAgent:
 
         for _ in range(3):
             data = {"model": self.model, "messages": messages}
+            data["max_tokens"] = int(CONFIG.get("llm_max_tokens") or 16384)
             if allow_structured:
                 data["response_format"] = {
                     "type": "json_schema",

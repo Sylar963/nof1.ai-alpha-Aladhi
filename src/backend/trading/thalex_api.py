@@ -257,13 +257,43 @@ class ThalexAPI(ExchangeAdapter):
     # Lifecycle
     # ------------------------------------------------------------------
 
+    def _is_client_alive(self) -> bool:
+        """Check whether the underlying WS client still looks usable.
+
+        ``self.connected`` is a bool we set during login and clear in disconnect,
+        but it can drift out of sync with the real WS state (e.g. the receive
+        loop crashed with 'no close frame received'). Probe the client when
+        possible so callers don't push messages into a dead socket.
+        """
+        if self._client is None:
+            return False
+        for attr in ("closed", "is_closed"):
+            if hasattr(self._client, attr):
+                try:
+                    closed = getattr(self._client, attr)
+                    if callable(closed):
+                        closed = closed()
+                    return not bool(closed)
+                except Exception:  # pylint: disable=broad-except
+                    return False
+        receiver = self._receiver_task
+        if receiver is not None and receiver.done():
+            return False
+        return True
+
     async def connect(self) -> None:
         """Establish the WebSocket, login with JWT, and start the receive loop."""
-        if self.connected:
+        if self.connected and self._is_client_alive():
             return
         async with self._lock:
-            if self.connected:
+            if self.connected and self._is_client_alive():
                 return
+            # If we were flagged connected but the socket is dead, tear down
+            # stale state before re-establishing. Without this, a zombie
+            # connection lingers forever and every request hits the 15s timeout.
+            if self.connected or self._client is not None or self._receiver_task is not None:
+                await self._teardown_stale_client()
+
             from thalex import Thalex, Network  # local import keeps test imports light
 
             if not self.key_id:
@@ -276,27 +306,64 @@ class ThalexAPI(ExchangeAdapter):
 
             net = Network.TEST if self.network_name == "test" else Network.PROD
             self._client = Thalex(network=net)
-            await self._client.connect()
+            try:
+                await asyncio.wait_for(self._client.connect(), timeout=10.0)
+            except (asyncio.TimeoutError, Exception) as exc:
+                self._client = None
+                raise RuntimeError(f"Thalex WebSocket connect failed: {exc}") from exc
 
             self._receiver_task = asyncio.create_task(self._receiver_loop())
 
-            private_key_raw = key_path.read_text(encoding="utf-8")
-            private_key = _normalize_private_key(private_key_raw)
-            login_id = self._next_id()
-            login_future = self._make_future(login_id)
-            await self._client.login(
-                key_id=self.key_id,
-                private_key=private_key,
-                account=self.account or None,
-                id=login_id,
-            )
-            await asyncio.wait_for(login_future, timeout=10.0)
+            try:
+                private_key_raw = key_path.read_text(encoding="utf-8")
+                private_key = _normalize_private_key(private_key_raw)
+                login_id = self._next_id()
+                login_future = self._make_future(login_id)
+                await self._client.login(
+                    key_id=self.key_id,
+                    private_key=private_key,
+                    account=self.account or None,
+                    id=login_id,
+                )
+                await asyncio.wait_for(login_future, timeout=10.0)
+            except Exception:
+                # Login failed — roll back the partial connect so the next
+                # caller retries cleanly instead of trusting a zombie client.
+                await self._teardown_stale_client()
+                raise
 
             self.connected = True
             logger.info("Thalex connected on %s", self.network_name)
 
             await self._refresh_instruments_cache()
             await self._resubscribe_tickers()
+
+    async def _teardown_stale_client(self) -> None:
+        """Cancel the receiver and close the client without raising.
+
+        Called when we detect (or suspect) the WS is dead so connect() can
+        rebuild from a clean slate. Safe to call when nothing is initialized.
+        """
+        self.connected = False
+        receiver = self._receiver_task
+        self._receiver_task = None
+        if receiver is not None and not receiver.done():
+            receiver.cancel()
+            try:
+                await receiver
+            except (asyncio.CancelledError, Exception):  # pylint: disable=broad-except
+                pass
+        client = self._client
+        self._client = None
+        if client is not None:
+            try:
+                await client.disconnect()
+            except Exception:  # pylint: disable=broad-except
+                pass
+        for fut in list(self._pending.values()):
+            if not fut.done():
+                fut.set_exception(ConnectionError("Thalex connection torn down"))
+        self._pending.clear()
 
     async def disconnect(self) -> None:
         """Tear down the receive loop and close the WebSocket."""
@@ -343,6 +410,10 @@ class ThalexAPI(ExchangeAdapter):
             raise
         except Exception as exc:  # pylint: disable=broad-except
             logger.error("Thalex receiver loop crashed: %s", exc)
+            # Flip the connection flag so the next caller rebuilds instead of
+            # trusting a dead socket. Without this, connect() short-circuits on
+            # self.connected and every subsequent request times out at 15s.
+            self.connected = False
             for fut in self._pending.values():
                 if not fut.done():
                     fut.set_exception(exc)
@@ -423,7 +494,7 @@ class ThalexAPI(ExchangeAdapter):
         ``sender`` is a callable that takes the kwargs (including ``id``) and
         invokes a method on the underlying thalex client.
         """
-        if not self.connected:
+        if not self.connected or not self._is_client_alive():
             await self.connect()
         request_id = self._next_id()
         fut = self._make_future(request_id)
@@ -733,7 +804,7 @@ class ThalexAPI(ExchangeAdapter):
         return []
 
     async def get_user_state(self) -> AccountState:
-        if not self.connected:
+        if not self.connected or not self._is_client_alive():
             await self.connect()
         if self._client is None:
             raise RuntimeError("Thalex client not initialized after connect()")
@@ -875,9 +946,23 @@ class ThalexAPI(ExchangeAdapter):
         order_id = ""
         status = "ok"
         price = submitted_price
+        error: Optional[str] = None
         if isinstance(raw, dict):
             order_id = str(raw.get("order_id") or raw.get("id") or "")
-            status = str(raw.get("status") or "ok")
+            raw_status = str(raw.get("status") or "ok").lower()
+            # Thalex surfaces rejection via status strings like "rejected" /
+            # "cancelled" (for IOC orders that couldn't match), or an explicit
+            # ``error``/``reason`` field. Normalize all of those to
+            # ``status="rejected"`` so callers can check a single flag.
+            err_payload = raw.get("error") or raw.get("reason")
+            if err_payload and raw_status not in {"open", "filled", "partially_filled"}:
+                error = str(err_payload)
+                status = "rejected"
+            elif raw_status in {"rejected", "cancelled", "canceled", "error"}:
+                status = "rejected"
+                error = str(raw.get("reject_reason") or raw.get("error") or raw_status)
+            else:
+                status = raw_status or "ok"
             price = _quote_field(
                 raw,
                 ("price",),
@@ -897,4 +982,36 @@ class ThalexAPI(ExchangeAdapter):
             instrument_name=asset,
             price=price,
             raw=raw if isinstance(raw, dict) else None,
+            error=error,
         )
+
+    async def margin_preflight(self, required_collateral_usd: float) -> tuple[bool, str]:
+        """Cheap pre-trade margin check against Thalex account cash collateral.
+
+        Fetches ``account_summary`` and compares available cash/margin against
+        ``required_collateral_usd`` (the estimated premium to pay for a long
+        or the expected margin requirement for a short, in USD). Returns
+        ``(True, "")`` when the venue has enough collateral, or
+        ``(False, reason)`` otherwise.
+
+        Fails open on RPC errors — a flaky account_summary shouldn't block a
+        trade; the order submit itself will still catch a true rejection.
+        """
+        if required_collateral_usd <= 0:
+            return True, ""
+        try:
+            state = await self.get_user_state()
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("Thalex margin_preflight: get_user_state failed — allowing trade: %s", exc)
+            return True, ""
+        balance = float(getattr(state, "balance", 0.0) or 0.0)
+        if balance <= 0:
+            return False, f"Thalex balance is {balance:.2f} — no collateral available"
+        # 10% buffer for fees/slippage + variation margin moves during fill.
+        buffered = required_collateral_usd * 1.10
+        if balance < buffered:
+            return False, (
+                f"Thalex collateral ${balance:,.2f} below required ≈ ${buffered:,.2f} "
+                f"(${required_collateral_usd:,.2f} +10% buffer)"
+            )
+        return True, ""

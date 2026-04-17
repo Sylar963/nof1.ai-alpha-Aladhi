@@ -209,7 +209,9 @@ def create_positions(bot_service: BotService, state_manager: StateManager):
                     ui.notify(f'Closing {label} position...', type='info')
                     
                     success = await bot_service.close_position(target)
-                    
+
+                    if not _ui_ok():
+                        return
                     if success:
                         ui.notify(f'Successfully closed {label} position!', type='positive')
                     else:

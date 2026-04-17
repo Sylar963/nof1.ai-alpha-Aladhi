@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 
 from src.backend.bot_engine import TradingBotEngine, BotState
 from src.backend.config_loader import CONFIG
+from src.database.db_manager import get_db_manager
 
 
 class BotService:
@@ -227,6 +228,15 @@ class BotService:
     def _build_indicator_frame(cls, frame: Dict, current_price: float | None, interval: str | None = None) -> Dict:
         frame = frame or {}
         keltner = frame.get('keltner') or {}
+        price_candles = frame.get('price_candles') or {}
+        keltner_middle = list(keltner.get('middle') or [])
+        frame_timestamps = list(frame.get('timestamps') or [])
+        if not frame_timestamps:
+            candle_times = list(price_candles.get('time') or [])
+            if keltner_middle and len(candle_times) >= len(keltner_middle):
+                frame_timestamps = candle_times[-len(keltner_middle):]
+            elif candle_times:
+                frame_timestamps = candle_times
         shaped = {
             'sma99': cls._latest(list(frame.get('sma99') or [])),
             'avwap': frame.get('avwap'),
@@ -234,11 +244,11 @@ class BotService:
             'opening_range': frame.get('opening_range') or {},
             'series': {
                 'sma99': list(frame.get('sma99') or []),
-                'keltner_middle': list(keltner.get('middle') or []),
+                'keltner_middle': keltner_middle,
                 'keltner_upper': list(keltner.get('upper') or []),
                 'keltner_lower': list(keltner.get('lower') or []),
-                'timestamps': list(frame.get('timestamps') or []),
-                'price_candles': frame.get('price_candles') or {},
+                'timestamps': frame_timestamps,
+                'price_candles': price_candles,
             },
         }
         if interval:
@@ -427,22 +437,6 @@ class BotService:
             self.logger.error(f"Failed to close position: {e}")
             return False
 
-    def update_config(self, config: Dict):
-        """
-        Update bot configuration.
-
-        Args:
-            config: Dict with 'assets', 'interval', 'model' keys
-        """
-        if 'assets' in config:
-            self.config['assets'] = config['assets']
-        if 'interval' in config:
-            self.config['interval'] = config['interval']
-        if 'model' in config:
-            self.config['model'] = config['model']
-
-        self.logger.info(f"Configuration updated: {self.config}")
-
     def get_assets(self) -> List[str]:
         """Get configured assets list"""
         if self.bot_engine:
@@ -526,6 +520,27 @@ class BotService:
                     }
                     indicator_payloads[asset] = {}
 
+            # Snapshot reasoning fields from the persistent state-manager
+            # BEFORE we possibly replace `state` with a fresh BotState(). Both
+            # the bot_engine.state and state_manager._state can be the same
+            # object reference, so snapshotting from `state` itself is a
+            # no-op restore. We snapshot all three reasoning fields because
+            # the perps cycle (5m) and the options cycle (3h) populate
+            # different ones, and a refresh in between must not erase either.
+            prior_reasoning = {}
+            prior_perps_reasoning = {}
+            prior_options_reasoning = {}
+            getter = getattr(self.state_manager, 'get_state', None) if self.state_manager else None
+            if callable(getter):
+                try:
+                    prior_state = getter()
+                except Exception:  # pylint: disable=broad-except
+                    prior_state = None
+                if prior_state is not None:
+                    prior_reasoning = dict(getattr(prior_state, 'last_reasoning', {}) or {})
+                    prior_perps_reasoning = dict(getattr(prior_state, 'last_perps_reasoning', {}) or {})
+                    prior_options_reasoning = dict(getattr(prior_state, 'last_options_reasoning', {}) or {})
+
             # Update bot state with fresh data (create new state if bot not running)
             if not self.bot_engine:
                 # Create a temporary bot state for display
@@ -565,9 +580,6 @@ class BotService:
 
             account_snapshot = self._aggregate_account_state(user_state, thalex_state)
 
-            # Preserve reasoning data across refreshes
-            prev_reasoning = state.last_reasoning
-
             # Update with fresh market data
             state.balance = account_snapshot['balance']
             state.total_value = account_snapshot['total_value']
@@ -577,9 +589,14 @@ class BotService:
             state.market_data = self._build_market_sections(assets, market_data, indicator_payloads)
             state.last_update = datetime.now(UTC).isoformat()
 
-            # Restore reasoning if the refresh created a fresh BotState
-            if not state.last_reasoning and prev_reasoning:
-                state.last_reasoning = prev_reasoning
+            # Restore reasoning if this refresh started from a fresh BotState
+            # or the engine hasn't completed an LLM cycle yet.
+            if not state.last_reasoning and prior_reasoning:
+                state.last_reasoning = prior_reasoning
+            if not getattr(state, 'last_perps_reasoning', None) and prior_perps_reasoning:
+                state.last_perps_reasoning = prior_perps_reasoning
+            if not getattr(state, 'last_options_reasoning', None) and prior_options_reasoning:
+                state.last_options_reasoning = prior_options_reasoning
 
             self.equity_history.append({
                 'time': state.last_update or datetime.now(UTC).isoformat(),
@@ -587,6 +604,8 @@ class BotService:
             })
             if len(self.equity_history) > 500:
                 self.equity_history = self.equity_history[-500:]
+
+            self._persist_bot_state(state)
 
             if len(self.equity_history) >= 3:
                 values = [e['value'] for e in self.equity_history if e['value'] and e['value'] > 0]
@@ -615,6 +634,68 @@ class BotService:
         except Exception as e:
             self.logger.error(f"Failed to refresh market data: {e}", exc_info=True)
             self._add_event(f"❌ Refresh failed: {str(e)}", level="error")
+            return False
+
+    async def refresh_chart_candles(self, asset: str, interval: str) -> bool:
+        """Fetch fresh Hyperliquid candles for one (asset, interval) and patch state.market_data.
+
+        Used by the Market page when the user switches asset or interval — avoids
+        re-running the full indicator bundle for a chart-only refresh.
+        """
+        valid_intervals = {"1m", "5m", "15m", "1h", "4h", "1d"}
+        if interval not in valid_intervals:
+            self.logger.warning("refresh_chart_candles: invalid interval %s", interval)
+            return False
+
+        try:
+            from src.backend.trading.hyperliquid_api import HyperliquidAPI
+            from src.backend.indicators.indicator_engine import to_price_candles
+
+            interval_minutes = {"1m": 1, "5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440}
+            bar_mins = interval_minutes[interval]
+            now_ms = int(datetime.now(UTC).timestamp() * 1000)
+            start_ms = now_ms - 200 * bar_mins * 60 * 1000
+
+            hyperliquid = HyperliquidAPI()
+            candles = await hyperliquid.get_candles(asset, interval, start_ms, now_ms)
+            price_candles = to_price_candles(candles, max_bars=200)
+            if not price_candles:
+                self.logger.warning(
+                    "refresh_chart_candles: no candles returned for %s %s", asset, interval,
+                )
+                return False
+
+            if not self.state_manager:
+                return False
+            state = self.state_manager.get_state()
+            market_sections = list(getattr(state, 'market_data', []) or [])
+            intraday_group = {"1m", "5m", "15m"}
+
+            updated = False
+            for section in market_sections:
+                if section.get('asset') != asset:
+                    continue
+                target_frame_key = 'intraday' if interval in intraday_group else 'long_term'
+                frame = section.get(target_frame_key) or {}
+                series = dict(frame.get('series') or {})
+                series['price_candles'] = price_candles
+                frame['series'] = series
+                if target_frame_key == 'long_term':
+                    frame['interval'] = interval
+                section[target_frame_key] = frame
+                updated = True
+                break
+
+            if not updated:
+                return False
+
+            state.market_data = market_sections
+            self.state_manager.update(state)
+            return True
+        except Exception as e:
+            self.logger.warning(
+                "refresh_chart_candles failed for %s %s: %s", asset, interval, e,
+            )
             return False
 
     def approve_proposal(self, proposal_id: str) -> bool:
@@ -718,6 +799,7 @@ class BotService:
             'value': state.total_value
         })
 
+        self._persist_bot_state(state)
         self._track_hedge_events(state)
 
         # Keep only last 500 points
@@ -762,6 +844,38 @@ class BotService:
 
         self._last_degraded_underlyings = degraded
         self._last_hedge_state_error = state_error
+
+    def _persist_bot_state(self, state: BotState):
+        """Save a bot state snapshot to the database for long-term equity tracking."""
+        try:
+            positions = state.positions or []
+            total_unrealized = sum(
+                float(p.get('unrealized_pnl', 0) or 0) for p in positions
+            )
+            get_db_manager().save_bot_state(
+                balance=state.balance,
+                total_value=state.total_value,
+                equity=state.total_value,
+                total_return_pct=state.total_return_pct,
+                sharpe_ratio=state.sharpe_ratio if state.sharpe_ratio else None,
+                open_positions_count=len(positions),
+                total_position_value=abs(sum(
+                    float(p.get('quantity', 0) or 0) * float(p.get('entry_price', 0) or 0)
+                    for p in positions
+                )),
+                total_unrealized_pnl=total_unrealized,
+                is_running=state.is_running,
+            )
+        except Exception as e:
+            self.logger.warning("Failed to persist bot state to DB: %s", e)
+
+    def get_equity_curve(self, days: int = 90) -> List[Dict]:
+        """Get equity curve from the database for long-term charting."""
+        try:
+            return get_db_manager().get_equity_curve(days=days)
+        except Exception as e:
+            self.logger.warning("Failed to load equity curve from DB: %s", e)
+            return []
 
     def _on_trade_executed(self, trade: Dict):
         """

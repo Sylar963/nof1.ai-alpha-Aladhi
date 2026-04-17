@@ -47,7 +47,9 @@ class BotState:
     hedge_status: Dict = field(default_factory=dict)
     hedge_metrics: List[Dict] = field(default_factory=list)
     pending_proposals: List[Dict] = field(default_factory=list)  # Pending trade proposals (manual mode)
-    last_reasoning: Dict = field(default_factory=dict)
+    last_reasoning: Dict = field(default_factory=dict)  # Composite view (perps + options) consumed by GUI
+    last_perps_reasoning: Dict = field(default_factory=dict)
+    last_options_reasoning: Dict = field(default_factory=dict)
     last_update: str = ""
     error: Optional[str] = None
     invocation_count: int = 0
@@ -141,6 +143,12 @@ class TradingBotEngine:
                     logger=self.logger,
                 )
 
+                # Cache one Deribit client for the bot's lifetime.  Creating
+                # a fresh client on every 15-min vol surface refresh meant a
+                # brand-new aiohttp session each time — ~200ms overhead plus
+                # a small FD leak if close() ever failed.
+                self._deribit_client = None
+
                 # Wire the two-cadence scheduler. Disabled by default — set
                 # OPTIONS_SCHEDULER_ENABLED=1 to turn on the live decision loop.
                 if CONFIG.get("options_scheduler_enabled"):
@@ -180,7 +188,7 @@ class TradingBotEngine:
         self.initial_account_value: Optional[float] = None
         self._last_thalex_execution: Dict[str, Any] = {}
         self.price_history: Dict[str, deque] = {asset: deque(maxlen=60) for asset in assets}
-        
+
         # Manual trading mode
         self.trading_mode = CONFIG.get("trading_mode", "auto").lower()
         self.pending_proposals: List[TradeProposal] = []
@@ -189,11 +197,96 @@ class TradingBotEngine:
         # File paths
         self.diary_path = Path("data/diary.jsonl")
         self.diary_path.parent.mkdir(parents=True, exist_ok=True)
+        # Persisted AI-opened trade list. Without this, a bot restart would
+        # lose the record of which positions were opened by the agent, and
+        # the GUI would label them as "External" even though the AI opened them.
+        self.active_trades_path = Path("data/active_trades.json")
+        self._load_active_trades()
+
+    def _load_active_trades(self) -> None:
+        """Rehydrate ``self.active_trades`` from disk if the file exists."""
+        try:
+            if self.active_trades_path.exists():
+                with open(self.active_trades_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    self.active_trades = data
+                    self.logger.info(
+                        "Loaded %d active trades from %s",
+                        len(self.active_trades), self.active_trades_path,
+                    )
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.warning("Failed to load active_trades.json: %s", exc)
+
+    def _save_active_trades(self) -> None:
+        """Persist ``self.active_trades`` to disk so it survives restarts."""
+        try:
+            with open(self.active_trades_path, "w", encoding="utf-8") as f:
+                json.dump(self.active_trades, f, default=str)
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.warning("Failed to save active_trades.json: %s", exc)
+
+    async def _hl_margin_preflight(self, asset: str, notional_usd: float) -> None:
+        """Raise :class:`RuntimeError` if Hyperliquid can't cover the notional.
+
+        Cross-margin cost of a perp is roughly ``notional / maxLeverage``. We
+        add a 5% buffer for entry slippage + taker fees + any variation
+        between quote-time and fill-time. The check fails OPEN on user_state
+        errors (a flaky /user_state call shouldn't block trading — the post-
+        submit response check will still catch a true rejection), but fails
+        CLOSED when the math says we're under water, so the bot doesn't
+        silently record a phantom trade that the venue would reject.
+        """
+        if notional_usd <= 0 or not self.hyperliquid:
+            return
+        try:
+            info = await self.hyperliquid.get_free_margin_info()
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.warning(
+                "Margin preflight: get_free_margin_info failed for %s — skipping check: %s",
+                asset, exc,
+            )
+            return
+        try:
+            max_leverage = await self.hyperliquid.get_max_leverage(asset)
+        except Exception:  # pylint: disable=broad-except
+            max_leverage = 1
+        required = (notional_usd / max(max_leverage, 1)) * 1.05
+        # Use the conservative of withdrawable vs. free_margin — both model
+        # "what can I open with right now" but the venue's own ``withdrawable``
+        # is the ground truth whenever it's populated.
+        available = min(
+            v for v in (info.get("withdrawable"), info.get("free_margin")) if v and v > 0
+        ) if any((info.get("withdrawable"), info.get("free_margin"))) else 0.0
+        if available < required:
+            raise RuntimeError(
+                f"Insufficient Hyperliquid margin for {asset}: "
+                f"required ≈ ${required:,.2f} "
+                f"(notional ${notional_usd:,.2f} / {max_leverage}x + 5% buffer), "
+                f"available ${available:,.2f} "
+                f"(withdrawable={info.get('withdrawable', 0):,.2f}, "
+                f"free_margin={info.get('free_margin', 0):,.2f})"
+            )
+
+    @staticmethod
+    def _hl_validate_response(order_result, context: str) -> None:
+        """Raise :class:`RuntimeError` when the Hyperliquid SDK response indicates rejection.
+
+        Hyperliquid's insufficient-margin path returns a top-level ``"ok"`` with
+        a per-status ``{"error": "..."}`` entry — so the naive "no exception =
+        success" read is wrong. ``context`` is embedded in the error for
+        trace-ability (``"buy BTC x0.01"``).
+        """
+        ok, reason = HyperliquidAPI.parse_order_response(order_result)
+        if not ok:
+            raise RuntimeError(f"Hyperliquid {context} rejected: {reason}")
 
     def _create_thalex_proposal(self, decision_payload: Dict) -> TradeProposal:
         """Build a manual-approval proposal for a Thalex decision payload."""
         decision = parse_decision(decision_payload)
         size = float(decision.contracts or decision.target_gamma_btc or 0.0)
+        if size <= 0:
+            raise ValueError(f"Thalex proposal has zero size: contracts={decision.contracts}, target_gamma_btc={decision.target_gamma_btc}")
         return TradeProposal(
             venue="thalex",
             asset=decision.asset,
@@ -256,6 +349,42 @@ class TradingBotEngine:
             return False, message
 
         open_count = await self._live_thalex_open_positions_count()
+
+        # Pre-trade margin check against Thalex cash collateral. We don't know
+        # the exact premium without another ticker RPC, so we use a rough
+        # proxy: contracts × underlying_spot × 1% (typical BTC option premium
+        # fraction) as the required collateral. If this fails the executor
+        # never hits the wire and the reason propagates to the caller.
+        #
+        # ``getattr``s throughout make this tolerant of the test doubles that
+        # build the engine via ``TradingBotEngine.__new__`` and set only the
+        # attributes they care about; the production adapter defines both
+        # ``margin_preflight`` and ``get_current_price``.
+        margin_preflight = getattr(self.thalex, "margin_preflight", None)
+        hl = getattr(self, "hyperliquid", None)
+        if callable(margin_preflight) and hl is not None:
+            try:
+                contracts_est = float(
+                    decision.contracts
+                    or decision.target_gamma_btc
+                    or sum((getattr(leg, "contracts", 0.0) or 0.0) for leg in (decision.legs or []))
+                )
+            except Exception:  # pylint: disable=broad-except
+                contracts_est = 0.0
+            if contracts_est > 0:
+                try:
+                    spot_est = await hl.get_current_price(
+                        decision.underlying or decision.asset or "BTC"
+                    )
+                except Exception:  # pylint: disable=broad-except
+                    spot_est = 0.0
+                required_usd = contracts_est * max(float(spot_est or 0.0), 0.0) * 0.01
+                ok_margin, reason = await margin_preflight(required_usd)
+                if not ok_margin:
+                    message = f"Thalex margin preflight failed: {reason}"
+                    self.logger.error(message)
+                    return False, message
+
         result = await self.options_executor.execute(decision, open_positions_count=open_count)
         if result.ok:
             hedge_orders = []
@@ -351,6 +480,7 @@ class TradingBotEngine:
                 "execution_price": execution_price,
                 "opened_at": datetime.now(UTC).isoformat(),
             })
+            self._save_active_trades()
             return True, ""
         else:
             self.logger.warning("Thalex decision rejected: %s", result.reason)
@@ -375,14 +505,26 @@ class TradingBotEngine:
         self.start_time = datetime.now(UTC)
         self.invocation_count = 0
 
-        # Get initial account value
+        # Get initial account value.
+        # Run Hyperliquid + Thalex fetches in parallel and bound the Thalex call
+        # so a flaky options venue can never stall the UI on "Starting...". The
+        # 5s cap is well over normal round-trip time (~1s) but short enough
+        # that auth/whitelist failures don't block the transition to Running.
         try:
-            user_state = await self.hyperliquid.get_user_state()
-            thalex_state = None
+            hl_task = asyncio.create_task(self.hyperliquid.get_user_state())
             if self.thalex is not None:
+                thalex_task = asyncio.create_task(
+                    asyncio.wait_for(self.thalex.get_user_state(), timeout=5.0)
+                )
+            else:
+                thalex_task = None
+
+            user_state = await hl_task
+            thalex_state = None
+            if thalex_task is not None:
                 try:
-                    thalex_state = await self.thalex.get_user_state()
-                except Exception as exc:  # pylint: disable=broad-except
+                    thalex_state = await thalex_task
+                except (asyncio.TimeoutError, Exception) as exc:  # pylint: disable=broad-except
                     self.logger.warning("Failed to load Thalex initial account value: %s", exc)
             snapshot = self._account_snapshot(user_state, thalex_state)
             self.initial_account_value = snapshot['total_value']
@@ -407,8 +549,8 @@ class TradingBotEngine:
 
         if self.hedge_manager is not None:
             try:
-                await self.hedge_manager.reconcile()
-            except Exception as exc:  # pylint: disable=broad-except
+                await asyncio.wait_for(self.hedge_manager.reconcile(), timeout=8.0)
+            except (asyncio.TimeoutError, Exception) as exc:  # pylint: disable=broad-except
                 self.logger.warning("Initial delta hedge reconcile failed: %s", exc)
             self._hedge_audit_task = asyncio.create_task(self._hedge_audit_loop())
 
@@ -457,6 +599,14 @@ class TradingBotEngine:
                 await self.options_llm_lifecycle.close()
             except Exception as exc:  # pylint: disable=broad-except
                 self.logger.warning("OptionsLLMLifecycle close failed: %s", exc)
+
+        # Release the cached Deribit client's aiohttp session.
+        if self._deribit_client is not None:
+            try:
+                await self._deribit_client.close()
+            except Exception as exc:  # pylint: disable=broad-except
+                self.logger.warning("Deribit client close failed: %s", exc)
+            self._deribit_client = None
 
         self.logger.info("Bot stopped")
         self._notify_state_update()
@@ -521,7 +671,11 @@ class TradingBotEngine:
             # Make sure Thalex is connected and the instrument cache is fresh.
             await self.thalex.connect()
 
-            deribit = DeribitPublicClient()
+            # Reuse one Deribit client across refreshes — its aiohttp session
+            # is lazily built on first call and reused thereafter.
+            if self._deribit_client is None:
+                self._deribit_client = DeribitPublicClient()
+            deribit = self._deribit_client
             try:
                 store = IVHistoryStore(db_path="data/iv_history.sqlite")
                 spot_history = await self._fetch_btc_daily_closes(deribit, days=16)
@@ -579,7 +733,8 @@ class TradingBotEngine:
                     len(self._latest_options_context.recent_options_trades),
                 )
             finally:
-                await deribit.close()
+                # Deribit client is reused across refreshes; closed in stop().
+                pass
         except Exception as exc:  # pylint: disable=broad-except
             self.logger.error("vol surface refresh failed: %s", exc)
 
@@ -643,11 +798,11 @@ class TradingBotEngine:
     async def _run_options_decision_cycle(self) -> None:
         """Background task: run the options agent against the cached snapshot.
 
-        Reads ``self._latest_options_context`` (populated by the 15m refresh
-        task), calls the OptionsAgent, parses decisions, and routes each one
-        through ``_execute_thalex_decision``. Skips silently if no snapshot
-        is available yet (typical on first run before the surface refresh
-        has had a chance to populate it).
+        Reads ``self._latest_options_context`` (populated by the vol surface
+        refresh), calls the OptionsAgent, parses decisions, and routes each
+        one through ``_execute_thalex_decision``. The scheduler's bootstrap
+        sequence guarantees the surface is fetched before the first decision,
+        but we still guard against None in case the refresh itself failed.
         """
         if self._latest_options_context is None:
             self.logger.info("OptionsContext not yet available; skipping decision cycle")
@@ -663,6 +818,12 @@ class TradingBotEngine:
             agent = OptionsAgent(llm=self._options_llm_adapter())
             decisions = await agent.decide(self._latest_options_context)
             self.logger.info("OptionsAgent emitted %d decisions", len(decisions))
+
+            # Surface options reasoning + decisions on the GUI alongside perps.
+            # ``getattr`` keeps tests that swap in a minimal fake OptionsAgent
+            # (no ``last_payload`` attribute) green.
+            options_payload = getattr(agent, "last_payload", None) or {}
+            options_decision_payloads: List[Dict[str, Any]] = []
 
             for decision in decisions:
                 decision_payload = {
@@ -692,6 +853,7 @@ class TradingBotEngine:
                     "vol_view": decision.vol_view,
                     "target_gamma_btc": decision.target_gamma_btc,
                 }
+                options_decision_payloads.append(decision_payload)
                 if self.trading_mode == "manual":
                     try:
                         proposal = self._create_thalex_proposal(decision_payload)
@@ -714,6 +876,17 @@ class TradingBotEngine:
                         )
                     continue
                 await self._execute_thalex_decision(decision_payload)
+
+            # Always publish — even an empty trade_decisions array carries the
+            # LLM's reasoning text, which the operator wants to see on the
+            # Reasoning page.
+            self.state.last_options_reasoning = {
+                "reasoning": (options_payload.get("reasoning") if isinstance(options_payload, dict) else "") or "",
+                "trade_decisions": options_decision_payloads,
+                "cycle_at": datetime.now(UTC).isoformat(),
+            }
+            self._compose_last_reasoning()
+            self._notify_state_update()
         except Exception as exc:  # pylint: disable=broad-except
             self.logger.error("options decision cycle failed: %s", exc)
 
@@ -964,11 +1137,14 @@ class TradingBotEngine:
             )
             return indicators
 
+    _MAX_CONSECUTIVE_ERRORS = 5
+
     async def _main_loop(self):
         """
         Main trading loop.
         Adapted from ai-trading-agent/src/main.py lines 88-455
         """
+        consecutive_errors = 0
         try:
             while self.is_running:
                 self.invocation_count += 1
@@ -1101,7 +1277,10 @@ class TradingBotEngine:
                         'balance': balance,
                         'account_value': total_value,
                         'sharpe_ratio': sharpe_ratio,
-                        'positions': combined_positions,
+                        'positions': [
+                            {k: v for k, v in pos.items() if k not in ("closable", "row_id")}
+                            for pos in combined_positions
+                        ],
                         'active_trades': self.active_trades,
                         'open_orders': open_orders,
                         'recent_diary': recent_diary,
@@ -1154,6 +1333,22 @@ class TradingBotEngine:
                             recent_price_points = list(self.price_history[asset])[-10:]
                             recent_timestamps = [p["t"] for p in recent_price_points]
 
+                            price_candles_5m = indicators["5m"].get("price_candles", {}) or {}
+                            price_candles_lt = lt_indicators.get("price_candles", {}) or {}
+                            # Prefer candle close timestamps so indicator & price charts share an x-axis
+                            candle_times_5m = price_candles_5m.get("time") or []
+                            candle_times_lt = price_candles_lt.get("time") or []
+                            keltner_5m_timestamps = (
+                                candle_times_5m[-len(keltner_5m_middle):]
+                                if keltner_5m_middle and len(candle_times_5m) >= len(keltner_5m_middle)
+                                else (recent_timestamps[-len(keltner_5m_middle):] if keltner_5m_middle else [])
+                            )
+                            lt_keltner_timestamps = (
+                                candle_times_lt[-len(lt_keltner_middle):]
+                                if lt_keltner_middle and len(candle_times_lt) >= len(lt_keltner_middle)
+                                else (recent_timestamps[-len(lt_keltner_middle):] if lt_keltner_middle else [])
+                            )
+
                             def _latest(series):
                                 return series[-1] if series else None
 
@@ -1190,8 +1385,8 @@ class TradingBotEngine:
                                         "keltner_middle": keltner_5m_middle,
                                         "keltner_upper": keltner_5m_upper,
                                         "keltner_lower": keltner_5m_lower,
-                                        "timestamps": recent_timestamps[-len(keltner_5m_middle):] if keltner_5m_middle else [],
-                                        "price_candles": {},
+                                        "timestamps": keltner_5m_timestamps,
+                                        "price_candles": price_candles_5m,
                                     }
                                 },
                                 "long_term": {
@@ -1204,8 +1399,8 @@ class TradingBotEngine:
                                         "keltner_middle": lt_keltner_middle,
                                         "keltner_upper": lt_keltner_upper,
                                         "keltner_lower": lt_keltner_lower,
-                                        "timestamps": recent_timestamps[-len(lt_keltner_middle):] if lt_keltner_middle else [],
-                                        "price_candles": {},
+                                        "timestamps": lt_keltner_timestamps,
+                                        "price_candles": price_candles_lt,
                                     },
                                 },
                                 "open_interest": oi,
@@ -1233,6 +1428,17 @@ class TradingBotEngine:
                             "note": "Follow the system prompt guidelines strictly"
                         })
                     ])
+
+                    # Inject compact options book summary when available so the
+                    # perps agent can factor in the options desk's net exposure.
+                    if self._latest_options_context is not None:
+                        ctx = self._latest_options_context
+                        context_payload["options_book_summary"] = {
+                            "vol_regime": ctx.vol_regime,
+                            "portfolio_greeks": ctx.portfolio_greeks,
+                            "open_position_count": ctx.open_position_count,
+                        }
+
                     context = json.dumps(context_payload, default=json_default, indent=2)
 
                     # Log prompt
@@ -1275,7 +1481,8 @@ class TradingBotEngine:
                     if reasoning:
                         self.logger.info(f"LLM Reasoning: {reasoning[:200]}...")
 
-                    self.state.last_reasoning = decisions
+                    self.state.last_perps_reasoning = decisions
+                    self._compose_last_reasoning()
                     self._notify_state_update()
 
                     # ===== PHASE 11: Execute Trades or Create Proposals =====
@@ -1321,7 +1528,10 @@ class TradingBotEngine:
                             if self.trading_mode == "manual":
                                 try:
                                     current_price = await self.hyperliquid.get_current_price(asset)
-                                    size = allocation / current_price if current_price > 0 else 0
+                                    if not current_price or current_price <= 0:
+                                        self.logger.error(f"Skipping proposal for {asset}: invalid price {current_price}")
+                                        continue
+                                    size = allocation / current_price
                                     
                                     # Calculate risk/reward
                                     risk_reward = None
@@ -1362,7 +1572,10 @@ class TradingBotEngine:
                             # AUTO MODE: Execute immediately (position-aware)
                             try:
                                 current_price = await self.hyperliquid.get_current_price(asset)
-                                desired_notional = allocation / current_price if current_price > 0 else 0
+                                if not current_price or current_price <= 0:
+                                    self.logger.error(f"Skipping {action} {asset}: invalid price {current_price}")
+                                    continue
+                                desired_size = allocation / current_price
 
                                 # --- Cancel stale orders for this asset ---
                                 cancel_result = await self.hyperliquid.cancel_all_orders(asset)
@@ -1380,38 +1593,54 @@ class TradingBotEngine:
 
                                 # Determine required order size.
                                 # BUY with existing short (-0.165): must buy
-                                #   |short| to flatten + desired_notional for
+                                #   |short| to flatten + desired_size for
                                 #   the new long.
-                                # BUY with existing long: just add desired_notional.
+                                # BUY with existing long: just add desired_size.
                                 # (mirror logic for SELL)
                                 if action == 'buy' and existing_pos < 0:
                                     # Close the short first, then go long with remainder
-                                    amount = abs(existing_pos) + desired_notional
+                                    amount = abs(existing_pos) + desired_size
                                     self.logger.info(
-                                        f"{asset}: closing short ({existing_pos:.6f}) + new long ({desired_notional:.6f}) = total buy {amount:.6f}"
+                                        f"{asset}: closing short ({existing_pos:.6f}) + new long ({desired_size:.6f}) = total buy {amount:.6f}"
                                     )
                                 elif action == 'sell' and existing_pos > 0:
                                     # Close the long first, then go short with remainder
-                                    amount = existing_pos + desired_notional
+                                    amount = existing_pos + desired_size
                                     self.logger.info(
-                                        f"{asset}: closing long ({existing_pos:.6f}) + new short ({desired_notional:.6f}) = total sell {amount:.6f}"
+                                        f"{asset}: closing long ({existing_pos:.6f}) + new short ({desired_size:.6f}) = total sell {amount:.6f}"
                                     )
                                 else:
-                                    amount = desired_notional
+                                    amount = desired_size
 
                                 # The resulting position size is the new
                                 # directional exposure (after closing the old
                                 # position).  TP/SL should protect only this.
-                                net_new_amount = desired_notional
+                                net_new_amount = desired_size
                                 order_result = None
                                 filled = False
 
                                 if amount > 0:
+                                    # Pre-trade margin check — fails loud if
+                                    # the venue can't cover this notional so
+                                    # we never record a phantom fill.
+                                    await self._hl_margin_preflight(asset, amount * current_price)
+
                                     # Place market order
                                     if action == 'buy':
                                         order_result = await self.hyperliquid.place_buy_order(asset, amount)
                                     else:
                                         order_result = await self.hyperliquid.place_sell_order(asset, amount)
+
+                                    # Validate the SDK response BEFORE we
+                                    # record anything. Insufficient-margin
+                                    # rejections come back with top-level
+                                    # status="ok" but a per-status error —
+                                    # so skipping this check silently books
+                                    # a trade the exchange never accepted.
+                                    self._hl_validate_response(
+                                        order_result,
+                                        context=f"{action} {asset} x{amount:.6f}",
+                                    )
 
                                     self.logger.info(f"Executed {action} {asset}: {amount:.6f} @ {current_price}")
 
@@ -1468,8 +1697,17 @@ class TradingBotEngine:
                                         'tp_oid': tp_oid,
                                         'sl_oid': sl_oid,
                                         'exit_plan': exit_plan,
+                                        # Deep-memory fields: preserve the full thesis so the
+                                        # LLM sees why this trade was opened on the next cycle
+                                        # (even after a bot restart). Without these, the agent
+                                        # has to re-derive the thesis from only the exit_plan.
+                                        'rationale': rationale,
+                                        'tp_price': tp_price,
+                                        'sl_price': sl_price,
+                                        'confidence': confidence,
                                         'opened_at': datetime.now(UTC).isoformat()
                                     })
+                                self._save_active_trades()
 
                                 # Write to diary
                                 self._write_diary_entry({
@@ -1518,21 +1756,39 @@ class TradingBotEngine:
 
                     # Update market data in state for dashboard
                     self.state.market_data = market_sections
-                    
+
                     # Update state timestamp
                     self.state.last_update = datetime.now(UTC).isoformat()
                     self._notify_state_update()
+                    consecutive_errors = 0  # successful iteration
 
                 except Exception as e:
-                    self.logger.error(f"Error in main loop iteration: {e}", exc_info=True)
+                    consecutive_errors += 1
+                    self.logger.error(
+                        "Error in main loop iteration (%d/%d consecutive): %s",
+                        consecutive_errors, self._MAX_CONSECUTIVE_ERRORS, e,
+                        exc_info=True,
+                    )
                     self.state.error = str(e)
                     self.state.last_update = datetime.now(UTC).isoformat()
                     self._notify_state_update()
                     if self.on_error:
                         self.on_error(str(e))
+                    if consecutive_errors >= self._MAX_CONSECUTIVE_ERRORS:
+                        self.logger.error(
+                            "Stopping bot after %d consecutive failures", consecutive_errors,
+                        )
+                        self.is_running = False
+                        self.state.is_running = False
+                        self.state.error = (
+                            f"Bot stopped: {consecutive_errors} consecutive failures — last: {e}"
+                        )
+                        self._notify_state_update()
+                        break
 
                 # ===== PHASE 12: Sleep Until Next Interval =====
-                await asyncio.sleep(self._get_interval_seconds())
+                backoff = min(consecutive_errors, 3) * 30  # 0s, 30s, 60s, 90s
+                await asyncio.sleep(self._get_interval_seconds() + backoff)
 
         except asyncio.CancelledError:
             self.logger.info("Bot loop cancelled")
@@ -1590,6 +1846,7 @@ class TradingBotEngine:
 
         if removed:
             self.logger.info(f"Reconciled: removed stale trades for {removed}")
+            self._save_active_trades()
             self._write_diary_entry({
                 'timestamp': datetime.now(UTC).isoformat(),
                 'action': 'reconcile',
@@ -1619,6 +1876,54 @@ class TradingBotEngine:
         elif self.interval.endswith('d'):
             return int(self.interval[:-1]) * 86400
         return 300  # default 5 minutes
+
+    def _compose_last_reasoning(self) -> None:
+        """Rebuild ``state.last_reasoning`` as the merged perps + options view.
+
+        The Reasoning page reads ``state.last_reasoning`` directly. Perps fire
+        every 5 min while options fire every 3 h, so a wholesale assignment in
+        either cycle would erase the other. We instead keep both halves on
+        their own fields and recompose the GUI-facing dict here.
+
+        Trade decisions from both venues are concatenated; each item already
+        carries a ``venue`` field so the timeline can colour and filter them
+        appropriately. Reasoning text is exposed as a ``per_venue`` mapping
+        plus a top-level ``reasoning`` summary that prefers the more recent
+        cycle so the JSON editor isn't empty.
+        """
+        perps = getattr(self.state, "last_perps_reasoning", None) or {}
+        options = getattr(self.state, "last_options_reasoning", None) or {}
+
+        perps_decisions = list(perps.get("trade_decisions") or [])
+        options_decisions = list(options.get("trade_decisions") or [])
+        for decision in perps_decisions:
+            decision.setdefault("venue", "hyperliquid")
+        for decision in options_decisions:
+            decision.setdefault("venue", "thalex")
+
+        perps_text = perps.get("reasoning") or ""
+        options_text = options.get("reasoning") or ""
+        summary_parts = []
+        if perps_text:
+            summary_parts.append(f"[PERPS]\n{perps_text}")
+        if options_text:
+            summary_parts.append(f"[OPTIONS]\n{options_text}")
+
+        self.state.last_reasoning = {
+            "reasoning": "\n\n".join(summary_parts),
+            "trade_decisions": perps_decisions + options_decisions,
+            "per_venue": {
+                "hyperliquid": {
+                    "reasoning": perps_text,
+                    "trade_decisions": perps_decisions,
+                },
+                "thalex": {
+                    "reasoning": options_text,
+                    "trade_decisions": options_decisions,
+                    "cycle_at": options.get("cycle_at"),
+                },
+            },
+        }
 
     def _notify_state_update(self):
         """Notify GUI of state update via callback"""
@@ -1726,6 +2031,7 @@ class TradingBotEngine:
                         self.active_trades = [
                             t for t in self.active_trades if t['asset'] != asset
                         ]
+                        self._save_active_trades()
 
                         self._write_diary_entry({
                             'timestamp': datetime.now(UTC).isoformat(),
@@ -1876,6 +2182,11 @@ class TradingBotEngine:
             if amount <= 0:
                 raise ValueError(f"Invalid amount: {amount}")
             
+            # Pre-trade margin check before submitting — same rationale as
+            # the auto-execute path: don't silently record a trade the
+            # venue would reject for insufficient collateral.
+            await self._hl_margin_preflight(proposal.asset, amount * (current_price or 0.0))
+
             # Place market order
             if proposal.action == 'buy':
                 order_result = await self.hyperliquid.place_buy_order(proposal.asset, amount)
@@ -1883,7 +2194,13 @@ class TradingBotEngine:
                 order_result = await self.hyperliquid.place_sell_order(proposal.asset, amount)
             else:
                 raise ValueError(f"Invalid action: {proposal.action}")
-            
+
+            # Validate response BEFORE touching active_trades / state.
+            self._hl_validate_response(
+                order_result,
+                context=f"proposal {proposal.action} {proposal.asset} x{amount:.6f}",
+            )
+
             self.logger.info(f"Order placed: {proposal.action} {proposal.asset}: {amount:.6f} @ {current_price}")
             
             # Wait and check fills
@@ -1938,9 +2255,15 @@ class TradingBotEngine:
                 'tp_oid': tp_oid,
                 'sl_oid': sl_oid,
                 'exit_plan': market_conditions.get('exit_plan', ''),
+                # Deep-memory fields: preserve thesis across cycles + restarts.
+                'rationale': proposal.rationale,
+                'tp_price': proposal.tp_price,
+                'sl_price': proposal.sl_price,
+                'confidence': getattr(proposal, 'confidence', None),
                 'opened_at': datetime.now(UTC).isoformat(),
                 'from_proposal': proposal.id
             })
+            self._save_active_trades()
             
             # Mark proposal as executed
             proposal.mark_executed(current_price)

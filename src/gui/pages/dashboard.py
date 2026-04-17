@@ -2,6 +2,9 @@
 Dashboard Page - Main dashboard with metrics and charts
 """
 
+import asyncio
+import time
+
 import plotly.graph_objects as go
 from nicegui import ui
 from src.gui.services.bot_service import BotService
@@ -76,7 +79,7 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
     with ui.row().classes('w-full gap-4 mb-6'):
         # Equity Curve Chart (left half)
         with ui.card().classes('flex-1 p-4'):
-            ui.label('Portfolio Value').classes('text-xl font-bold text-white mb-2')
+            ui.label('Portfolio Value (3 months)').classes('text-xl font-bold text-white mb-2')
 
             equity_chart = ui.plotly(go.Figure(
                 data=[go.Scatter(
@@ -84,13 +87,16 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
                     y=[],
                     mode='lines',
                     name='Value',
-                    line=dict(color='#667eea', width=3)
+                    line=dict(color='#667eea', width=2),
+                    fill='tozeroy',
+                    fillcolor='rgba(102,126,234,0.15)',
                 )],
                 layout=go.Layout(
                     template='plotly_dark',
                     height=300,
                     margin=dict(l=50, r=20, t=20, b=40),
-                    xaxis=dict(title='Time', showgrid=True, gridcolor='#374151'),
+                    xaxis=dict(title='Time', showgrid=True, gridcolor='#374151',
+                               type='date', rangeslider=dict(visible=False)),
                     yaxis=dict(title='Value ($)', showgrid=True, gridcolor='#374151'),
                     paper_bgcolor='#1f2937',
                     plot_bgcolor='#1f2937',
@@ -186,21 +192,16 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
 
     async def start_bot():
         """Start the trading bot"""
-        try:
+        # Snapshot alive-state up front so we know whether any element writes
+        # after the await are still safe to issue. If the user navigated away
+        # during bot_service.start(), status_indicator is gone and any .text
+        # assignment raises RuntimeError before we can reach the _ui_ok guard.
+        if _ui_ok():
             status_indicator.text = '🟡 Starting...'
             activity_log.push('Starting bot...')
 
+        try:
             await bot_service.start()
-
-            status_indicator.text = '🟢 Running'
-            _set_status_indicator_tone('text-green-500')
-            start_btn.props('disable')
-            stop_btn.props(remove='disable')
-
-            activity_log.push('✅ Bot started successfully!')
-            if _ui_ok():
-                ui.notify('Bot started!', type='positive')
-
         except Exception as e:
             if not _ui_ok():
                 return
@@ -208,28 +209,39 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
             _set_status_indicator_tone('text-red-500')
             activity_log.push(f'❌ Error starting bot: {str(e)}')
             ui.notify(f'Failed to start: {str(e)}', type='negative')
+            return
+
+        if not _ui_ok():
+            return
+        status_indicator.text = '🟢 Running'
+        _set_status_indicator_tone('text-green-500')
+        start_btn.props('disable')
+        stop_btn.props(remove='disable')
+        activity_log.push('✅ Bot started successfully!')
+        ui.notify('Bot started!', type='positive')
 
     async def stop_bot():
         """Stop the trading bot"""
-        try:
+        if _ui_ok():
             status_indicator.text = '🟡 Stopping...'
             activity_log.push('Stopping bot...')
 
+        try:
             await bot_service.stop()
-
-            status_indicator.text = '⚫ Stopped'
-            _set_status_indicator_tone('text-gray-400')
-            start_btn.props(remove='disable')
-            stop_btn.props('disable')
-
-            activity_log.push('✅ Bot stopped successfully!')
-            if _ui_ok():
-                ui.notify('Bot stopped!', type='info')
-
         except Exception as e:
             if _ui_ok():
                 activity_log.push(f'❌ Error stopping bot: {str(e)}')
                 ui.notify(f'Failed to stop: {str(e)}', type='negative')
+            return
+
+        if not _ui_ok():
+            return
+        status_indicator.text = '⚫ Stopped'
+        _set_status_indicator_tone('text-gray-400')
+        start_btn.props(remove='disable')
+        stop_btn.props('disable')
+        activity_log.push('✅ Bot stopped successfully!')
+        ui.notify('Bot stopped!', type='info')
 
     async def toggle_delta_hedge():
         """Enable or disable live delta hedging from the dashboard."""
@@ -261,8 +273,6 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
 
     # ===== AUTO-REFRESH FUNCTIONS =====
 
-    import time
-    import asyncio
     last_refresh_time = None
     refresh_seconds_ago = 0
     displayed_events = set()
@@ -270,10 +280,6 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
     async def refresh_market_data():
         """Refresh market data from Hyperliquid without starting bot"""
         nonlocal last_refresh_time, refresh_seconds_ago
-
-        def _ui_ok_refresh():
-            """Return False if the client/slot has been deleted (user navigated away)."""
-            return _ui_ok()
 
         try:
             refresh_data_btn.enabled = False
@@ -300,16 +306,16 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
         except RuntimeError:
             return  # client navigated away
         except Exception as e:
-            if not _ui_ok_refresh():
+            if not _ui_ok():
                 return
             activity_log.push(f'❌ Refresh error: {str(e)}')
             ui.notify(f'Error: {str(e)}', type='negative')
             refresh_data_loading.text = '❌ Error'
         finally:
-            if _ui_ok_refresh():
+            if _ui_ok():
                 refresh_data_btn.enabled = True
                 await asyncio.sleep(2.0)
-                if _ui_ok_refresh():
+                if _ui_ok():
                     refresh_data_loading.text = ''
 
     async def update_dashboard():
@@ -373,14 +379,24 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
             else:
                 hedge_health_value.classes(remove='text-green-500 text-red-500', add='text-gray-400')
 
-            # Update equity curve chart
-            equity_history = bot_service.get_equity_history()
-            if equity_history:
-                times = [d['time'] for d in equity_history]
-                values = [d['value'] for d in equity_history]
-
-                equity_chart.figure.data[0].x = times
-                equity_chart.figure.data[0].y = values
+            # Update equity curve chart — merge 3-month DB history with in-memory session data
+            db_curve = bot_service.get_equity_curve(days=90)
+            session_history = bot_service.get_equity_history(limit=500)
+            merged_times = []
+            merged_values = []
+            if db_curve:
+                merged_times.extend(d['timestamp'] for d in db_curve if d.get('total_value'))
+                merged_values.extend(d['total_value'] for d in db_curve if d.get('total_value'))
+            if session_history:
+                db_last_ts = merged_times[-1] if merged_times else ''
+                for d in session_history:
+                    ts = d.get('time', '')
+                    if ts > db_last_ts and d.get('value'):
+                        merged_times.append(ts)
+                        merged_values.append(d['value'])
+            if merged_times:
+                equity_chart.figure.data[0].x = merged_times
+                equity_chart.figure.data[0].y = merged_values
                 equity_chart.update()
 
             # Update asset allocation chart
