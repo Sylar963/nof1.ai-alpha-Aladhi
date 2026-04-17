@@ -946,9 +946,23 @@ class ThalexAPI(ExchangeAdapter):
         order_id = ""
         status = "ok"
         price = submitted_price
+        error: Optional[str] = None
         if isinstance(raw, dict):
             order_id = str(raw.get("order_id") or raw.get("id") or "")
-            status = str(raw.get("status") or "ok")
+            raw_status = str(raw.get("status") or "ok").lower()
+            # Thalex surfaces rejection via status strings like "rejected" /
+            # "cancelled" (for IOC orders that couldn't match), or an explicit
+            # ``error``/``reason`` field. Normalize all of those to
+            # ``status="rejected"`` so callers can check a single flag.
+            err_payload = raw.get("error") or raw.get("reason")
+            if err_payload and raw_status not in {"open", "filled", "partially_filled"}:
+                error = str(err_payload)
+                status = "rejected"
+            elif raw_status in {"rejected", "cancelled", "canceled", "error"}:
+                status = "rejected"
+                error = str(raw.get("reject_reason") or raw.get("error") or raw_status)
+            else:
+                status = raw_status or "ok"
             price = _quote_field(
                 raw,
                 ("price",),
@@ -968,4 +982,36 @@ class ThalexAPI(ExchangeAdapter):
             instrument_name=asset,
             price=price,
             raw=raw if isinstance(raw, dict) else None,
+            error=error,
         )
+
+    async def margin_preflight(self, required_collateral_usd: float) -> tuple[bool, str]:
+        """Cheap pre-trade margin check against Thalex account cash collateral.
+
+        Fetches ``account_summary`` and compares available cash/margin against
+        ``required_collateral_usd`` (the estimated premium to pay for a long
+        or the expected margin requirement for a short, in USD). Returns
+        ``(True, "")`` when the venue has enough collateral, or
+        ``(False, reason)`` otherwise.
+
+        Fails open on RPC errors — a flaky account_summary shouldn't block a
+        trade; the order submit itself will still catch a true rejection.
+        """
+        if required_collateral_usd <= 0:
+            return True, ""
+        try:
+            state = await self.get_user_state()
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("Thalex margin_preflight: get_user_state failed — allowing trade: %s", exc)
+            return True, ""
+        balance = float(getattr(state, "balance", 0.0) or 0.0)
+        if balance <= 0:
+            return False, f"Thalex balance is {balance:.2f} — no collateral available"
+        # 10% buffer for fees/slippage + variation margin moves during fill.
+        buffered = required_collateral_usd * 1.10
+        if balance < buffered:
+            return False, (
+                f"Thalex collateral ${balance:,.2f} below required ≈ ${buffered:,.2f} "
+                f"(${required_collateral_usd:,.2f} +10% buffer)"
+            )
+        return True, ""

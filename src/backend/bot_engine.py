@@ -143,6 +143,12 @@ class TradingBotEngine:
                     logger=self.logger,
                 )
 
+                # Cache one Deribit client for the bot's lifetime.  Creating
+                # a fresh client on every 15-min vol surface refresh meant a
+                # brand-new aiohttp session each time — ~200ms overhead plus
+                # a small FD leak if close() ever failed.
+                self._deribit_client = None
+
                 # Wire the two-cadence scheduler. Disabled by default — set
                 # OPTIONS_SCHEDULER_ENABLED=1 to turn on the live decision loop.
                 if CONFIG.get("options_scheduler_enabled"):
@@ -182,7 +188,7 @@ class TradingBotEngine:
         self.initial_account_value: Optional[float] = None
         self._last_thalex_execution: Dict[str, Any] = {}
         self.price_history: Dict[str, deque] = {asset: deque(maxlen=60) for asset in assets}
-        
+
         # Manual trading mode
         self.trading_mode = CONFIG.get("trading_mode", "auto").lower()
         self.pending_proposals: List[TradeProposal] = []
@@ -191,6 +197,89 @@ class TradingBotEngine:
         # File paths
         self.diary_path = Path("data/diary.jsonl")
         self.diary_path.parent.mkdir(parents=True, exist_ok=True)
+        # Persisted AI-opened trade list. Without this, a bot restart would
+        # lose the record of which positions were opened by the agent, and
+        # the GUI would label them as "External" even though the AI opened them.
+        self.active_trades_path = Path("data/active_trades.json")
+        self._load_active_trades()
+
+    def _load_active_trades(self) -> None:
+        """Rehydrate ``self.active_trades`` from disk if the file exists."""
+        try:
+            if self.active_trades_path.exists():
+                with open(self.active_trades_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    self.active_trades = data
+                    self.logger.info(
+                        "Loaded %d active trades from %s",
+                        len(self.active_trades), self.active_trades_path,
+                    )
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.warning("Failed to load active_trades.json: %s", exc)
+
+    def _save_active_trades(self) -> None:
+        """Persist ``self.active_trades`` to disk so it survives restarts."""
+        try:
+            with open(self.active_trades_path, "w", encoding="utf-8") as f:
+                json.dump(self.active_trades, f, default=str)
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.warning("Failed to save active_trades.json: %s", exc)
+
+    async def _hl_margin_preflight(self, asset: str, notional_usd: float) -> None:
+        """Raise :class:`RuntimeError` if Hyperliquid can't cover the notional.
+
+        Cross-margin cost of a perp is roughly ``notional / maxLeverage``. We
+        add a 5% buffer for entry slippage + taker fees + any variation
+        between quote-time and fill-time. The check fails OPEN on user_state
+        errors (a flaky /user_state call shouldn't block trading — the post-
+        submit response check will still catch a true rejection), but fails
+        CLOSED when the math says we're under water, so the bot doesn't
+        silently record a phantom trade that the venue would reject.
+        """
+        if notional_usd <= 0 or not self.hyperliquid:
+            return
+        try:
+            info = await self.hyperliquid.get_free_margin_info()
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.warning(
+                "Margin preflight: get_free_margin_info failed for %s — skipping check: %s",
+                asset, exc,
+            )
+            return
+        try:
+            max_leverage = await self.hyperliquid.get_max_leverage(asset)
+        except Exception:  # pylint: disable=broad-except
+            max_leverage = 1
+        required = (notional_usd / max(max_leverage, 1)) * 1.05
+        # Use the conservative of withdrawable vs. free_margin — both model
+        # "what can I open with right now" but the venue's own ``withdrawable``
+        # is the ground truth whenever it's populated.
+        available = min(
+            v for v in (info.get("withdrawable"), info.get("free_margin")) if v and v > 0
+        ) if any((info.get("withdrawable"), info.get("free_margin"))) else 0.0
+        if available < required:
+            raise RuntimeError(
+                f"Insufficient Hyperliquid margin for {asset}: "
+                f"required ≈ ${required:,.2f} "
+                f"(notional ${notional_usd:,.2f} / {max_leverage}x + 5% buffer), "
+                f"available ${available:,.2f} "
+                f"(withdrawable={info.get('withdrawable', 0):,.2f}, "
+                f"free_margin={info.get('free_margin', 0):,.2f})"
+            )
+
+    @staticmethod
+    def _hl_validate_response(order_result, context: str) -> None:
+        """Raise :class:`RuntimeError` when the Hyperliquid SDK response indicates rejection.
+
+        Hyperliquid's insufficient-margin path returns a top-level ``"ok"`` with
+        a per-status ``{"error": "..."}`` entry — so the naive "no exception =
+        success" read is wrong. ``context`` is embedded in the error for
+        trace-ability (``"buy BTC x0.01"``).
+        """
+        ok, reason = HyperliquidAPI.parse_order_response(order_result)
+        if not ok:
+            raise RuntimeError(f"Hyperliquid {context} rejected: {reason}")
 
     def _create_thalex_proposal(self, decision_payload: Dict) -> TradeProposal:
         """Build a manual-approval proposal for a Thalex decision payload."""
@@ -260,6 +349,42 @@ class TradingBotEngine:
             return False, message
 
         open_count = await self._live_thalex_open_positions_count()
+
+        # Pre-trade margin check against Thalex cash collateral. We don't know
+        # the exact premium without another ticker RPC, so we use a rough
+        # proxy: contracts × underlying_spot × 1% (typical BTC option premium
+        # fraction) as the required collateral. If this fails the executor
+        # never hits the wire and the reason propagates to the caller.
+        #
+        # ``getattr``s throughout make this tolerant of the test doubles that
+        # build the engine via ``TradingBotEngine.__new__`` and set only the
+        # attributes they care about; the production adapter defines both
+        # ``margin_preflight`` and ``get_current_price``.
+        margin_preflight = getattr(self.thalex, "margin_preflight", None)
+        hl = getattr(self, "hyperliquid", None)
+        if callable(margin_preflight) and hl is not None:
+            try:
+                contracts_est = float(
+                    decision.contracts
+                    or decision.target_gamma_btc
+                    or sum((getattr(leg, "contracts", 0.0) or 0.0) for leg in (decision.legs or []))
+                )
+            except Exception:  # pylint: disable=broad-except
+                contracts_est = 0.0
+            if contracts_est > 0:
+                try:
+                    spot_est = await hl.get_current_price(
+                        decision.underlying or decision.asset or "BTC"
+                    )
+                except Exception:  # pylint: disable=broad-except
+                    spot_est = 0.0
+                required_usd = contracts_est * max(float(spot_est or 0.0), 0.0) * 0.01
+                ok_margin, reason = await margin_preflight(required_usd)
+                if not ok_margin:
+                    message = f"Thalex margin preflight failed: {reason}"
+                    self.logger.error(message)
+                    return False, message
+
         result = await self.options_executor.execute(decision, open_positions_count=open_count)
         if result.ok:
             hedge_orders = []
@@ -355,6 +480,7 @@ class TradingBotEngine:
                 "execution_price": execution_price,
                 "opened_at": datetime.now(UTC).isoformat(),
             })
+            self._save_active_trades()
             return True, ""
         else:
             self.logger.warning("Thalex decision rejected: %s", result.reason)
@@ -474,6 +600,14 @@ class TradingBotEngine:
             except Exception as exc:  # pylint: disable=broad-except
                 self.logger.warning("OptionsLLMLifecycle close failed: %s", exc)
 
+        # Release the cached Deribit client's aiohttp session.
+        if self._deribit_client is not None:
+            try:
+                await self._deribit_client.close()
+            except Exception as exc:  # pylint: disable=broad-except
+                self.logger.warning("Deribit client close failed: %s", exc)
+            self._deribit_client = None
+
         self.logger.info("Bot stopped")
         self._notify_state_update()
 
@@ -537,7 +671,11 @@ class TradingBotEngine:
             # Make sure Thalex is connected and the instrument cache is fresh.
             await self.thalex.connect()
 
-            deribit = DeribitPublicClient()
+            # Reuse one Deribit client across refreshes — its aiohttp session
+            # is lazily built on first call and reused thereafter.
+            if self._deribit_client is None:
+                self._deribit_client = DeribitPublicClient()
+            deribit = self._deribit_client
             try:
                 store = IVHistoryStore(db_path="data/iv_history.sqlite")
                 spot_history = await self._fetch_btc_daily_closes(deribit, days=16)
@@ -595,7 +733,8 @@ class TradingBotEngine:
                     len(self._latest_options_context.recent_options_trades),
                 )
             finally:
-                await deribit.close()
+                # Deribit client is reused across refreshes; closed in stop().
+                pass
         except Exception as exc:  # pylint: disable=broad-except
             self.logger.error("vol surface refresh failed: %s", exc)
 
@@ -1481,11 +1620,27 @@ class TradingBotEngine:
                                 filled = False
 
                                 if amount > 0:
+                                    # Pre-trade margin check — fails loud if
+                                    # the venue can't cover this notional so
+                                    # we never record a phantom fill.
+                                    await self._hl_margin_preflight(asset, amount * current_price)
+
                                     # Place market order
                                     if action == 'buy':
                                         order_result = await self.hyperliquid.place_buy_order(asset, amount)
                                     else:
                                         order_result = await self.hyperliquid.place_sell_order(asset, amount)
+
+                                    # Validate the SDK response BEFORE we
+                                    # record anything. Insufficient-margin
+                                    # rejections come back with top-level
+                                    # status="ok" but a per-status error —
+                                    # so skipping this check silently books
+                                    # a trade the exchange never accepted.
+                                    self._hl_validate_response(
+                                        order_result,
+                                        context=f"{action} {asset} x{amount:.6f}",
+                                    )
 
                                     self.logger.info(f"Executed {action} {asset}: {amount:.6f} @ {current_price}")
 
@@ -1542,8 +1697,17 @@ class TradingBotEngine:
                                         'tp_oid': tp_oid,
                                         'sl_oid': sl_oid,
                                         'exit_plan': exit_plan,
+                                        # Deep-memory fields: preserve the full thesis so the
+                                        # LLM sees why this trade was opened on the next cycle
+                                        # (even after a bot restart). Without these, the agent
+                                        # has to re-derive the thesis from only the exit_plan.
+                                        'rationale': rationale,
+                                        'tp_price': tp_price,
+                                        'sl_price': sl_price,
+                                        'confidence': confidence,
                                         'opened_at': datetime.now(UTC).isoformat()
                                     })
+                                self._save_active_trades()
 
                                 # Write to diary
                                 self._write_diary_entry({
@@ -1682,6 +1846,7 @@ class TradingBotEngine:
 
         if removed:
             self.logger.info(f"Reconciled: removed stale trades for {removed}")
+            self._save_active_trades()
             self._write_diary_entry({
                 'timestamp': datetime.now(UTC).isoformat(),
                 'action': 'reconcile',
@@ -1866,6 +2031,7 @@ class TradingBotEngine:
                         self.active_trades = [
                             t for t in self.active_trades if t['asset'] != asset
                         ]
+                        self._save_active_trades()
 
                         self._write_diary_entry({
                             'timestamp': datetime.now(UTC).isoformat(),
@@ -2016,6 +2182,11 @@ class TradingBotEngine:
             if amount <= 0:
                 raise ValueError(f"Invalid amount: {amount}")
             
+            # Pre-trade margin check before submitting — same rationale as
+            # the auto-execute path: don't silently record a trade the
+            # venue would reject for insufficient collateral.
+            await self._hl_margin_preflight(proposal.asset, amount * (current_price or 0.0))
+
             # Place market order
             if proposal.action == 'buy':
                 order_result = await self.hyperliquid.place_buy_order(proposal.asset, amount)
@@ -2023,7 +2194,13 @@ class TradingBotEngine:
                 order_result = await self.hyperliquid.place_sell_order(proposal.asset, amount)
             else:
                 raise ValueError(f"Invalid action: {proposal.action}")
-            
+
+            # Validate response BEFORE touching active_trades / state.
+            self._hl_validate_response(
+                order_result,
+                context=f"proposal {proposal.action} {proposal.asset} x{amount:.6f}",
+            )
+
             self.logger.info(f"Order placed: {proposal.action} {proposal.asset}: {amount:.6f} @ {current_price}")
             
             # Wait and check fills
@@ -2078,9 +2255,15 @@ class TradingBotEngine:
                 'tp_oid': tp_oid,
                 'sl_oid': sl_oid,
                 'exit_plan': market_conditions.get('exit_plan', ''),
+                # Deep-memory fields: preserve thesis across cycles + restarts.
+                'rationale': proposal.rationale,
+                'tp_price': proposal.tp_price,
+                'sl_price': proposal.sl_price,
+                'confidence': getattr(proposal, 'confidence', None),
                 'opened_at': datetime.now(UTC).isoformat(),
                 'from_proposal': proposal.id
             })
+            self._save_active_trades()
             
             # Mark proposal as executed
             proposal.mark_executed(current_price)

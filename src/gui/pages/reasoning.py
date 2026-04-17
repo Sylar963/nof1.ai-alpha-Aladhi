@@ -105,7 +105,11 @@ def create_reasoning(bot_service: BotService, state_manager: StateManager):
             or reasoning_data.get('trade_decisions') is not None
         )
         if has_data:
-            json_editor.content = {'json': reasoning_data}
+            # NiceGUI json_editor stores its config in _props['properties'].
+            # Setting `.content` just creates a dead attribute — we have to
+            # mutate the properties dict and call .update() so the new JSON
+            # is pushed to the Vue component.
+            json_editor._props['properties']['content'] = {'json': reasoning_data}
             json_editor.update()
 
             # Update timeline with filtering
@@ -205,8 +209,8 @@ def create_reasoning(bot_service: BotService, state_manager: StateManager):
                 else:
                     ui.label('No trade decisions yet').classes('text-gray-400 text-center py-4')
         else:
-            # Empty state
-            json_editor.content = {'json': {}}
+            # Empty state — same properties-dict pattern as the has_data path.
+            json_editor._props['properties']['content'] = {'json': {}}
             json_editor.update()
             timeline_container.clear()
 

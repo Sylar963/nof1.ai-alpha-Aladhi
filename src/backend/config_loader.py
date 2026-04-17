@@ -140,7 +140,12 @@ CONFIG = {
     "openrouter_base_url": _get_env("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
     "openrouter_referer": _get_env("OPENROUTER_REFERER"),
     "openrouter_app_title": _get_env("OPENROUTER_APP_TITLE", "trading-agent"),
-    "llm_model": _get_env("LLM_MODEL", "x-ai/grok-4"),
+    "llm_model": _get_env("LLM_MODEL", "z-ai/glm-5.1"),
+    "llm_max_tokens": _get_env("LLM_MAX_TOKENS", "16384"),
+    # Options reasoning is much more verbose than perps (vol surface,
+    # multi-leg construction, greeks, regime). Default 32K, can go up to 96K
+    # for models that support it.
+    "options_llm_max_tokens": _get_env("OPTIONS_LLM_MAX_TOKENS", "32768"),
     # Reasoning tokens
     "reasoning_enabled": _get_bool("REASONING_ENABLED", False),
     "reasoning_effort": _get_env("REASONING_EFFORT", "high"),

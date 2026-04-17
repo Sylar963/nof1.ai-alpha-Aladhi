@@ -643,12 +643,19 @@ def create_market(bot_service: BotService, state_manager: StateManager):
             momentum_icon.set_text('○')
             _set_status_tone(momentum_icon, 'text-gray-400')
 
-        # Funding signal — rate pressure (overleveraged positioning)
+        # Funding signal — rate pressure (overleveraged positioning).
+        # Hyperliquid funding is hourly. For BTC, "normal" sits in roughly
+        # [-0.00005, +0.0001] per hour (~-44% to ~+88% annualized). The
+        # previous thresholds (0.0005 / -0.0002 per hour = ~4400% / ~-1750%
+        # annualized) only fired in extreme market stress — effectively dead
+        # signal. Tighten to surface actionable crowding:
+        #   > +0.0001/hr (~+88% APR)  → RED (longs crowded, bearish)
+        #   < -0.00005/hr (~-44% APR) → GREEN (shorts crowded, bullish)
         funding_rate = market_data.get('funding_rate')
-        if funding_rate is not None and funding_rate > 0.0005:
+        if funding_rate is not None and funding_rate > 0.0001:
             volume_icon.set_text('●')
             _set_status_tone(volume_icon, 'text-red-400')
-        elif funding_rate is not None and funding_rate < -0.0002:
+        elif funding_rate is not None and funding_rate < -0.00005:
             volume_icon.set_text('●')
             _set_status_tone(volume_icon, 'text-green-400')
         else:

@@ -110,7 +110,12 @@ class OptionsScheduler:
                 )
             )
 
-    _BOOTSTRAP_TIMEOUT: float = 60.0  # seconds
+    # Vol surface: HTTP fetches + math, normally ~30s. Generous 5-min cap.
+    _VOL_SURFACE_TIMEOUT: float = 300.0
+    # Options decision: LLM call with verbose reasoning. glm-5.1 with reasoning
+    # enabled has been observed taking up to 10 minutes per cycle. Cap at 15
+    # min so a hung request doesn't block the scheduler forever.
+    _DECISION_TIMEOUT: float = 900.0
 
     async def _bootstrap(self) -> None:
         """Fetch vol surface then fire the first options decision sequentially."""
@@ -119,12 +124,12 @@ class OptionsScheduler:
                 logger.info("OptionsScheduler: bootstrap — fetching initial vol surface")
                 try:
                     await asyncio.wait_for(
-                        self._refresh_vol_surface(), timeout=self._BOOTSTRAP_TIMEOUT,
+                        self._refresh_vol_surface(), timeout=self._VOL_SURFACE_TIMEOUT,
                     )
                 except asyncio.TimeoutError:
                     logger.error(
                         "OptionsScheduler: bootstrap vol surface timed out after %.0fs",
-                        self._BOOTSTRAP_TIMEOUT,
+                        self._VOL_SURFACE_TIMEOUT,
                     )
                 except Exception as exc:  # pylint: disable=broad-except
                     logger.error("OptionsScheduler: bootstrap vol surface failed: %s", exc)
@@ -133,12 +138,12 @@ class OptionsScheduler:
                 logger.info("OptionsScheduler: bootstrap — running initial options decision")
                 try:
                     await asyncio.wait_for(
-                        self._run_options_decision(), timeout=self._BOOTSTRAP_TIMEOUT,
+                        self._run_options_decision(), timeout=self._DECISION_TIMEOUT,
                     )
                 except asyncio.TimeoutError:
                     logger.error(
                         "OptionsScheduler: bootstrap options decision timed out after %.0fs",
-                        self._BOOTSTRAP_TIMEOUT,
+                        self._DECISION_TIMEOUT,
                     )
                 except Exception as exc:  # pylint: disable=broad-except
                     logger.error("OptionsScheduler: bootstrap options decision failed: %s", exc)
@@ -159,7 +164,14 @@ class OptionsScheduler:
         self._tasks.clear()
 
     _MAX_CONSECUTIVE_ERRORS = 5
-    _CALLBACK_TIMEOUT: float = 120.0  # seconds
+
+    # Per-loop callback timeouts. Vol surface is HTTP+math (fast), options
+    # decision is an LLM call with verbose reasoning (slow — see _bootstrap
+    # docstring above). Looked up from the loop name.
+    _CALLBACK_TIMEOUTS: dict[str, float] = {
+        "vol_surface": _VOL_SURFACE_TIMEOUT,
+        "options_decision": _DECISION_TIMEOUT,
+    }
 
     async def _loop(
         self,
@@ -179,6 +191,7 @@ class OptionsScheduler:
         itself to avoid silent infinite retries.
         """
         consecutive_errors = 0
+        callback_timeout = self._CALLBACK_TIMEOUTS.get(name, self._DECISION_TIMEOUT)
         try:
             if wait_for_bootstrap:
                 await self._bootstrap_done.wait()
@@ -188,13 +201,13 @@ class OptionsScheduler:
 
             while self._running:
                 try:
-                    await asyncio.wait_for(callback(), timeout=self._CALLBACK_TIMEOUT)
+                    await asyncio.wait_for(callback(), timeout=callback_timeout)
                     consecutive_errors = 0
                 except asyncio.TimeoutError:
                     consecutive_errors += 1
                     logger.error(
-                        "OptionsScheduler[%s] callback timed out (%d/%d)",
-                        name, consecutive_errors, self._MAX_CONSECUTIVE_ERRORS,
+                        "OptionsScheduler[%s] callback timed out after %.0fs (%d/%d)",
+                        name, callback_timeout, consecutive_errors, self._MAX_CONSECUTIVE_ERRORS,
                     )
                 except Exception as exc:  # pylint: disable=broad-except
                     consecutive_errors += 1
