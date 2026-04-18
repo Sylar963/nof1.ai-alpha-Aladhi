@@ -206,8 +206,9 @@ async def test_system_prompt_contains_strategy_selection():
     # Decision tree branches by regime
     assert "skew" in lower
     assert "realized_iv_ratio" in prompt or "realized" in lower
-    # Tenor guidance
-    assert "7" in prompt and "21" in prompt  # premium selling DTE range
+    # Tenor guidance — match the exact "7-21 DTE" string from the prompt
+    # so this doesn't silently pass on any other occurrence of "7" or "21".
+    assert "7-21 DTE" in prompt
     assert "tenor" in lower
 
 

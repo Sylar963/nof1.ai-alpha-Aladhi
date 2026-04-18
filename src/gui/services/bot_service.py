@@ -647,6 +647,22 @@ class BotService:
             self.logger.warning("refresh_chart_candles: invalid interval %s", interval)
             return False
 
+        # The intraday frame ships pre-computed indicator overlays (EMAs,
+        # Keltner, opening range, anchored VWAP) that are bucketed to 5-min
+        # bars by the indicator engine. Swapping just the price_candles to a
+        # different intraday interval would paint 15m candles over 5m
+        # overlays — wrong alignment and silently misleading. Hard-reject
+        # non-5m intraday requests here; the long-term frame is rebuilt per
+        # interval by the main refresh cycle and is safe to swap candles on.
+        intraday_group = {"1m", "5m", "15m"}
+        if interval in intraday_group and interval != "5m":
+            self.logger.warning(
+                "refresh_chart_candles: intraday interval %s not supported "
+                "(overlays are pinned to 5m); use the full refresh to rebuild",
+                interval,
+            )
+            return False
+
         try:
             from src.backend.trading.hyperliquid_api import HyperliquidAPI
             from src.backend.indicators.indicator_engine import to_price_candles
@@ -669,7 +685,6 @@ class BotService:
                 return False
             state = self.state_manager.get_state()
             market_sections = list(getattr(state, 'market_data', []) or [])
-            intraday_group = {"1m", "5m", "15m"}
 
             updated = False
             for section in market_sections:

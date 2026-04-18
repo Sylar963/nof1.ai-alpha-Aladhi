@@ -398,6 +398,12 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
                 equity_chart.figure.data[0].x = merged_times
                 equity_chart.figure.data[0].y = merged_values
                 equity_chart.update()
+            else:
+                # Clear any stale points left over from a prior session;
+                # otherwise the chart keeps showing yesterday's equity.
+                equity_chart.figure.data[0].x = []
+                equity_chart.figure.data[0].y = []
+                equity_chart.update()
 
             # Update asset allocation chart
             if positions:

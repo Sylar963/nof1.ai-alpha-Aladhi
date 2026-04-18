@@ -6,6 +6,8 @@ Refactored from ai-trading-agent/src/main.py
 import asyncio
 import json
 import logging
+import os
+import tempfile
 from collections import deque, OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, UTC
@@ -219,10 +221,31 @@ class TradingBotEngine:
             self.logger.warning("Failed to load active_trades.json: %s", exc)
 
     def _save_active_trades(self) -> None:
-        """Persist ``self.active_trades`` to disk so it survives restarts."""
+        """Persist ``self.active_trades`` to disk so it survives restarts.
+
+        Writes to a temp file in the same directory, fsyncs, then atomically
+        renames into place. This avoids the zero-length-file hazard where a
+        crash mid-write would leave ``active_trades.json`` truncated and
+        wipe the bot's memory of open positions on the next startup.
+        """
         try:
-            with open(self.active_trades_path, "w", encoding="utf-8") as f:
-                json.dump(self.active_trades, f, default=str)
+            path = self.active_trades_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=path.name + ".", suffix=".tmp", dir=str(path.parent),
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(self.active_trades, f, default=str)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_name, path)
+            except Exception:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+                raise
         except Exception as exc:  # pylint: disable=broad-except
             self.logger.warning("Failed to save active_trades.json: %s", exc)
 
@@ -231,27 +254,32 @@ class TradingBotEngine:
 
         Cross-margin cost of a perp is roughly ``notional / maxLeverage``. We
         add a 5% buffer for entry slippage + taker fees + any variation
-        between quote-time and fill-time. The check fails OPEN on user_state
-        errors (a flaky /user_state call shouldn't block trading — the post-
-        submit response check will still catch a true rejection), but fails
-        CLOSED when the math says we're under water, so the bot doesn't
-        silently record a phantom trade that the venue would reject.
+        between quote-time and fill-time.
+
+        Fail-open vs fail-closed policy:
+        - ``get_free_margin_info`` failures → propagate (fail CLOSED). We
+          have no collateral number so refusing the trade is the only safe
+          move — the alternative (skipping the check) would re-open the
+          silent-failure bug this preflight exists to close.
+        - ``get_max_leverage`` failures → fail OPEN. Max leverage is a
+          nice-to-have sizing hint; falling back to a conservative 1× would
+          reject many legitimate trades on a transient meta hiccup. Treat
+          it as unbounded (``inf``) so the leverage divisor vanishes and the
+          check only trips on truly missing collateral.
         """
         if notional_usd <= 0 or not self.hyperliquid:
             return
-        try:
-            info = await self.hyperliquid.get_free_margin_info()
-        except Exception as exc:  # pylint: disable=broad-except
-            self.logger.warning(
-                "Margin preflight: get_free_margin_info failed for %s — skipping check: %s",
-                asset, exc,
-            )
-            return
+        info = await self.hyperliquid.get_free_margin_info()
         try:
             max_leverage = await self.hyperliquid.get_max_leverage(asset)
-        except Exception:  # pylint: disable=broad-except
-            max_leverage = 1
-        required = (notional_usd / max(max_leverage, 1)) * 1.05
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.warning(
+                "Margin preflight: get_max_leverage(%s) failed, treating as unbounded: %s",
+                asset, exc,
+            )
+            max_leverage = float("inf")
+        effective_leverage = max_leverage if max_leverage and max_leverage > 0 else 1
+        required = (notional_usd / effective_leverage) * 1.05
         # Use the conservative of withdrawable vs. free_margin — both model
         # "what can I open with right now" but the venue's own ``withdrawable``
         # is the ground truth whenever it's populated.
@@ -372,13 +400,28 @@ class TradingBotEngine:
             except Exception:  # pylint: disable=broad-except
                 contracts_est = 0.0
             if contracts_est > 0:
+                underlying = decision.underlying or decision.asset or "BTC"
+                # Spot fetch must fail CLOSED — if we can't size the
+                # collateral requirement, silently skipping the check lets
+                # margin-insolvent trades slip through. Surface the error
+                # and refuse the trade until pricing recovers.
                 try:
-                    spot_est = await hl.get_current_price(
-                        decision.underlying or decision.asset or "BTC"
+                    spot_est = await hl.get_current_price(underlying)
+                except Exception as exc:  # pylint: disable=broad-except
+                    message = (
+                        f"Thalex margin preflight aborted: spot price lookup for "
+                        f"{underlying} failed ({exc}); refusing trade"
                     )
-                except Exception:  # pylint: disable=broad-except
-                    spot_est = 0.0
-                required_usd = contracts_est * max(float(spot_est or 0.0), 0.0) * 0.01
+                    self.logger.error(message)
+                    return False, message
+                if spot_est is None or float(spot_est) <= 0:
+                    message = (
+                        f"Thalex margin preflight aborted: spot price for {underlying} "
+                        f"unavailable (got {spot_est!r}); refusing trade"
+                    )
+                    self.logger.error(message)
+                    return False, message
+                required_usd = contracts_est * float(spot_est) * 0.01
                 ok_margin, reason = await margin_preflight(required_usd)
                 if not ok_margin:
                     message = f"Thalex margin preflight failed: {reason}"
@@ -1894,12 +1937,20 @@ class TradingBotEngine:
         perps = getattr(self.state, "last_perps_reasoning", None) or {}
         options = getattr(self.state, "last_options_reasoning", None) or {}
 
-        perps_decisions = list(perps.get("trade_decisions") or [])
-        options_decisions = list(options.get("trade_decisions") or [])
-        for decision in perps_decisions:
-            decision.setdefault("venue", "hyperliquid")
-        for decision in options_decisions:
-            decision.setdefault("venue", "thalex")
+        # ``list(...)`` shallow-copies the outer list but leaves the inner
+        # dicts shared with the per-venue reasoning state. setdefault on those
+        # originals would mutate the persisted state every time the composite
+        # is rebuilt. Copy each decision before tagging the venue.
+        perps_decisions = [
+            {**d, "venue": d.get("venue", "hyperliquid")}
+            for d in (perps.get("trade_decisions") or [])
+            if isinstance(d, dict)
+        ]
+        options_decisions = [
+            {**d, "venue": d.get("venue", "thalex")}
+            for d in (options.get("trade_decisions") or [])
+            if isinstance(d, dict)
+        ]
 
         perps_text = perps.get("reasoning") or ""
         options_text = options.get("reasoning") or ""

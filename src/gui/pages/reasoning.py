@@ -88,6 +88,23 @@ def create_reasoning(bot_service: BotService, state_manager: StateManager):
     # Historical decisions storage
     historical_decisions = []
 
+    # Retained references for fire-and-forget tasks. Without this the event
+    # loop can garbage-collect the coroutine mid-flight ("Task was destroyed
+    # but it is pending!"), dropping updates silently.
+    background_tasks: list[asyncio.Task] = []
+
+    def _set_editor_content(content: dict) -> None:
+        """Push new JSON into the NiceGUI json_editor component.
+
+        Wraps the brittle ``_props['properties']['content']`` access that
+        NiceGUI's json_editor currently requires (upstream doesn't expose a
+        public setter yet — TODO: replace when ``ui.json_editor.content``
+        starts propagating properly). Centralising the access keeps both
+        call sites consistent.
+        """
+        json_editor._props['properties']['content'] = content
+        json_editor.update()
+
     def _ui_ok() -> bool:
         return is_ui_alive(action_filter)
 
@@ -105,12 +122,7 @@ def create_reasoning(bot_service: BotService, state_manager: StateManager):
             or reasoning_data.get('trade_decisions') is not None
         )
         if has_data:
-            # NiceGUI json_editor stores its config in _props['properties'].
-            # Setting `.content` just creates a dead attribute — we have to
-            # mutate the properties dict and call .update() so the new JSON
-            # is pushed to the Vue component.
-            json_editor._props['properties']['content'] = {'json': reasoning_data}
-            json_editor.update()
+            _set_editor_content({'json': reasoning_data})
 
             # Update timeline with filtering
             timeline_container.clear()
@@ -209,9 +221,7 @@ def create_reasoning(bot_service: BotService, state_manager: StateManager):
                 else:
                     ui.label('No trade decisions yet').classes('text-gray-400 text-center py-4')
         else:
-            # Empty state — same properties-dict pattern as the has_data path.
-            json_editor._props['properties']['content'] = {'json': {}}
-            json_editor.update()
+            _set_editor_content({'json': {}})
             timeline_container.clear()
 
             # Update stats in empty state
@@ -232,7 +242,9 @@ def create_reasoning(bot_service: BotService, state_manager: StateManager):
         """Handle filter change"""
         if not _ui_ok():
             return
-        asyncio.create_task(update_reasoning())
+        task = asyncio.create_task(update_reasoning())
+        background_tasks.append(task)
+        task.add_done_callback(lambda t: background_tasks.remove(t) if t in background_tasks else None)
 
     action_filter.on('update:model-value', on_filter_change)
 
@@ -244,5 +256,9 @@ def create_reasoning(bot_service: BotService, state_manager: StateManager):
     # Auto-refresh every 3 seconds
     ui.timer(3.0, _guarded_update_reasoning)
 
-    # Initial update
-    asyncio.create_task(update_reasoning())
+    # Initial update — retain a reference so the task isn't GC'd mid-flight.
+    _initial_task = asyncio.create_task(update_reasoning())
+    background_tasks.append(_initial_task)
+    _initial_task.add_done_callback(
+        lambda t: background_tasks.remove(t) if t in background_tasks else None
+    )

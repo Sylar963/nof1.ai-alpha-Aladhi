@@ -335,7 +335,8 @@ class TradingAgent:
 
         for _ in range(3):
             data = {"model": self.model, "messages": messages}
-            data["max_tokens"] = int(CONFIG.get("llm_max_tokens") or 16384)
+            _cfg_max = CONFIG.get("llm_max_tokens")
+            data["max_tokens"] = int(_cfg_max) if _cfg_max is not None and _cfg_max != "" else 16384
             if allow_structured:
                 data["response_format"] = {
                     "type": "json_schema",
