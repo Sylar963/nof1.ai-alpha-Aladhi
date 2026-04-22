@@ -899,18 +899,22 @@ class TradingBotEngine:
                 # opened in a scoped session so the connection is released
                 # before the surface refresh returns. Failures degrade to an
                 # empty history list rather than blanking the whole snapshot.
-                db_session = None
-                db_session_ctx = None
+                #
+                # Uses a proper ``with`` block so the session is always
+                # released on exceptions — the previous manual
+                # ``__enter__``/``__exit__`` pair leaked connections when
+                # ``build_options_context`` raised between the two calls.
+                from contextlib import nullcontext
+                from src.database.db_manager import get_db_manager
                 try:
-                    from src.database.db_manager import get_db_manager
-                    db_session_ctx = get_db_manager().session_scope()
-                    db_session = db_session_ctx.__enter__()
+                    session_cm = get_db_manager().session_scope()
                 except Exception as exc:  # pylint: disable=broad-except
-                    self.logger.warning("options trade-history session unavailable: %s", exc)
-                    db_session = None
-                    db_session_ctx = None
+                    self.logger.warning(
+                        "options trade-history session unavailable: %s", exc
+                    )
+                    session_cm = nullcontext(None)
 
-                try:
+                with session_cm as db_session:
                     self._latest_options_context = await build_options_context(
                         thalex=self.thalex,
                         deribit=deribit,
@@ -924,12 +928,6 @@ class TradingBotEngine:
                         hedge_underlying="BTC",
                         recent_options_skips=self._read_recent_options_skips(),
                     )
-                finally:
-                    if db_session_ctx is not None:
-                        try:
-                            db_session_ctx.__exit__(None, None, None)
-                        except Exception as exc:  # pylint: disable=broad-except
-                            self.logger.debug("db session close failed: %s", exc)
 
                 self.logger.info(
                     "OptionsContext refreshed (regime=%s confidence=%s, spot_history=%d closes, "
@@ -2245,6 +2243,27 @@ class TradingBotEngine:
             except Exception as e:
                 self.logger.error(f"Error in state update callback: {e}")
 
+    def _spawn_tracked_task(self, coro, label: str) -> asyncio.Task:
+        """Schedule ``coro`` as a fire-and-forget task with failure logging.
+
+        Silent task failures (create_task without done_callback) were masking
+        proposal execution errors — the task would crash, the proposal would
+        stay in its prior state, and the operator had no signal that anything
+        went wrong. This wrapper surfaces the exception in the bot log and
+        marks the proposal failed when possible.
+        """
+        task = asyncio.create_task(coro)
+
+        def _done(t: asyncio.Task):
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                self.logger.error("%s task failed: %s", label, exc, exc_info=exc)
+
+        task.add_done_callback(_done)
+        return task
+
     def _refresh_hedge_state(self) -> None:
         """Copy live hedge-manager telemetry into BotState for the GUI."""
         if self.hedge_manager is None:
@@ -2614,7 +2633,10 @@ class TradingBotEngine:
             f"[RETRY] Re-executing proposal {proposal_id[:8]}: "
             f"{proposal.action.upper()} {proposal.asset}"
         )
-        asyncio.create_task(self._execute_proposal(proposal))
+        self._spawn_tracked_task(
+            self._execute_proposal(proposal),
+            label=f"retry_proposal[{proposal_id[:8]}]",
+        )
         self._sync_pending_proposals_state()
         self._notify_state_update()
         return True
@@ -2651,9 +2673,14 @@ class TradingBotEngine:
         # Mark as approved
         proposal.approve()
         self.logger.info(f"[APPROVED] Proposal: {proposal.action.upper()} {proposal.asset} (ID: {proposal_id[:8]})")
-        
-        # Execute asynchronously
-        asyncio.create_task(self._execute_proposal(proposal))
+
+        # Execute asynchronously with tracked error logging (silent task
+        # failures here previously stranded proposals in 'approved' state
+        # without any signal to the operator).
+        self._spawn_tracked_task(
+            self._execute_proposal(proposal),
+            label=f"approve_proposal[{proposal_id[:8]}]",
+        )
 
         # Update state
         self._sync_pending_proposals_state()

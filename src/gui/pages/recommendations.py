@@ -26,38 +26,66 @@ def create_recommendations(bot_service: BotService, state_manager: StateManager)
     
     # Container for proposals
     proposals_container = ui.column().classes('w-full gap-4')
-    
+
     # Stats row
     stats_row = ui.row().classes('w-full gap-4 mb-4')
-    
+
+    # Signature caches so the 2s timer can skip the rebuild entirely when
+    # nothing in the proposals list has changed — the common case. The card
+    # structure varies by status/TP/SL/risk-reward presence, so signature-
+    # based diffing is simpler than per-field in-place updates while still
+    # eliminating the per-tick DOM thrash.
+    last_proposals_sig: dict = {'value': None}
+    last_stats_sig: dict = {'value': None}
+
+    def _proposal_sig(p: dict):
+        return (
+            p.get('id'),
+            p.get('status'),
+            p.get('action'),
+            p.get('confidence'),
+            p.get('entry_price'),
+            p.get('tp_price'),
+            p.get('sl_price'),
+            p.get('size'),
+            p.get('allocation'),
+            p.get('risk_reward'),
+            p.get('execution_error'),
+        )
+
     async def update_proposals():
         """Update list of pending proposals"""
         if not _ui_ok():
             return
         state = state_manager.get_state()
         proposals = state.pending_proposals or []
-        
-        # Update stats
-        stats_row.clear()
-        with stats_row:
-            # Total proposals
-            with ui.card().classes('flex-1 p-4 bg-gradient-to-br from-purple-800 to-purple-900'):
-                ui.label(str(len(proposals))).classes('text-3xl font-bold text-white')
-                ui.label('Pending Proposals').classes('text-sm text-purple-200 mt-1')
-            
-            # If bot is running
-            if state.is_running:
-                with ui.card().classes('flex-1 p-4 bg-gradient-to-br from-green-800 to-green-900'):
-                    ui.label('Active').classes('text-3xl font-bold text-white')
-                    ui.label('Bot Status').classes('text-sm text-green-200 mt-1')
-            else:
-                with ui.card().classes('flex-1 p-4 bg-gradient-to-br from-gray-700 to-gray-800'):
-                    ui.label('Stopped').classes('text-3xl font-bold text-white')
-                    ui.label('Bot Status').classes('text-sm text-gray-300 mt-1')
-        
-        # Update proposals list
+
+        # Stats row — only rebuild when counts/running state change.
+        stats_sig = (len(proposals), bool(state.is_running))
+        if stats_sig != last_stats_sig['value']:
+            last_stats_sig['value'] = stats_sig
+            stats_row.clear()
+            with stats_row:
+                with ui.card().classes('flex-1 p-4 bg-gradient-to-br from-purple-800 to-purple-900'):
+                    ui.label(str(len(proposals))).classes('text-3xl font-bold text-white')
+                    ui.label('Pending Proposals').classes('text-sm text-purple-200 mt-1')
+                if state.is_running:
+                    with ui.card().classes('flex-1 p-4 bg-gradient-to-br from-green-800 to-green-900'):
+                        ui.label('Active').classes('text-3xl font-bold text-white')
+                        ui.label('Bot Status').classes('text-sm text-green-200 mt-1')
+                else:
+                    with ui.card().classes('flex-1 p-4 bg-gradient-to-br from-gray-700 to-gray-800'):
+                        ui.label('Stopped').classes('text-3xl font-bold text-white')
+                        ui.label('Bot Status').classes('text-sm text-gray-300 mt-1')
+
+        # Proposal list — skip the full rebuild when nothing actionable
+        # changed. This is the hot path (2s cadence, large cards).
+        proposals_sig = tuple(_proposal_sig(p) for p in proposals)
+        if proposals_sig == last_proposals_sig['value']:
+            return
+        last_proposals_sig['value'] = proposals_sig
+
         proposals_container.clear()
-        
         if not proposals:
             with proposals_container:
                 with ui.card().classes('w-full p-8 bg-gradient-to-br from-gray-800 to-gray-900'):
@@ -66,7 +94,7 @@ def create_recommendations(bot_service: BotService, state_manager: StateManager)
                         ui.label('No pending recommendations').classes('text-2xl text-gray-400')
                         ui.label('AI will create proposals when the bot analyzes the market.').classes('text-gray-500')
             return
-        
+
         with proposals_container:
             for proposal in proposals:
                 create_proposal_card(proposal)

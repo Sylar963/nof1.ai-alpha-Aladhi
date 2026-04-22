@@ -128,7 +128,11 @@ class TradingAgent:
                 f.write(f"Model: {payload.get('model')}\n")
                 f.write(f"Headers: {json.dumps({k: v for k, v in headers.items() if k != 'Authorization'})}\n")
                 f.write(f"Payload:\n{json.dumps(payload, indent=2)}\n")
-            resp = requests.post(self.base_url, headers=headers, json=payload, timeout=60)
+            # Tightened from 60s → 45s. The call runs inside asyncio.to_thread
+            # at the bot_engine call sites, so a hang would tie up a worker
+            # thread (uncancellable from the outer loop) until this fires.
+            # 45s is still well above OpenRouter p99 latency.
+            resp = requests.post(self.base_url, headers=headers, json=payload, timeout=45)
             logging.info("Received response from OpenRouter (status: %s)", resp.status_code)
             if resp.status_code != 200:
                 logging.error("OpenRouter error: %s - %s", resp.status_code, resp.text)

@@ -4,6 +4,11 @@
 
 This skill provides comprehensive guidance for interacting with, modifying, and extending the nof1.ai Alpha Arena trading bot codebase. It covers architecture, conventions, patterns, and step-by-step procedures for common development tasks.
 
+## LLM Reference Files
+
+- For dependency/version guidance and pytest fixture conventions, consult `.agents/skills/nof1-stack-and-testing/SKILL.md` before changing stack-level code or tests.
+- Treat `requirements.txt` as the source of truth for supported dependency ranges.
+
 ---
 
 ## 1. Architecture Overview
