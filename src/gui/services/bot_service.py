@@ -738,6 +738,40 @@ class BotService:
             self._add_event(f"❌ Approval failed: {str(e)}", level="error")
             return False
 
+    def retry_proposal(self, proposal_id: str) -> bool:
+        """Re-execute a previously failed proposal (after margin deposit, etc.)."""
+        if not self.bot_engine or not self.bot_engine.is_running:
+            self.logger.error("Bot engine not running - cannot retry proposal")
+            return False
+
+        try:
+            success = self.bot_engine.retry_proposal(proposal_id)
+            if success:
+                self._add_event(f"🔄 Proposal {proposal_id[:8]} retrying - re-executing trade")
+                self.logger.info(f"Proposal retry scheduled: {proposal_id}")
+            return success
+        except Exception as e:
+            self.logger.error(f"Failed to retry proposal: {e}")
+            self._add_event(f"❌ Retry failed: {str(e)}", level="error")
+            return False
+
+    def dismiss_proposal(self, proposal_id: str) -> bool:
+        """Remove a failed proposal from the UI without retrying."""
+        if not self.bot_engine or not self.bot_engine.is_running:
+            self.logger.error("Bot engine not running - cannot dismiss proposal")
+            return False
+
+        try:
+            success = self.bot_engine.dismiss_proposal(proposal_id)
+            if success:
+                self._add_event(f"🗑 Proposal {proposal_id[:8]} dismissed")
+                self.logger.info(f"Proposal dismissed: {proposal_id}")
+            return success
+        except Exception as e:
+            self.logger.error(f"Failed to dismiss proposal: {e}")
+            self._add_event(f"❌ Dismiss failed: {str(e)}", level="error")
+            return False
+
     def reject_proposal(self, proposal_id: str, reason: str = "User rejected") -> bool:
         """
         Reject a trade proposal.

@@ -46,6 +46,17 @@ from src.backend.options_intel.snapshot import OptionsContext
 logger = logging.getLogger(__name__)
 
 
+def _decision_size(decision: TradeDecision) -> float:
+    """Derive the BTC-contract size implied by a Thalex decision.
+
+    Priority: top-level ``contracts`` → ``target_gamma_btc`` → sum of
+    leg contracts. Multi-leg strategies (iron condor, credit spreads)
+    carry size on the legs; single-leg strategies carry it at the top.
+    """
+    legs_total = sum(float(leg.contracts or 0.0) for leg in decision.legs)
+    return float(decision.contracts or decision.target_gamma_btc or legs_total or 0.0)
+
+
 # ---------------------------------------------------------------------------
 # System prompt — assembled from named sections
 # ---------------------------------------------------------------------------
@@ -328,9 +339,19 @@ class OptionsAgent:
         parsed: list[TradeDecision] = []
         for raw in raw_decisions:
             try:
-                parsed.append(parse_decision(raw))
+                decision = parse_decision(raw)
             except DecisionParseError as exc:
                 logger.warning("OptionsAgent: dropping malformed decision: %s — %s", exc, raw)
+                continue
+            if decision.action in ("buy", "sell") and _decision_size(decision) <= 0:
+                logger.warning(
+                    "OptionsAgent: dropping sizeless %s decision (strategy=%s asset=%s): "
+                    "contracts=%r target_gamma_btc=%r legs=%d — %s",
+                    decision.action, decision.strategy, decision.asset,
+                    decision.contracts, decision.target_gamma_btc, len(decision.legs), raw,
+                )
+                continue
+            parsed.append(decision)
         return parsed
 
     @staticmethod

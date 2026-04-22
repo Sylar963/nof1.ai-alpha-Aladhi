@@ -96,13 +96,19 @@ def create_recommendations(bot_service: BotService, state_manager: StateManager)
         risk_reward = proposal.get('risk_reward')
         proposal_id = proposal.get('id', '')
         timestamp = proposal.get('timestamp', '')
-        
+        status = proposal.get('status', 'pending')
+        execution_error = proposal.get('execution_error')
+
         # Calculate potential gain/loss percentages
         potential_gain = proposal.get('potential_gain')
         potential_loss = proposal.get('potential_loss')
-        
-        # Determine card color based on action
-        if action == 'buy':
+
+        # Determine card color based on action (dim when failed)
+        if status == 'failed':
+            gradient = 'from-orange-950 to-gray-950'
+            badge_color = 'bg-orange-700'
+            action_icon = '⚠'
+        elif action == 'buy':
             gradient = 'from-green-900 to-green-950'
             badge_color = 'bg-green-600'
             action_icon = '📈'
@@ -185,18 +191,38 @@ def create_recommendations(bot_service: BotService, state_manager: StateManager)
             
             # Timestamp
             ui.label(f'Created: {timestamp[:19] if timestamp else "N/A"}').classes('text-xs text-gray-500 mb-4')
-            
-            # Action buttons
+
+            # Failure banner — shown only when execution failed; reason is what the engine raised.
+            if status == 'failed' and execution_error:
+                with ui.card().classes('w-full p-3 mb-4 bg-red-900 bg-opacity-40 border-l-4 border-red-500'):
+                    with ui.row().classes('items-center gap-3'):
+                        ui.icon('error', size='24px').classes('text-red-300')
+                        with ui.column().classes('gap-1'):
+                            ui.label('Execution failed').classes('text-sm font-bold text-red-200')
+                            ui.label(execution_error).classes('text-xs text-red-100 whitespace-pre-wrap')
+
+            # Action buttons — differ by status
             with ui.row().classes('gap-3 w-full justify-end'):
-                ui.button(
-                    '❌ Reject',
-                    on_click=lambda pid=proposal_id: reject_proposal(pid)
-                ).classes('bg-red-600 hover:bg-red-700 text-white px-6 py-3 text-lg')
-                
-                ui.button(
-                    '✅ Execute Trade',
-                    on_click=lambda pid=proposal_id: approve_proposal(pid)
-                ).classes('bg-green-600 hover:bg-green-700 text-white px-8 py-3 text-lg font-bold')
+                if status == 'failed':
+                    ui.button(
+                        '🗑 Dismiss',
+                        on_click=lambda pid=proposal_id: dismiss_proposal(pid)
+                    ).classes('bg-gray-600 hover:bg-gray-700 text-white px-6 py-3 text-lg')
+
+                    ui.button(
+                        '🔄 Retry',
+                        on_click=lambda pid=proposal_id: retry_proposal(pid)
+                    ).classes('bg-blue-600 hover:bg-blue-700 text-white px-8 py-3 text-lg font-bold')
+                else:
+                    ui.button(
+                        '❌ Reject',
+                        on_click=lambda pid=proposal_id: reject_proposal(pid)
+                    ).classes('bg-red-600 hover:bg-red-700 text-white px-6 py-3 text-lg')
+
+                    ui.button(
+                        '✅ Execute Trade',
+                        on_click=lambda pid=proposal_id: approve_proposal(pid)
+                    ).classes('bg-green-600 hover:bg-green-700 text-white px-8 py-3 text-lg font-bold')
     
     async def approve_proposal(proposal_id: str):
         """Approve and execute a proposal"""
@@ -224,6 +250,36 @@ def create_recommendations(bot_service: BotService, state_manager: StateManager)
                 await update_proposals()
             else:
                 ui.notify('Failed to reject proposal', type='negative')
+        except Exception as e:
+            if _ui_ok():
+                ui.notify(f'Error: {str(e)}', type='negative')
+
+    async def retry_proposal(proposal_id: str):
+        """Re-execute a previously failed proposal."""
+        if not _ui_ok():
+            return
+        try:
+            success = bot_service.retry_proposal(proposal_id)
+            if success:
+                ui.notify('🔄 Retrying trade...', type='info', position='top')
+                await update_proposals()
+            else:
+                ui.notify('Retry already in progress or proposal not retryable', type='warning')
+        except Exception as e:
+            if _ui_ok():
+                ui.notify(f'Error: {str(e)}', type='negative')
+
+    async def dismiss_proposal(proposal_id: str):
+        """Remove a failed proposal from the list without retrying."""
+        if not _ui_ok():
+            return
+        try:
+            success = bot_service.dismiss_proposal(proposal_id)
+            if success:
+                ui.notify('🗑 Failed proposal dismissed', type='warning', position='top')
+                await update_proposals()
+            else:
+                ui.notify('Failed to dismiss proposal', type='negative')
         except Exception as e:
             if _ui_ok():
                 ui.notify(f'Error: {str(e)}', type='negative')

@@ -81,7 +81,21 @@ class TradeProposal:
         self.status = "failed"
         self.executed_at = datetime.now(UTC)
         self.execution_error = error
-    
+
+    def reset_for_retry(self) -> bool:
+        """Transition failed → pending so the proposal can be re-executed.
+
+        Returns False if the proposal is not in a retryable state (guards
+        against double-clicks and retrying non-failed proposals).
+        Preserves ``execution_error`` so the UI can still show the prior
+        failure reason until the retry produces a new outcome.
+        """
+        if self.status != "failed":
+            return False
+        self.status = "pending"
+        self.executed_at = None
+        return True
+
     def to_dict(self) -> dict:
         """Convert to dictionary for serialization"""
         return {
@@ -111,6 +125,16 @@ class TradeProposal:
     def is_pending(self) -> bool:
         """Check if proposal is pending approval"""
         return self.status == "pending"
+
+    @property
+    def is_retryable(self) -> bool:
+        """Check if proposal is in a state the user can retry"""
+        return self.status == "failed"
+
+    @property
+    def is_visible_to_ui(self) -> bool:
+        """Proposals the UI should render (awaiting action or awaiting retry)."""
+        return self.status in ("pending", "failed")
     
     @property
     def potential_gain(self) -> Optional[float]:
