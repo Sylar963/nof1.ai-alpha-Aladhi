@@ -99,6 +99,8 @@ class TradeDecision:
     vol_view: Optional[str] = None  # short_vol|long_vol|neutral
     target_gamma_btc: Optional[float] = None  # for multi-tenor auto-distribute sizing
 
+    risk_flags: list[str] = field(default_factory=list)
+
     def to_option_intent(self) -> Optional[OptionIntent]:
         """Build an OptionIntent for single-leg options decisions, else None."""
         if self.venue != "thalex" or self.strategy is None:
@@ -234,6 +236,16 @@ def parse_decision(payload: dict) -> TradeDecision:
             f"entry_kind must be one of {VALID_ENTRY_KINDS} or null, got {entry_kind!r}"
         )
 
+    raw_flags = payload.get("risk_flags")
+    if raw_flags is None:
+        risk_flags: list[str] = []
+    elif isinstance(raw_flags, list):
+        risk_flags = [str(f) for f in raw_flags if f]
+    else:
+        raise DecisionParseError(
+            f"risk_flags must be a list of strings, got {type(raw_flags).__name__}"
+        )
+
     return TradeDecision(
         asset=asset,
         action=action,
@@ -254,4 +266,5 @@ def parse_decision(payload: dict) -> TradeDecision:
         entry_kind=entry_kind,
         vol_view=vol_view,
         target_gamma_btc=_optional_float(payload.get("target_gamma_btc")),
+        risk_flags=risk_flags,
     )

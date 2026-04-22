@@ -155,23 +155,26 @@ class TradingAgent:
 
         def _post(payload):
             """Send a POST request to OpenRouter, logging request and response metadata."""
-            # Log the full request payload for debugging
             logging.info("Sending request to OpenRouter (model: %s)", payload.get('model'))
-            with open("llm_requests.log", "a", encoding="utf-8") as f:
-                f.write(f"\n\n=== {datetime.now()} ===\n")
-                f.write(f"Model: {payload.get('model')}\n")
-                f.write(f"Headers: {json.dumps({k: v for k, v in headers.items() if k != 'Authorization'})}\n")
-                f.write(f"Payload:\n{json.dumps(payload, indent=2)}\n")
-            # Tightened from 60s → 45s. The call runs inside asyncio.to_thread
-            # at the bot_engine call sites, so a hang would tie up a worker
-            # thread (uncancellable from the outer loop) until this fires.
-            # 45s is still well above OpenRouter p99 latency.
-            resp = requests.post(self.base_url, headers=headers, json=payload, timeout=45)
-            logging.info("Received response from OpenRouter (status: %s)", resp.status_code)
-            if resp.status_code != 200:
-                logging.error("OpenRouter error: %s - %s", resp.status_code, resp.text)
-                with open("llm_requests.log", "a", encoding="utf-8") as f:
-                    f.write(f"ERROR Response: {resp.status_code} - {resp.text}\n")
+            # Open the log once for both the request block and (optionally)
+            # the error block — the previous double-``open()`` pattern meant
+            # up to 2 file opens per _post call, i.e. up to 12 per 5-minute
+            # perps cycle once retries are counted.
+            with open("llm_requests.log", "a", encoding="utf-8") as log_f:
+                log_f.write(f"\n\n=== {datetime.now()} ===\n")
+                log_f.write(f"Model: {payload.get('model')}\n")
+                log_f.write(f"Headers: {json.dumps({k: v for k, v in headers.items() if k != 'Authorization'})}\n")
+                log_f.write(f"Payload:\n{json.dumps(payload, indent=2)}\n")
+                # Tightened from 60s → 45s. The call runs inside
+                # asyncio.to_thread at the bot_engine call sites, so a hang
+                # would tie up a worker thread (uncancellable from the outer
+                # loop) until this fires. 45s is still well above
+                # OpenRouter p99 latency.
+                resp = requests.post(self.base_url, headers=headers, json=payload, timeout=45)
+                logging.info("Received response from OpenRouter (status: %s)", resp.status_code)
+                if resp.status_code != 200:
+                    logging.error("OpenRouter error: %s - %s", resp.status_code, resp.text)
+                    log_f.write(f"ERROR Response: {resp.status_code} - {resp.text}\n")
             resp.raise_for_status()
             return resp.json()
 

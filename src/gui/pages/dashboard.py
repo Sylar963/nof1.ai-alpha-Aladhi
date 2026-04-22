@@ -697,10 +697,17 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
                 equity_chart.figure.data[0].y = []
                 equity_chart.update()
 
-            # Update asset allocation chart
+            # Update asset allocation chart — mark-to-market, falling back to
+            # entry price when the live quote isn't populated yet. Using
+            # ``entry_price`` alone drifted from reality as soon as the
+            # market moved (a long opened at 60k reads a third too low when
+            # spot is 90k).
             if positions:
                 labels = [p['symbol'] for p in positions]
-                values = [abs(p['quantity'] * p['entry_price']) for p in positions]
+                values = [
+                    abs(p['quantity'] * (p.get('current_price') or p['entry_price']))
+                    for p in positions
+                ]
 
                 allocation_chart.figure.data[0].labels = labels
                 allocation_chart.figure.data[0].values = values

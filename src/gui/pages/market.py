@@ -2,6 +2,7 @@
 Market Data Page - Live market data and technical indicators
 """
 
+import logging
 from datetime import datetime, timezone
 
 import plotly.graph_objects as go
@@ -9,6 +10,9 @@ from nicegui import ui
 from src.gui.services.bot_service import BotService
 from src.gui.services.state_manager import StateManager
 from src.gui.services.ui_utils import is_ui_alive
+
+
+logger = logging.getLogger(__name__)
 
 
 def _ms_to_dt(ms_values: list) -> list:
@@ -717,7 +721,7 @@ def create_market(bot_service: BotService, state_manager: StateManager):
 
     # Auto-refresh every 5 seconds
     ui.timer(5.0, update_market_data)
-    ui.timer(0.1, _bootstrap_market_snapshot, once=True)
+    ui.timer(0.5, _bootstrap_market_snapshot, once=True)
 
     # Refresh on asset/interval change
     async def _handle_market_selection_change(_=None):
@@ -727,8 +731,13 @@ def create_market(bot_service: BotService, state_manager: StateManager):
         selected_interval = str(interval_select.value or '5m')
         try:
             await bot_service.refresh_chart_candles(selected_asset, selected_interval)
-        except Exception:  # pylint: disable=broad-except
-            pass
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning(
+                "refresh_chart_candles(%s, %s) failed: %s",
+                selected_asset, selected_interval, exc,
+            )
+            if _ui_ok():
+                ui.notify(f'Chart refresh failed: {exc}', type='warning')
         if not _ui_ok():
             return
         await update_market_data()

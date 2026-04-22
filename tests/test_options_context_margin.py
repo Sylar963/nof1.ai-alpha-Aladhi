@@ -26,8 +26,8 @@ def test_options_context_fields_default_zero():
         expected_move_pct_by_tenor={},
         vol_regime="neutral",
         vol_regime_confidence="low",
-        realized_iv_ratio_15d=1.0,
-        straddle_test_15d={},
+        realized_iv_ratio_30d=1.0,
+        straddle_test_30d={},
     )
     assert ctx.hyperliquid_free_margin == 0.0
     assert ctx.hyperliquid_max_leverage == 1
@@ -48,8 +48,8 @@ def test_options_context_serializes_new_fields():
         expected_move_pct_by_tenor={},
         vol_regime="rich",
         vol_regime_confidence="high",
-        realized_iv_ratio_15d=0.7,
-        straddle_test_15d={},
+        realized_iv_ratio_30d=0.7,
+        straddle_test_30d={},
         hyperliquid_free_margin=1234.56,
         hyperliquid_max_leverage=40,
         max_hedge_notional=47000.0,

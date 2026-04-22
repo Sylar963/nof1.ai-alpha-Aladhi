@@ -67,7 +67,7 @@ def thalex_chain():
     expiry_15 = _utc_ts(2026, 4, 25)
     expiry_30 = _utc_ts(2026, 5, 10)
     return [
-        # 15-day tenor
+        # 30-day tenor
         {"instrument_name": "BTC-25APR26-60000-C", "type": "option", "underlying": "BTCUSD",
          "option_type": "call", "strike": 60000, "mark_iv": 0.65, "mark_price": 2500,
          "expiry_timestamp": expiry_15, "delta": 0.5},
@@ -139,9 +139,9 @@ async def test_build_persists_straddle_anchor_to_iv_history(thalex_chain, deribi
         today=_TEST_TODAY,
     )
 
-    rows = store.read_recent(tenor_days=15, limit=5)
+    rows = store.read_recent(tenor_days=30, limit=5)
     assert len(rows) == 1
-    assert rows[0].tenor_days == 15
+    assert rows[0].tenor_days == 30
     assert rows[0].lower_strike < 60000 < rows[0].upper_strike
 
 
@@ -292,7 +292,9 @@ async def test_build_aggregates_portfolio_greeks_from_thalex_positions(thalex_ch
 
 @pytest.mark.asyncio
 async def test_build_tolerates_empty_thalex_chain(deribit_chain, tmp_path):
-    """No instruments → builder must return a sensible empty-ish context, not raise."""
+    """No Thalex instruments → builder must still produce a surface from
+    Deribit alone (the cross-venue aggregation is what the LLM relies on
+    when Thalex metadata is stale or the ticker fan-out fails)."""
     thalex = FakeThalexAdapter(instruments_cache=[], tickers={})
     deribit = FakeDeribitClient(summaries=deribit_chain)
     store = IVHistoryStore(db_path=str(tmp_path / "iv.db"))
@@ -305,6 +307,12 @@ async def test_build_tolerates_empty_thalex_chain(deribit_chain, tmp_path):
         today=_TEST_TODAY,
     )
 
-    assert ctx.atm_iv_by_tenor == {}
+    # Deribit fixtures carry 15d + 30d tenors; the merged surface should
+    # surface them to the LLM since that's the only vol data available.
+    assert set(ctx.atm_iv_by_tenor.keys()) == {15, 30}
+    # Without any Thalex chain there is nothing to cross-match, so the
+    # mispricing list stays empty — that's still the correct behavior.
     assert ctx.top_mispricings_vs_deribit == []
-    assert ctx.vol_regime == "unknown"
+    # Coverage map provenance must reflect that tenors came from Deribit.
+    assert ctx.vol_data_coverage["sources"]["thalex_tenors"] == []
+    assert set(ctx.vol_data_coverage["sources"]["deribit_tenors"]) == {15, 30}

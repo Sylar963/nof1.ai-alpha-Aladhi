@@ -123,6 +123,14 @@ CONFIG = {
     "options_decision_interval_seconds": _get_int(
         "OPTIONS_DECISION_INTERVAL_SECONDS", 10800
     ),
+    # Safety buffer multiplier applied to the live spot delta notional when
+    # checking HL free margin before opening a delta-hedged options strategy.
+    # required_margin = contracts x delta_per_contract x spot x buffer. A
+    # value of 1.25 means the bot refuses to open the position unless HL has
+    # 25% more free margin than the bare hedge needs.
+    "options_hedge_margin_buffer_pct": float(
+        _get_env("OPTIONS_HEDGE_MARGIN_BUFFER_PCT", "1.25") or 1.25
+    ),
     # BTC delta drift (signed) before the perp hedge re-trades. Threshold-only —
     # the loop polls for free, only fires a perp order when |drift| > this.
     "thalex_delta_threshold": _require_positive(

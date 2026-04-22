@@ -43,8 +43,8 @@ class OptionsContext:
     # Regime
     vol_regime: str
     vol_regime_confidence: str
-    realized_iv_ratio_15d: float
-    straddle_test_15d: dict
+    realized_iv_ratio_30d: float
+    straddle_test_30d: dict
 
     # Cross-venue
     top_mispricings_vs_deribit: list = field(default_factory=list)
@@ -75,6 +75,12 @@ class OptionsContext:
     # unaffordable trade every 3 hours.
     recent_options_skips: list = field(default_factory=list)
 
+    # Explicit coverage map for vol/greek data. Lets the LLM tell "the tenor
+    # isn't on the chain" apart from "I forgot to look" — both otherwise
+    # manifest as a missing dict key. surface_stale=True is the only
+    # authoritative "vol data unavailable" signal.
+    vol_data_coverage: dict = field(default_factory=dict)
+
     # ------------------------------------------------------------------
     # Serialization
     # ------------------------------------------------------------------
@@ -93,8 +99,8 @@ class OptionsContext:
             "expected_move_pct_by_tenor": self.expected_move_pct_by_tenor,
             "vol_regime": self.vol_regime,
             "vol_regime_confidence": self.vol_regime_confidence,
-            "realized_iv_ratio_15d": self.realized_iv_ratio_15d,
-            "straddle_test_15d": self.straddle_test_15d,
+            "realized_iv_ratio_30d": self.realized_iv_ratio_30d,
+            "straddle_test_30d": self.straddle_test_30d,
             "top_mispricings_vs_deribit": self.top_mispricings_vs_deribit[:_MAX_MISPRICINGS],
             "open_positions": self.open_positions[:self.max_open_positions],
             "portfolio_greeks": self.portfolio_greeks,
@@ -107,6 +113,7 @@ class OptionsContext:
             "max_hedge_notional": self.max_hedge_notional,
             "recent_options_trades": self.recent_options_trades[:5],
             "recent_options_skips": self.recent_options_skips[:5],
+            "vol_data_coverage": self.vol_data_coverage,
         }
 
     def to_json(self) -> str:

@@ -35,22 +35,23 @@ class MispricingScanReport:
 
 
 def _normalize_expiry_seconds(record: dict) -> Optional[int]:
-    """Extract expiry as a UTC timestamp in *seconds*.
+    """Extract expiry as a UTC timestamp in *seconds*, rounded to the day.
 
-    Thalex publishes ``expiry_timestamp`` in seconds; Deribit publishes
-    ``expiration_timestamp`` in milliseconds. We normalize both to seconds
-    and round to the nearest day so off-by-an-hour intra-day differences
-    don't break exact-match alignment.
+    Field precedence: ``expiry_timestamp`` (Thalex, seconds) → then
+    ``expiration_timestamp`` which can be either Thalex seconds OR Deribit
+    milliseconds — we distinguish by magnitude (>1e11 ⇒ ms). Rounding to the
+    day kills intra-day differences that would otherwise block alignment.
     """
     raw = record.get("expiry_timestamp")
     if raw is None:
         raw = record.get("expiration_timestamp")
-        if isinstance(raw, (int, float)):
-            raw = int(raw / 1000)
     if not isinstance(raw, (int, float)):
         return None
+    ts = float(raw)
+    if ts > 1e11:
+        ts = ts / 1000.0
     try:
-        as_date = datetime.fromtimestamp(int(raw), tz=timezone.utc).date()
+        as_date = datetime.fromtimestamp(int(ts), tz=timezone.utc).date()
         return int(datetime(as_date.year, as_date.month, as_date.day, tzinfo=timezone.utc).timestamp())
     except (OverflowError, OSError, ValueError):
         return None

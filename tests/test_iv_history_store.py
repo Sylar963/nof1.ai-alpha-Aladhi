@@ -56,7 +56,7 @@ def test_lookback_at_target_age_finds_closest_row(store):
 
     found = store.lookback(tenor_days=15, target_age_days=15, now=now)
     assert found is not None
-    # The 15d-2h row is closest to a 15-day lookback.
+    # The 15d-2h row is closest to a 30-day lookback.
     assert found.atm_iv == pytest.approx(0.55)
 
 

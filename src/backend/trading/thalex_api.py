@@ -122,6 +122,10 @@ def _extract_greeks(payload: Any) -> dict:
     Tries each path in :data:`_GREEKS_FIELD_PATHS` and merges any keys it
     finds. Numeric coercion is best-effort; values that don't parse as floats
     are silently dropped so a malformed sub-field doesn't poison the rest.
+
+    Thalex's public ticker publishes IV under the key ``iv`` (decimal);
+    Deribit and our own cached snapshots use ``mark_iv``. We accept both
+    and normalize to ``mark_iv`` so downstream callers see one name.
     """
     if not isinstance(payload, dict):
         return {}
@@ -145,6 +149,14 @@ def _extract_greeks(payload: Any) -> dict:
                 found[key] = float(value)
             except (TypeError, ValueError):
                 continue
+        if "mark_iv" not in found:
+            iv_value = node.get("iv")
+            if iv_value is not None:
+                try:
+                    iv_f = float(iv_value)
+                    found["mark_iv"] = iv_f / 100.0 if iv_f > 2.0 else iv_f
+                except (TypeError, ValueError):
+                    pass
     return found
 
 
@@ -397,14 +409,28 @@ class ThalexAPI(ExchangeAdapter):
     async def _receiver_loop(self) -> None:
         """Forever loop pulling messages from the Thalex WS and resolving futures."""
         assert self._client is not None
+        # Consecutive decode-failure counter. Without it a socket that starts
+        # delivering garbage (version skew, proxy injection, truncated frames)
+        # tight-loops on ``continue`` — the server keeps pushing, ``receive``
+        # returns fast, the CPU burns. Reset on any successful decode.
+        decode_fails = 0
         try:
             while True:
                 raw = await self._client.receive()
                 try:
                     message = json.loads(raw) if isinstance(raw, str) else raw
                 except (TypeError, json.JSONDecodeError):
-                    logger.warning("Thalex receiver: undecodable message: %r", raw)
+                    decode_fails += 1
+                    logger.warning(
+                        "Thalex receiver: undecodable message (#%d): %r",
+                        decode_fails, raw,
+                    )
+                    if decode_fails >= 5:
+                        await asyncio.sleep(
+                            min(0.1 * (2 ** (decode_fails - 5)), 2.0)
+                        )
                     continue
+                decode_fails = 0
                 self._dispatch(message)
         except asyncio.CancelledError:
             raise
@@ -929,6 +955,16 @@ class ThalexAPI(ExchangeAdapter):
         if parsed:
             self._greeks_cache[instrument_name] = (time.monotonic(), parsed)
         return parsed
+
+    async def get_ticker_snapshot(self, instrument_name: str) -> dict:
+        """Return the raw Thalex ticker dict for an instrument.
+
+        Unlike :meth:`get_greeks` this does NOT pass through the greeks
+        extractor — callers (chain enricher) need the full payload so they
+        can pull ``iv``, ``mark_price``, ``delta``, ``forward``, etc.
+        """
+        result = await self._request(self._client.ticker, instrument_name=instrument_name)
+        return result if isinstance(result, dict) else {}
 
     # ------------------------------------------------------------------
     # Helpers
