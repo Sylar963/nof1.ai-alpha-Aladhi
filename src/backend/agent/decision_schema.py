@@ -186,6 +186,21 @@ def parse_decision(payload: dict) -> TradeDecision:
             f"strategy must be one of {VALID_STRATEGIES} or null, got {strategy!r}"
         )
 
+    # Options strategies can only live on the Thalex venue — enforce the
+    # strategy ↔ venue contract at parse time so a cross-contaminated perps
+    # decision can't slip through routing. When strategy is set but venue is
+    # missing, coerce to thalex (forgiving the common LLM omission). When
+    # venue is explicitly hyperliquid, reject — that's a prompt bug we want
+    # to surface, not paper over.
+    if strategy is not None:
+        raw_venue = payload.get("venue")
+        if raw_venue is None:
+            venue = "thalex"
+        elif str(raw_venue).lower() != "thalex":
+            raise DecisionParseError(
+                f"options strategy {strategy!r} requires venue='thalex', got {raw_venue!r}"
+            )
+
     underlying = payload.get("underlying")
     if strategy is not None and not underlying:
         raise DecisionParseError("strategy decisions require an 'underlying' field")

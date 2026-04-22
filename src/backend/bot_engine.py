@@ -6,9 +6,11 @@ Refactored from ai-trading-agent/src/main.py
 import asyncio
 import json
 import logging
+import os
+import tempfile
 from collections import deque, OrderedDict
 from dataclasses import dataclass, field
-from datetime import datetime, UTC
+from datetime import datetime, timedelta, UTC
 from pathlib import Path
 from typing import Dict, List, Optional, Callable, Any
 
@@ -27,6 +29,19 @@ from src.backend.trading.options_scheduler import (
 )
 from src.backend.trading.options_strategies import DeltaHedger, OptionsExecutor
 from src.backend.utils.prompt_utils import json_default
+
+
+# Failed proposals linger in pending_proposals so the UI can offer Retry.
+# After this many seconds the engine drops them so state doesn't accumulate
+# indefinitely and stale market context isn't retried against fresh prices.
+FAILED_PROPOSAL_TTL_SECONDS = int(CONFIG.get("FAILED_PROPOSAL_TTL_SECONDS") or 30 * 60)
+
+# Circuit breaker: auto-pauses trading after repeated execution failures or a
+# session drawdown. Resets on manual resume. These are guardrails for the
+# autonomous loop, distinct from the hard bot-stop at MAX_CONSECUTIVE_ERRORS
+# (which trips on any cycle-level exception, e.g. LLM/RPC failures).
+CIRCUIT_BREAKER_CONSECUTIVE_FAILS = int(CONFIG.get("CIRCUIT_BREAKER_CONSECUTIVE_FAILS") or 3)
+CIRCUIT_BREAKER_DRAWDOWN_PCT = float(CONFIG.get("CIRCUIT_BREAKER_DRAWDOWN_PCT") or 5.0)
 
 
 @dataclass
@@ -53,6 +68,12 @@ class BotState:
     last_update: str = ""
     error: Optional[str] = None
     invocation_count: int = 0
+    # Circuit-breaker / kill-switch state surfaced to the UI
+    is_paused: bool = False
+    pause_reason: Optional[str] = None
+    peak_account_value: float = 0.0
+    drawdown_pct: float = 0.0
+    execution_failure_streak: int = 0
 
 
 class TradingBotEngine:
@@ -188,6 +209,18 @@ class TradingBotEngine:
         self.initial_account_value: Optional[float] = None
         self._last_thalex_execution: Dict[str, Any] = {}
         self.price_history: Dict[str, deque] = {asset: deque(maxlen=60) for asset in assets}
+        # Per-asset max leverage rarely changes between cycles; cache to avoid
+        # re-querying the venue meta on every decision + preflight call.
+        self._max_leverage_cache: Dict[str, int] = {}
+
+        # Circuit breaker / kill switch. ``is_paused`` skips the trading cycle
+        # (market data + LLM + execution) until the user resumes via the UI.
+        # The streak counter is incremented on trade-execution failures only —
+        # not on decision-level errors (which have their own handling).
+        self.is_paused: bool = False
+        self.pause_reason: Optional[str] = None
+        self.peak_account_value: float = 0.0
+        self._execution_failure_streak: int = 0
 
         # Manual trading mode
         self.trading_mode = CONFIG.get("trading_mode", "auto").lower()
@@ -219,39 +252,119 @@ class TradingBotEngine:
             self.logger.warning("Failed to load active_trades.json: %s", exc)
 
     def _save_active_trades(self) -> None:
-        """Persist ``self.active_trades`` to disk so it survives restarts."""
+        """Persist ``self.active_trades`` to disk so it survives restarts.
+
+        Writes to a temp file in the same directory, fsyncs, then atomically
+        renames into place. This avoids the zero-length-file hazard where a
+        crash mid-write would leave ``active_trades.json`` truncated and
+        wipe the bot's memory of open positions on the next startup.
+        """
         try:
-            with open(self.active_trades_path, "w", encoding="utf-8") as f:
-                json.dump(self.active_trades, f, default=str)
+            path = self.active_trades_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=path.name + ".", suffix=".tmp", dir=str(path.parent),
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(self.active_trades, f, default=str)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_name, path)
+            except Exception:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+                raise
         except Exception as exc:  # pylint: disable=broad-except
             self.logger.warning("Failed to save active_trades.json: %s", exc)
+
+    async def _get_max_leverage_cached(self, asset: str) -> int:
+        """Return cached max leverage for ``asset``. Falls back to 1 on failure."""
+        if asset in self._max_leverage_cache:
+            return self._max_leverage_cache[asset]
+        try:
+            lev = await self.hyperliquid.get_max_leverage(asset)
+            self._max_leverage_cache[asset] = max(int(lev or 1), 1)
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.warning("get_max_leverage(%s) failed, defaulting to 1: %s", asset, exc)
+            self._max_leverage_cache[asset] = 1
+        return self._max_leverage_cache[asset]
+
+    async def _get_buying_power_snapshot(self) -> Dict[str, Any]:
+        """Build the buying-power block the LLM needs to size trades responsibly.
+
+        Returns withdrawable / free_margin / account_value plus per-asset max
+        leverage and the derived cap ``max_new_notional_by_asset`` that mirrors
+        ``_hl_margin_preflight`` (available × leverage / 1.05 buffer). If the
+        collateral lookup fails, returns a conservative all-zeros dict so the
+        LLM sees "no buying power" rather than a missing field.
+        """
+        if not self.hyperliquid:
+            return {}
+        try:
+            info = await self.hyperliquid.get_free_margin_info()
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.warning("buying_power snapshot: get_free_margin_info failed: %s", exc)
+            info = {"withdrawable": 0.0, "free_margin": 0.0, "account_value": 0.0, "total_margin_used": 0.0}
+
+        withdrawable = float(info.get("withdrawable") or 0.0)
+        free_margin = float(info.get("free_margin") or 0.0)
+        # Mirror preflight: pick the conservative positive value as "what we can open with".
+        candidates = [v for v in (withdrawable, free_margin) if v and v > 0]
+        available = min(candidates) if candidates else 0.0
+
+        max_leverage_by_asset: Dict[str, int] = {}
+        max_new_notional_by_asset: Dict[str, float] = {}
+        for asset in self.assets:
+            lev = await self._get_max_leverage_cached(asset)
+            max_leverage_by_asset[asset] = lev
+            # available × leverage is the gross notional cap; /1.05 matches the
+            # 5% buffer preflight demands for slippage + fees, so any number
+            # the LLM picks at-or-below this will pass the guard.
+            max_new_notional_by_asset[asset] = round((available * lev) / 1.05, 2) if available > 0 else 0.0
+
+        return {
+            "withdrawable": round(withdrawable, 2),
+            "free_margin": round(free_margin, 2),
+            "account_value": round(float(info.get("account_value") or 0.0), 2),
+            "total_margin_used": round(float(info.get("total_margin_used") or 0.0), 2),
+            "max_leverage_by_asset": max_leverage_by_asset,
+            "max_new_notional_by_asset": max_new_notional_by_asset,
+        }
 
     async def _hl_margin_preflight(self, asset: str, notional_usd: float) -> None:
         """Raise :class:`RuntimeError` if Hyperliquid can't cover the notional.
 
         Cross-margin cost of a perp is roughly ``notional / maxLeverage``. We
         add a 5% buffer for entry slippage + taker fees + any variation
-        between quote-time and fill-time. The check fails OPEN on user_state
-        errors (a flaky /user_state call shouldn't block trading — the post-
-        submit response check will still catch a true rejection), but fails
-        CLOSED when the math says we're under water, so the bot doesn't
-        silently record a phantom trade that the venue would reject.
+        between quote-time and fill-time.
+
+        Fail-open vs fail-closed policy:
+        - ``get_free_margin_info`` failures → propagate (fail CLOSED). We
+          have no collateral number so refusing the trade is the only safe
+          move — the alternative (skipping the check) would re-open the
+          silent-failure bug this preflight exists to close.
+        - ``get_max_leverage`` failures → fail OPEN. Max leverage is a
+          nice-to-have sizing hint; falling back to a conservative 1× would
+          reject many legitimate trades on a transient meta hiccup. Treat
+          it as unbounded (``inf``) so the leverage divisor vanishes and the
+          check only trips on truly missing collateral.
         """
         if notional_usd <= 0 or not self.hyperliquid:
             return
-        try:
-            info = await self.hyperliquid.get_free_margin_info()
-        except Exception as exc:  # pylint: disable=broad-except
-            self.logger.warning(
-                "Margin preflight: get_free_margin_info failed for %s — skipping check: %s",
-                asset, exc,
-            )
-            return
+        info = await self.hyperliquid.get_free_margin_info()
         try:
             max_leverage = await self.hyperliquid.get_max_leverage(asset)
-        except Exception:  # pylint: disable=broad-except
-            max_leverage = 1
-        required = (notional_usd / max(max_leverage, 1)) * 1.05
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.warning(
+                "Margin preflight: get_max_leverage(%s) failed, treating as unbounded: %s",
+                asset, exc,
+            )
+            max_leverage = float("inf")
+        effective_leverage = max_leverage if max_leverage and max_leverage > 0 else 1
+        required = (notional_usd / effective_leverage) * 1.05
         # Use the conservative of withdrawable vs. free_margin — both model
         # "what can I open with right now" but the venue's own ``withdrawable``
         # is the ground truth whenever it's populated.
@@ -282,11 +395,25 @@ class TradingBotEngine:
             raise RuntimeError(f"Hyperliquid {context} rejected: {reason}")
 
     def _create_thalex_proposal(self, decision_payload: Dict) -> TradeProposal:
-        """Build a manual-approval proposal for a Thalex decision payload."""
+        """Build a manual-approval proposal for a Thalex decision payload.
+
+        Size is derived in priority order: top-level ``contracts`` →
+        ``target_gamma_btc`` → sum of ``legs[].contracts`` (multi-leg
+        strategies carry their size on the legs, not at the top level).
+        """
         decision = parse_decision(decision_payload)
-        size = float(decision.contracts or decision.target_gamma_btc or 0.0)
+        legs_total = sum(float(leg.contracts or 0.0) for leg in decision.legs)
+        size = float(
+            decision.contracts
+            or decision.target_gamma_btc
+            or legs_total
+            or 0.0
+        )
         if size <= 0:
-            raise ValueError(f"Thalex proposal has zero size: contracts={decision.contracts}, target_gamma_btc={decision.target_gamma_btc}")
+            raise ValueError(
+                f"Thalex proposal has zero size: contracts={decision.contracts}, "
+                f"target_gamma_btc={decision.target_gamma_btc}, legs_total={legs_total}"
+            )
         return TradeProposal(
             venue="thalex",
             asset=decision.asset,
@@ -362,28 +489,92 @@ class TradingBotEngine:
         # ``margin_preflight`` and ``get_current_price``.
         margin_preflight = getattr(self.thalex, "margin_preflight", None)
         hl = getattr(self, "hyperliquid", None)
+        # Compute once up-front — both the Thalex cash-collateral preflight
+        # below and the Hyperliquid hedge-leg preflight need this number.
+        try:
+            contracts_est = float(
+                decision.contracts
+                or decision.target_gamma_btc
+                or sum((getattr(leg, "contracts", 0.0) or 0.0) for leg in (decision.legs or []))
+            )
+        except Exception:  # pylint: disable=broad-except
+            contracts_est = 0.0
+
         if callable(margin_preflight) and hl is not None:
-            try:
-                contracts_est = float(
-                    decision.contracts
-                    or decision.target_gamma_btc
-                    or sum((getattr(leg, "contracts", 0.0) or 0.0) for leg in (decision.legs or []))
-                )
-            except Exception:  # pylint: disable=broad-except
-                contracts_est = 0.0
             if contracts_est > 0:
+                underlying = decision.underlying or decision.asset or "BTC"
+                # Spot fetch must fail CLOSED — if we can't size the
+                # collateral requirement, silently skipping the check lets
+                # margin-insolvent trades slip through. Surface the error
+                # and refuse the trade until pricing recovers.
                 try:
-                    spot_est = await hl.get_current_price(
-                        decision.underlying or decision.asset or "BTC"
+                    spot_est = await hl.get_current_price(underlying)
+                except Exception as exc:  # pylint: disable=broad-except
+                    message = (
+                        f"Thalex margin preflight aborted: spot price lookup for "
+                        f"{underlying} failed ({exc}); refusing trade"
                     )
-                except Exception:  # pylint: disable=broad-except
-                    spot_est = 0.0
-                required_usd = contracts_est * max(float(spot_est or 0.0), 0.0) * 0.01
+                    self.logger.error(message)
+                    return False, message
+                if spot_est is None or float(spot_est) <= 0:
+                    message = (
+                        f"Thalex margin preflight aborted: spot price for {underlying} "
+                        f"unavailable (got {spot_est!r}); refusing trade"
+                    )
+                    self.logger.error(message)
+                    return False, message
+                required_usd = contracts_est * float(spot_est) * 0.01
                 ok_margin, reason = await margin_preflight(required_usd)
                 if not ok_margin:
                     message = f"Thalex margin preflight failed: {reason}"
                     self.logger.error(message)
                     return False, message
+
+        # Hyperliquid hedge-leg preflight for delta-hedged strategies. The
+        # existing Thalex check only covers option-side collateral; the perp
+        # leg draws from a different pool that can (and did — see the margin
+        # failure this system was debugging) be empty while Thalex is funded.
+        # We use a conservative worst-case hedge = contracts × spot × 1.0
+        # because we don't have real leg-level greeks before execution.
+        # Gated on hl being wired (test doubles omit it) and on
+        # ``_hl_margin_preflight`` existing on the engine.
+        hedged_strategies = {"long_call_delta_hedged", "long_put_delta_hedged", "vol_arb"}
+        strategy_name = getattr(decision, "strategy", None) or ""
+        can_hedge_preflight = (
+            hl is not None
+            and callable(getattr(self, "_hl_margin_preflight", None))
+            and strategy_name in hedged_strategies
+            and contracts_est > 0
+        )
+        if can_hedge_preflight:
+            try:
+                spot_for_hedge = await hl.get_current_price(
+                    decision.underlying or decision.asset or "BTC"
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                message = f"Hedge-leg preflight: spot lookup failed: {exc}"
+                self.logger.error(message)
+                return False, message
+            worst_case_hedge_notional = float(contracts_est) * float(spot_for_hedge or 0.0)
+            try:
+                await self._hl_margin_preflight(
+                    decision.underlying or "BTC", worst_case_hedge_notional
+                )
+            except RuntimeError as hedge_err:
+                message = (
+                    f"Hyperliquid hedge-leg preflight failed for {strategy_name} "
+                    f"(worst-case notional ${worst_case_hedge_notional:,.2f}): {hedge_err}"
+                )
+                self.logger.warning(f"[SKIP-OPTIONS] {message}")
+                self._write_diary_entry({
+                    "timestamp": datetime.now(UTC).isoformat(),
+                    "asset": decision.underlying or decision.asset,
+                    "action": "options_proposal_skipped_insufficient_hedge_margin",
+                    "strategy": strategy_name,
+                    "contracts": contracts_est,
+                    "reason": str(hedge_err),
+                })
+                return False, message
 
         result = await self.options_executor.execute(decision, open_positions_count=open_count)
         if result.ok:
@@ -493,6 +684,21 @@ class TradingBotEngine:
         self.state.error = message
         if self.on_error:
             self.on_error(message)
+        # Diary feedback so the options LLM sees the failure next cycle.
+        # Options skips written by the preflight already carry their own
+        # ``options_proposal_skipped_*`` action; this covers post-preflight
+        # execution failures (e.g. leg rejection, hedge unwind fallout).
+        try:
+            self._write_diary_entry({
+                "timestamp": datetime.now(UTC).isoformat(),
+                "venue": venue,
+                "asset": asset,
+                "action": "options_execution_failed" if venue.lower() == "thalex" else "execution_failed",
+                "reason": reason or "unknown",
+            })
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.warning(f"Diary write failed for {venue} execution failure: {exc}")
+        self._record_execution_failure(message)
 
     async def start(self):
         """Start the trading bot"""
@@ -714,6 +920,9 @@ class TradingBotEngine:
                         intraday_minute_prices=intraday_minutes,
                         daily_closes_for_keltner=daily_closes_for_keltner,
                         db_session=db_session,
+                        hyperliquid=self.hyperliquid,
+                        hedge_underlying="BTC",
+                        recent_options_skips=self._read_recent_options_skips(),
                     )
                 finally:
                     if db_session_ctx is not None:
@@ -854,6 +1063,10 @@ class TradingBotEngine:
                     "target_gamma_btc": decision.target_gamma_btc,
                 }
                 options_decision_payloads.append(decision_payload)
+                # Hold decisions surface on the reasoning page but don't
+                # create proposals — nothing to execute.
+                if decision.action == "hold":
+                    continue
                 if self.trading_mode == "manual":
                     try:
                         proposal = self._create_thalex_proposal(decision_payload)
@@ -865,9 +1078,7 @@ class TradingBotEngine:
                             decision.asset,
                             proposal.id[:8],
                         )
-                        self.state.pending_proposals = [
-                            p.to_dict() for p in self.pending_proposals if p.is_pending
-                        ]
+                        self._sync_pending_proposals_state()
                     except Exception as exc:  # pylint: disable=broad-except
                         self.logger.error(
                             "Error creating scheduled Thalex proposal for %s: %s",
@@ -1073,7 +1284,7 @@ class TradingBotEngine:
         locally.  Falls back to the TAAPI bulk API only when Hyperliquid candle
         fetch fails.
         """
-        from datetime import timezone, timedelta
+        from datetime import timezone
 
         AVWAP_ANCHOR_MS = int(datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp()) * 1000
 
@@ -1176,7 +1387,7 @@ class TradingBotEngine:
                     self._previous_total_value = total_value
 
                     sharpe_ratio = self._calculate_sharpe(self.trade_log)
-                    
+
                     self.logger.debug(f"  Balance: ${balance:,.2f} | Return: {total_return_pct:+.2f}% | Sharpe: {sharpe_ratio:.2f}")
 
                     # Update bot state
@@ -1186,6 +1397,22 @@ class TradingBotEngine:
                     self.state.total_value_breakdown = account_snapshot['total_value_breakdown']
                     self.state.total_return_pct = total_return_pct
                     self.state.sharpe_ratio = sharpe_ratio
+
+                    # Peak + drawdown tracking. Trips the circuit breaker when
+                    # the session drops below the configured drawdown threshold.
+                    self._update_peak_and_check_drawdown(total_value)
+
+                    # Circuit-breaker / kill-switch pause: we still refresh the
+                    # account snapshot above so the UI keeps showing live P&L,
+                    # but we skip the expensive market-data + LLM + execution
+                    # phases until the user resumes.
+                    if self.is_paused:
+                        self.logger.info(
+                            f"[PAUSED] Skipping cycle — {self.pause_reason or 'no reason set'}"
+                        )
+                        self._notify_state_update()
+                        await asyncio.sleep(self._get_interval_seconds())
+                        continue
 
                     # ===== PHASE 2: Enrich Hyperliquid Positions =====
                     enriched_hyperliquid_positions = []
@@ -1272,10 +1499,18 @@ class TradingBotEngine:
                     self.state.recent_fills = recent_fills
 
                     # ===== PHASE 7: Build Dashboard =====
+                    # Buying-power snapshot — the LLM uses ``max_new_notional_by_asset``
+                    # as the hard cap on ``allocation_usd`` so it won't propose trades
+                    # the account can't afford. Without this, the only margin check was
+                    # at execution time, which produced silent "Insufficient margin"
+                    # failures with no feedback to the agent.
+                    buying_power = await self._get_buying_power_snapshot()
+
                     dashboard = {
                         'total_return_pct': total_return_pct,
                         'balance': balance,
                         'account_value': total_value,
+                        'buying_power': buying_power,
                         'sharpe_ratio': sharpe_ratio,
                         'positions': [
                             {k: v for k, v in pos.items() if k not in ("closable", "row_id")}
@@ -1506,7 +1741,7 @@ class TradingBotEngine:
                                         asset,
                                         proposal.id[:8],
                                     )
-                                    self.state.pending_proposals = [p.to_dict() for p in self.pending_proposals if p.is_pending]
+                                    self._sync_pending_proposals_state()
                                 except Exception as exc:  # pylint: disable=broad-except
                                     self.logger.error("Error creating Thalex proposal for %s: %s", asset, exc)
                                 continue
@@ -1532,7 +1767,29 @@ class TradingBotEngine:
                                         self.logger.error(f"Skipping proposal for {asset}: invalid price {current_price}")
                                         continue
                                     size = allocation / current_price
-                                    
+
+                                    # Pre-proposal margin guard — refuse to create a
+                                    # proposal the account can't afford. Without this,
+                                    # the LLM's unaffordable trade would sit in the
+                                    # Recommendations UI until the user clicked Execute
+                                    # and hit the same error at execution time.
+                                    try:
+                                        await self._hl_margin_preflight(asset, allocation)
+                                    except RuntimeError as margin_err:
+                                        self.logger.warning(
+                                            f"[SKIP-PROPOSAL] {action.upper()} {asset}: {margin_err}"
+                                        )
+                                        self._write_diary_entry({
+                                            'timestamp': datetime.now(UTC).isoformat(),
+                                            'asset': asset,
+                                            'action': 'proposal_skipped_insufficient_margin',
+                                            'proposed_action': action,
+                                            'proposed_allocation_usd': allocation,
+                                            'reason': str(margin_err),
+                                            'rationale': rationale,
+                                        })
+                                        continue
+
                                     # Calculate risk/reward
                                     risk_reward = None
                                     if tp_price and sl_price and current_price:
@@ -1540,7 +1797,7 @@ class TradingBotEngine:
                                         potential_loss = abs(sl_price - current_price) / current_price
                                         if potential_loss > 0:
                                             risk_reward = potential_gain / potential_loss
-                                    
+
                                     proposal = TradeProposal(
                                         asset=asset,
                                         action=action,
@@ -1562,8 +1819,8 @@ class TradingBotEngine:
                                     self.logger.info(f"[PROPOSAL] Created: {action.upper()} {asset} @ ${current_price:,.2f} (ID: {proposal.id[:8]})")
                                     
                                     # Update state with proposals
-                                    self.state.pending_proposals = [p.to_dict() for p in self.pending_proposals if p.is_pending]
-                                    
+                                    self._sync_pending_proposals_state()
+
                                 except Exception as e:
                                     self.logger.error(f"Error creating proposal for {asset}: {e}")
                                     
@@ -1643,6 +1900,7 @@ class TradingBotEngine:
                                     )
 
                                     self.logger.info(f"Executed {action} {asset}: {amount:.6f} @ {current_price}")
+                                    self._record_execution_success()
 
                                     # Wait and check fills
                                     await asyncio.sleep(1)
@@ -1744,6 +2002,26 @@ class TradingBotEngine:
                                 self.logger.error(f"Error executing {action} for {asset}: {e}")
                                 if self.on_error:
                                     self.on_error(f"Trade execution error: {e}")
+                                # Persist the skip/failure so the next cycle's
+                                # ``recent_diary`` tells the LLM the trade didn't happen.
+                                # Margin-preflight raises RuntimeError with a distinctive
+                                # prefix so we tag those separately from other failures.
+                                err_text = str(e)
+                                diary_action = (
+                                    'execution_skipped_insufficient_margin'
+                                    if err_text.startswith("Insufficient Hyperliquid margin")
+                                    else 'execution_failed'
+                                )
+                                self._write_diary_entry({
+                                    'timestamp': datetime.now(UTC).isoformat(),
+                                    'asset': asset,
+                                    'action': diary_action,
+                                    'proposed_action': action,
+                                    'proposed_allocation_usd': allocation,
+                                    'reason': err_text,
+                                    'rationale': rationale,
+                                })
+                                self._record_execution_failure(f"{action} {asset}: {err_text}")
 
                         elif action == 'hold':
                             self.logger.info(f"{asset}: HOLD - {rationale}")
@@ -1894,12 +2172,45 @@ class TradingBotEngine:
         perps = getattr(self.state, "last_perps_reasoning", None) or {}
         options = getattr(self.state, "last_options_reasoning", None) or {}
 
-        perps_decisions = list(perps.get("trade_decisions") or [])
-        options_decisions = list(options.get("trade_decisions") or [])
-        for decision in perps_decisions:
-            decision.setdefault("venue", "hyperliquid")
-        for decision in options_decisions:
-            decision.setdefault("venue", "thalex")
+        # ``list(...)`` shallow-copies the outer list but leaves the inner
+        # dicts shared with the per-venue reasoning state. setdefault on those
+        # originals would mutate the persisted state every time the composite
+        # is rebuilt. Copy each decision before tagging the venue.
+        #
+        # Cross-venue sentinel: any decision in the perps bucket that looks
+        # like an options decision (explicit ``venue='thalex'`` or a
+        # ``strategy`` field set) gets routed to the options bucket for
+        # display. The perps agent prompt/schema is supposed to prevent
+        # this, but if it regresses we still want the GUI to render
+        # correctly and we log a warning so the drift is visible.
+        raw_perps = [d for d in (perps.get("trade_decisions") or []) if isinstance(d, dict)]
+        raw_options = [d for d in (options.get("trade_decisions") or []) if isinstance(d, dict)]
+
+        def _looks_like_options(d: Dict) -> bool:
+            return (
+                (d.get("venue") or "").lower() == "thalex"
+                or d.get("strategy") is not None
+                or bool(d.get("legs"))
+            )
+
+        perps_decisions: List[Dict] = []
+        stray_options: List[Dict] = []
+        for d in raw_perps:
+            if _looks_like_options(d):
+                stray_options.append({**d, "venue": "thalex"})
+                self.logger.warning(
+                    "_compose_last_reasoning: routing stray options-shaped decision "
+                    "out of perps bucket (asset=%s strategy=%s) — perps agent emitted "
+                    "an options field it shouldn't",
+                    d.get("asset"), d.get("strategy"),
+                )
+            else:
+                perps_decisions.append({**d, "venue": d.get("venue") or "hyperliquid"})
+
+        options_decisions = [
+            {**d, "venue": d.get("venue") or "thalex"}
+            for d in raw_options
+        ] + stray_options
 
         perps_text = perps.get("reasoning") or ""
         options_text = options.get("reasoning") or ""
@@ -1990,6 +2301,26 @@ class TradingBotEngine:
             self.logger.error(f"Failed to load diary: {e}")
             return []
 
+    def _read_recent_options_skips(self, limit: int = 5) -> List[Dict]:
+        """Extract the most-recent options skip entries from the diary.
+
+        The options LLM runs on its own 3-hour cadence so it needs a
+        condensed feed of "why did we skip last time?" signals — without
+        this, the agent re-proposes the same unaffordable strategy and
+        the guard trips again in silence.
+        """
+        relevant = {
+            "options_proposal_skipped_insufficient_hedge_margin",
+            "options_execution_failed",
+        }
+        entries = self._load_recent_diary(limit=200)
+        skips = [
+            {k: v for k, v in e.items() if k in ("timestamp", "action", "asset", "reason", "strategy")}
+            for e in entries
+            if isinstance(e, dict) and e.get("action") in relevant
+        ]
+        return skips[-limit:]
+
     def get_state(self) -> BotState:
         """Get current bot state"""
         return self.state
@@ -2053,12 +2384,254 @@ class TradingBotEngine:
                 self.on_error(f"Failed to close position: {e}")
             return False
     
+    async def flatten_all(self) -> Dict[str, Any]:
+        """Kill switch: cancel all orders, close all perp positions, pause trading.
+
+        Each step is wrapped in its own try/except so one venue's failure
+        doesn't abort the rest — a partial flatten is strictly better than
+        aborting midway. Thalex option positions are NOT auto-closed (each
+        instrument needs a reverse order with correct side/contracts); we
+        cancel orders on that venue and surface the remaining positions in
+        the result so the UI can flag them for manual closure.
+        """
+        result: Dict[str, Any] = {
+            "orders_cancelled": {"hyperliquid": {}, "thalex": False},
+            "positions_closed": [],
+            "thalex_positions_remaining": [],
+            "errors": [],
+        }
+
+        # Cancel HL orders per asset
+        for asset in self.assets:
+            try:
+                cancel = await self.hyperliquid.cancel_all_orders(asset)
+                result["orders_cancelled"]["hyperliquid"][asset] = int(
+                    cancel.get("cancelled_count", 0) if isinstance(cancel, dict) else 0
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                self.logger.error(f"flatten_all: HL cancel_all_orders({asset}) failed: {exc}")
+                result["errors"].append(f"hl_cancel_{asset}: {exc}")
+
+        # Cancel Thalex orders globally
+        if self.thalex is not None:
+            try:
+                await self.thalex.cancel_all_orders(None)
+                result["orders_cancelled"]["thalex"] = True
+            except Exception as exc:  # pylint: disable=broad-except
+                self.logger.error(f"flatten_all: Thalex cancel_all_orders failed: {exc}")
+                result["errors"].append(f"thalex_cancel: {exc}")
+
+        # Close HL perp positions (snapshot first — close_position mutates state)
+        hl_positions = [
+            pos for pos in list(self.state.positions or [])
+            if (pos.get("venue") or "hyperliquid") == "hyperliquid" and abs(float(pos.get("quantity", 0) or 0)) > 0
+        ]
+        for pos in hl_positions:
+            asset = pos.get("symbol")
+            if not asset:
+                continue
+            try:
+                closed = await self.close_position(asset)
+                if closed:
+                    result["positions_closed"].append({"venue": "hyperliquid", "asset": asset})
+                else:
+                    result["errors"].append(f"hl_close_{asset}: close_position returned False")
+            except Exception as exc:  # pylint: disable=broad-except
+                self.logger.error(f"flatten_all: close_position({asset}) failed: {exc}")
+                result["errors"].append(f"hl_close_{asset}: {exc}")
+
+        # Surface Thalex positions that the user still needs to close manually
+        result["thalex_positions_remaining"] = [
+            {
+                "instrument_name": pos.get("instrument_name") or pos.get("symbol"),
+                "quantity": pos.get("quantity"),
+            }
+            for pos in (self.state.positions or [])
+            if (pos.get("venue") == "thalex") and abs(float(pos.get("quantity", 0) or 0)) > 0
+        ]
+
+        # Pause the loop — the user explicitly pulled the pin.
+        reason = "kill switch activated"
+        if result["errors"]:
+            reason += f" ({len(result['errors'])} error(s) during flatten — check logs)"
+        if result["thalex_positions_remaining"]:
+            reason += f"; {len(result['thalex_positions_remaining'])} Thalex position(s) still open — close manually"
+        self._trip_circuit_breaker(reason)
+
+        self._write_diary_entry({
+            "timestamp": datetime.now(UTC).isoformat(),
+            "action": "kill_switch_flatten",
+            "result": result,
+        })
+        return result
+
     # ===== MANUAL TRADING MODE METHODS =====
     
     def get_pending_proposals(self) -> List[TradeProposal]:
         """Get list of pending trade proposals"""
         return [p for p in self.pending_proposals if p.is_pending]
-    
+
+    def _prune_stale_failed_proposals(self) -> None:
+        """Drop failed proposals older than the TTL.
+
+        Only acts on status=='failed'; in-flight pending proposals and
+        retries-in-flight (also status=='pending') are never pruned here.
+        """
+        if FAILED_PROPOSAL_TTL_SECONDS <= 0:
+            return
+        cutoff = datetime.now(UTC) - timedelta(seconds=FAILED_PROPOSAL_TTL_SECONDS)
+        before = len(self.pending_proposals)
+        self.pending_proposals = [
+            p for p in self.pending_proposals
+            if p.status != "failed" or (p.executed_at is not None and p.executed_at > cutoff)
+        ]
+        dropped = before - len(self.pending_proposals)
+        if dropped:
+            self.logger.info(f"[RETRY] Pruned {dropped} stale failed proposal(s)")
+
+    def _sync_pending_proposals_state(self) -> None:
+        """Reflect visible (pending + failed) proposals into BotState for the UI."""
+        self._prune_stale_failed_proposals()
+        self.state.pending_proposals = [
+            p.to_dict() for p in self.pending_proposals if p.is_visible_to_ui
+        ]
+
+    # --- Circuit breaker ---------------------------------------------------
+
+    def _record_execution_failure(self, reason: str) -> None:
+        """Increment the failure streak and trip the circuit breaker at threshold.
+
+        Called from every trade-execution failure path (manual + auto + options).
+        Decision-level errors (LLM/RPC) don't belong here — they're handled by
+        the main-loop ``MAX_CONSECUTIVE_ERRORS`` hard-stop. Defensively tolerant
+        of test doubles that build the engine via ``__new__`` and skip init.
+        """
+        streak = getattr(self, "_execution_failure_streak", 0) + 1
+        self._execution_failure_streak = streak
+        state = getattr(self, "state", None)
+        if state is not None and hasattr(state, "execution_failure_streak"):
+            state.execution_failure_streak = streak
+        if (
+            not getattr(self, "is_paused", False)
+            and CIRCUIT_BREAKER_CONSECUTIVE_FAILS > 0
+            and streak >= CIRCUIT_BREAKER_CONSECUTIVE_FAILS
+        ):
+            self._trip_circuit_breaker(
+                f"{streak} consecutive execution failures (last: {reason})"
+            )
+
+    def _record_execution_success(self) -> None:
+        """Reset the failure streak after any successful execution."""
+        if getattr(self, "_execution_failure_streak", 0) == 0:
+            return
+        self._execution_failure_streak = 0
+        state = getattr(self, "state", None)
+        if state is not None and hasattr(state, "execution_failure_streak"):
+            state.execution_failure_streak = 0
+
+    def _trip_circuit_breaker(self, reason: str) -> None:
+        """Pause trading with a reason. Idempotent — re-tripping updates the reason."""
+        self.is_paused = True
+        self.pause_reason = reason
+        state = getattr(self, "state", None)
+        if state is not None:
+            if hasattr(state, "is_paused"):
+                state.is_paused = True
+            if hasattr(state, "pause_reason"):
+                state.pause_reason = reason
+        self.logger.error(f"[CIRCUIT-BREAKER] Trading paused: {reason}")
+        try:
+            self._write_diary_entry({
+                'timestamp': datetime.now(UTC).isoformat(),
+                'action': 'circuit_breaker_tripped',
+                'reason': reason,
+            })
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.warning(f"Diary write failed during CB trip: {exc}")
+        notify = getattr(self, "_notify_state_update", None)
+        if callable(notify):
+            notify()
+
+    def resume_trading(self) -> bool:
+        """Manual resume from the UI. Clears pause state + failure streak."""
+        if not self.is_paused:
+            return False
+        self.logger.info(f"[CIRCUIT-BREAKER] Resuming trading (was paused: {self.pause_reason})")
+        self.is_paused = False
+        self.pause_reason = None
+        self._execution_failure_streak = 0
+        self.state.is_paused = False
+        self.state.pause_reason = None
+        self.state.execution_failure_streak = 0
+        try:
+            self._write_diary_entry({
+                'timestamp': datetime.now(UTC).isoformat(),
+                'action': 'circuit_breaker_resumed',
+            })
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.warning(f"Diary write failed during CB resume: {exc}")
+        self._notify_state_update()
+        return True
+
+    def _update_peak_and_check_drawdown(self, total_value: float) -> None:
+        """Track session peak and trip the CB on drawdown. Safe to call every cycle."""
+        if total_value <= 0:
+            return
+        if self.peak_account_value <= 0:
+            # First valid reading after start — seed the peak.
+            self.peak_account_value = total_value
+            self.state.peak_account_value = total_value
+            self.state.drawdown_pct = 0.0
+            return
+        if total_value > self.peak_account_value:
+            self.peak_account_value = total_value
+            self.state.peak_account_value = total_value
+        drawdown = ((total_value - self.peak_account_value) / self.peak_account_value) * 100.0
+        self.state.drawdown_pct = drawdown
+        if (
+            not self.is_paused
+            and CIRCUIT_BREAKER_DRAWDOWN_PCT > 0
+            and drawdown <= -CIRCUIT_BREAKER_DRAWDOWN_PCT
+        ):
+            self._trip_circuit_breaker(
+                f"session drawdown {drawdown:.2f}% exceeds limit "
+                f"{CIRCUIT_BREAKER_DRAWDOWN_PCT:.2f}% (peak ${self.peak_account_value:,.2f}, "
+                f"now ${total_value:,.2f})"
+            )
+
+    def retry_proposal(self, proposal_id: str) -> bool:
+        """Re-execute a previously failed proposal.
+
+        Returns True if a retry was scheduled; False if the proposal is not
+        found or not in a retryable state (guards double-clicks).
+        """
+        proposal = next((p for p in self.pending_proposals if p.id == proposal_id), None)
+        if proposal is None or not proposal.reset_for_retry():
+            self.logger.warning(f"Proposal {proposal_id} not found or not retryable")
+            return False
+
+        self.logger.info(
+            f"[RETRY] Re-executing proposal {proposal_id[:8]}: "
+            f"{proposal.action.upper()} {proposal.asset}"
+        )
+        asyncio.create_task(self._execute_proposal(proposal))
+        self._sync_pending_proposals_state()
+        self._notify_state_update()
+        return True
+
+    def dismiss_proposal(self, proposal_id: str) -> bool:
+        """Remove a failed proposal from the UI without retrying."""
+        proposal = next((p for p in self.pending_proposals if p.id == proposal_id), None)
+        if proposal is None or proposal.status != "failed":
+            self.logger.warning(f"Proposal {proposal_id} not found or not dismissible")
+            return False
+
+        self.pending_proposals = [p for p in self.pending_proposals if p.id != proposal_id]
+        self.logger.info(f"[DISMISSED] Failed proposal {proposal_id[:8]}")
+        self._sync_pending_proposals_state()
+        self._notify_state_update()
+        return True
+
     def approve_proposal(self, proposal_id: str) -> bool:
         """
         Approve and execute a trade proposal.
@@ -2081,13 +2654,13 @@ class TradingBotEngine:
         
         # Execute asynchronously
         asyncio.create_task(self._execute_proposal(proposal))
-        
+
         # Update state
-        self.state.pending_proposals = [p.to_dict() for p in self.pending_proposals if p.is_pending]
+        self._sync_pending_proposals_state()
         self._notify_state_update()
-        
+
         return True
-    
+
     def reject_proposal(self, proposal_id: str, reason: Optional[str] = None) -> bool:
         """
         Reject a trade proposal.
@@ -2120,11 +2693,11 @@ class TradingBotEngine:
         })
         
         # Update state
-        self.state.pending_proposals = [p.to_dict() for p in self.pending_proposals if p.is_pending]
+        self._sync_pending_proposals_state()
         self._notify_state_update()
-        
+
         return True
-    
+
     async def _execute_proposal(self, proposal: TradeProposal):
         """
         Execute an approved trade proposal.
@@ -2173,8 +2746,10 @@ class TradingBotEngine:
                     })
 
                 self.logger.info(f"[SUCCESS] Proposal executed: {proposal.id[:8]}")
+                self._record_execution_success()
                 return
-            
+
+
             # Get fresh price
             current_price = await self.hyperliquid.get_current_price(proposal.asset)
             amount = proposal.size
@@ -2299,15 +2874,17 @@ class TradingBotEngine:
                 })
             
             self.logger.info(f"[SUCCESS] Proposal executed: {proposal.id[:8]}")
-            
+            self._record_execution_success()
+
         except Exception as e:
             self.logger.error(f"Failed to execute proposal {proposal.id}: {e}")
             proposal.mark_failed(str(e))
-            
+
             if self.on_error:
                 self.on_error(f"Failed to execute trade: {e}")
-        
+            self._record_execution_failure(f"proposal {proposal.id[:8]}: {e}")
+
         finally:
-            # Update state
-            self.state.pending_proposals = [p.to_dict() for p in self.pending_proposals if p.is_pending]
+            # Update state — failed proposals stay visible so the UI can offer Retry.
+            self._sync_pending_proposals_state()
             self._notify_state_update()

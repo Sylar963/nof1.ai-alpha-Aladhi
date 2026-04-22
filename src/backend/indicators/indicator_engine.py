@@ -20,15 +20,20 @@ OR_DURATION_MINUTES = 15
 
 
 def _or_window_ms(now_utc: datetime) -> tuple[int, int]:
-    """Return the (start_ms, end_ms) of the most recent 20:00–20:15 Tijuana window.
+    """Return the (start_ms, end_ms) of the most recent *completed* 20:00–20:15 Tijuana window.
 
-    If the current Tijuana time is before 20:00, returns yesterday's window.
+    Rolls back one day if today's window hasn't finished yet (``now_tj`` is
+    before ``start_tj + OR_DURATION_MINUTES``). This way
+    :func:`compute_opening_range` never operates on a half-formed window —
+    downstream range-breakout logic expects a stable high/low that won't
+    shift mid-bar.
     """
     now_tj = now_utc.astimezone(TIJUANA_TZ)
     start_tj = now_tj.replace(hour=OR_START_HOUR, minute=0, second=0, microsecond=0)
-    if now_tj < start_tj:
-        start_tj = start_tj - timedelta(days=1)
     end_tj = start_tj + timedelta(minutes=OR_DURATION_MINUTES)
+    if now_tj < end_tj:
+        start_tj = start_tj - timedelta(days=1)
+        end_tj = start_tj + timedelta(minutes=OR_DURATION_MINUTES)
     start_ms = int(start_tj.astimezone(timezone.utc).timestamp() * 1000)
     end_ms = int(end_tj.astimezone(timezone.utc).timestamp() * 1000)
     return start_ms, end_ms
@@ -235,8 +240,11 @@ def compute_avwap(candles: list[dict]) -> Optional[float]:
 def compute_opening_range(candles: list[dict], current_spot: Optional[float] = None) -> dict:
     """Compute the first-hour opening range from intraday candle highs/lows.
 
+    Operates on the most recent *completed* 20:00–20:15 Tijuana window (see
+    :func:`_or_window_ms`) — callers pre-filter candles to that slice, so
+    the resulting high/low is stable and won't move mid-bar.
+
     Candle dicts must have ``h`` and ``l`` keys (floats).
-    All candles passed in should already be filtered to the first hour.
     """
     highs = []
     lows = []

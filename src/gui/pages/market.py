@@ -379,9 +379,17 @@ def create_market(bot_service: BotService, state_manager: StateManager):
 
         price_chart.figure.layout.shapes = shapes
 
-        # OR mid trace (trace 4)
+        # OR mid trace (trace 4) — recompute the start datetime from
+        # ``or_start`` directly. We can't reuse ``or_x0`` from the rectangle
+        # block above because that variable is only defined when the FULL
+        # OR tuple (high/low/start/end) is populated. If only ``or_start``
+        # came back (partial data), referencing ``or_x0`` here would raise
+        # UnboundLocalError.
         if or_mid is not None and dt_times:
-            or_mid_start = or_x0 if (or_start is not None) else dt_times[0]
+            if or_start is not None:
+                or_mid_start = _ms_to_dt([or_start])[0]
+            else:
+                or_mid_start = dt_times[0]
             price_chart.figure.data[4].x = [or_mid_start, dt_times[-1]]
             price_chart.figure.data[4].y = [or_mid, or_mid]
         else:

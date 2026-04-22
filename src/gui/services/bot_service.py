@@ -647,6 +647,22 @@ class BotService:
             self.logger.warning("refresh_chart_candles: invalid interval %s", interval)
             return False
 
+        # The intraday frame ships pre-computed indicator overlays (EMAs,
+        # Keltner, opening range, anchored VWAP) that are bucketed to 5-min
+        # bars by the indicator engine. Swapping just the price_candles to a
+        # different intraday interval would paint 15m candles over 5m
+        # overlays — wrong alignment and silently misleading. Hard-reject
+        # non-5m intraday requests here; the long-term frame is rebuilt per
+        # interval by the main refresh cycle and is safe to swap candles on.
+        intraday_group = {"1m", "5m", "15m"}
+        if interval in intraday_group and interval != "5m":
+            self.logger.warning(
+                "refresh_chart_candles: intraday interval %s not supported "
+                "(overlays are pinned to 5m); use the full refresh to rebuild",
+                interval,
+            )
+            return False
+
         try:
             from src.backend.trading.hyperliquid_api import HyperliquidAPI
             from src.backend.indicators.indicator_engine import to_price_candles
@@ -669,7 +685,6 @@ class BotService:
                 return False
             state = self.state_manager.get_state()
             market_sections = list(getattr(state, 'market_data', []) or [])
-            intraday_group = {"1m", "5m", "15m"}
 
             updated = False
             for section in market_sections:
@@ -721,6 +736,76 @@ class BotService:
         except Exception as e:
             self.logger.error(f"Failed to approve proposal: {e}")
             self._add_event(f"❌ Approval failed: {str(e)}", level="error")
+            return False
+
+    async def kill_switch_flatten(self) -> dict:
+        """Cancel all orders + close all HL positions + pause trading.
+
+        Returns the engine's summary dict so the UI can show what succeeded
+        and which Thalex positions still need manual closure.
+        """
+        if not self.bot_engine:
+            return {"errors": ["bot_engine not initialized"]}
+        try:
+            result = await self.bot_engine.flatten_all()
+            err_count = len(result.get("errors", []))
+            remaining = len(result.get("thalex_positions_remaining", []))
+            self._add_event(
+                f"🚨 Kill switch: closed {len(result.get('positions_closed', []))} position(s), "
+                f"{err_count} error(s), {remaining} Thalex position(s) remaining",
+                level="warning" if err_count or remaining else "info",
+            )
+            return result
+        except Exception as e:
+            self.logger.error(f"Kill switch flatten failed: {e}")
+            self._add_event(f"❌ Kill switch failed: {e}", level="error")
+            return {"errors": [str(e)]}
+
+    def resume_trading(self) -> bool:
+        """Resume from a paused state (after circuit breaker or kill switch)."""
+        if not self.bot_engine:
+            return False
+        try:
+            resumed = self.bot_engine.resume_trading()
+            if resumed:
+                self._add_event("▶ Trading resumed")
+            return resumed
+        except Exception as e:
+            self.logger.error(f"Resume failed: {e}")
+            return False
+
+    def retry_proposal(self, proposal_id: str) -> bool:
+        """Re-execute a previously failed proposal (after margin deposit, etc.)."""
+        if not self.bot_engine or not self.bot_engine.is_running:
+            self.logger.error("Bot engine not running - cannot retry proposal")
+            return False
+
+        try:
+            success = self.bot_engine.retry_proposal(proposal_id)
+            if success:
+                self._add_event(f"🔄 Proposal {proposal_id[:8]} retrying - re-executing trade")
+                self.logger.info(f"Proposal retry scheduled: {proposal_id}")
+            return success
+        except Exception as e:
+            self.logger.error(f"Failed to retry proposal: {e}")
+            self._add_event(f"❌ Retry failed: {str(e)}", level="error")
+            return False
+
+    def dismiss_proposal(self, proposal_id: str) -> bool:
+        """Remove a failed proposal from the UI without retrying."""
+        if not self.bot_engine or not self.bot_engine.is_running:
+            self.logger.error("Bot engine not running - cannot dismiss proposal")
+            return False
+
+        try:
+            success = self.bot_engine.dismiss_proposal(proposal_id)
+            if success:
+                self._add_event(f"🗑 Proposal {proposal_id[:8]} dismissed")
+                self.logger.info(f"Proposal dismissed: {proposal_id}")
+            return success
+        except Exception as e:
+            self.logger.error(f"Failed to dismiss proposal: {e}")
+            self._add_event(f"❌ Dismiss failed: {str(e)}", level="error")
             return False
 
     def reject_proposal(self, proposal_id: str, reason: str = "User rejected") -> bool:

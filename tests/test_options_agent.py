@@ -183,6 +183,62 @@ async def test_agent_drops_invalid_decisions_without_raising():
 
 
 @pytest.mark.asyncio
+async def test_agent_drops_sizeless_buy_sell_decisions():
+    """A buy/sell decision with no contracts, target_gamma_btc, or legs
+    cannot be sized or executed — drop it upstream so downstream proposal
+    creation doesn't raise."""
+    llm = FakeLLMClient({
+        "reasoning": "close the 80k put",
+        "trade_decisions": [
+            {  # sizeless — LLM forgot to set contracts
+                "venue": "thalex",
+                "asset": "BTC-01MAY26-80000-P",
+                "action": "buy",
+                "strategy": "long_put_delta_hedged",
+                "underlying": "BTC",
+                "tenor_days": 14,
+                "rationale": "close existing short put",
+            },
+            {  # valid
+                "venue": "thalex",
+                "asset": "BTC",
+                "action": "buy",
+                "strategy": "long_call_delta_hedged",
+                "underlying": "BTC",
+                "tenor_days": 21,
+                "contracts": 0.02,
+                "rationale": "buy gamma",
+            },
+        ],
+    })
+    agent = OptionsAgent(llm=llm)
+    decisions = await agent.decide(_basic_context())
+    assert len(decisions) == 1
+    assert decisions[0].strategy == "long_call_delta_hedged"
+
+
+@pytest.mark.asyncio
+async def test_agent_keeps_hold_decisions_even_when_sizeless():
+    """Hold decisions are informational — they must flow through so the
+    operator sees the reasoning, even without a size."""
+    llm = FakeLLMClient({
+        "reasoning": "no edge right now",
+        "trade_decisions": [
+            {
+                "venue": "thalex",
+                "asset": "BTC",
+                "action": "hold",
+                "rationale": "wait for IV regime clarity",
+            },
+        ],
+    })
+    agent = OptionsAgent(llm=llm)
+    decisions = await agent.decide(_basic_context())
+    assert len(decisions) == 1
+    assert decisions[0].action == "hold"
+
+
+@pytest.mark.asyncio
 async def test_agent_returns_empty_list_when_llm_returns_no_decisions():
     llm = FakeLLMClient({"trade_decisions": []})
     agent = OptionsAgent(llm=llm)
@@ -206,8 +262,9 @@ async def test_system_prompt_contains_strategy_selection():
     # Decision tree branches by regime
     assert "skew" in lower
     assert "realized_iv_ratio" in prompt or "realized" in lower
-    # Tenor guidance
-    assert "7" in prompt and "21" in prompt  # premium selling DTE range
+    # Tenor guidance — match the exact "7-21 DTE" string from the prompt
+    # so this doesn't silently pass on any other occurrence of "7" or "21".
+    assert "7-21 DTE" in prompt
     assert "tenor" in lower
 
 

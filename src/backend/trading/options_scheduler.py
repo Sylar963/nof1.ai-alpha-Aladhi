@@ -118,7 +118,15 @@ class OptionsScheduler:
     _DECISION_TIMEOUT: float = 900.0
 
     async def _bootstrap(self) -> None:
-        """Fetch vol surface then fire the first options decision sequentially."""
+        """Fetch vol surface then fire the first options decision sequentially.
+
+        The initial decision is gated on a successful vol surface refresh —
+        running the LLM against a missing / stale surface would either feed
+        it the previous cycle's data (misleading) or no surface at all
+        (forces a noop). Either way the decision is worse than just waiting
+        for the next cadence tick, so skip it on bootstrap surface failure.
+        """
+        vol_ok = False
         try:
             if self.config.vol_surface_interval_seconds > 0:
                 logger.info("OptionsScheduler: bootstrap — fetching initial vol surface")
@@ -126,6 +134,7 @@ class OptionsScheduler:
                     await asyncio.wait_for(
                         self._refresh_vol_surface(), timeout=self._VOL_SURFACE_TIMEOUT,
                     )
+                    vol_ok = True
                 except asyncio.TimeoutError:
                     logger.error(
                         "OptionsScheduler: bootstrap vol surface timed out after %.0fs",
@@ -133,20 +142,31 @@ class OptionsScheduler:
                     )
                 except Exception as exc:  # pylint: disable=broad-except
                     logger.error("OptionsScheduler: bootstrap vol surface failed: %s", exc)
+            else:
+                # No surface cadence configured — nothing to gate on. The
+                # decision path is responsible for reading whatever surface
+                # state exists.
+                vol_ok = True
 
             if self.config.options_decision_interval_seconds > 0:
-                logger.info("OptionsScheduler: bootstrap — running initial options decision")
-                try:
-                    await asyncio.wait_for(
-                        self._run_options_decision(), timeout=self._DECISION_TIMEOUT,
+                if not vol_ok:
+                    logger.warning(
+                        "OptionsScheduler: skipping initial options decision — "
+                        "bootstrap vol surface refresh did not succeed"
                     )
-                except asyncio.TimeoutError:
-                    logger.error(
-                        "OptionsScheduler: bootstrap options decision timed out after %.0fs",
-                        self._DECISION_TIMEOUT,
-                    )
-                except Exception as exc:  # pylint: disable=broad-except
-                    logger.error("OptionsScheduler: bootstrap options decision failed: %s", exc)
+                else:
+                    logger.info("OptionsScheduler: bootstrap — running initial options decision")
+                    try:
+                        await asyncio.wait_for(
+                            self._run_options_decision(), timeout=self._DECISION_TIMEOUT,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.error(
+                            "OptionsScheduler: bootstrap options decision timed out after %.0fs",
+                            self._DECISION_TIMEOUT,
+                        )
+                    except Exception as exc:  # pylint: disable=broad-except
+                        logger.error("OptionsScheduler: bootstrap options decision failed: %s", exc)
         finally:
             self._bootstrap_done.set()
 

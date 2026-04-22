@@ -252,6 +252,42 @@ def test_parse_thalex_intent_requires_underlying_when_strategy_set():
         })
 
 
+def test_parse_coerces_missing_venue_to_thalex_when_strategy_is_options():
+    """Missing venue + options strategy is a common LLM omission; coerce to
+    thalex rather than silently misroute through the perps path."""
+    decision = parse_decision({
+        "asset": "BTC",
+        "action": "buy",
+        "strategy": "long_call_delta_hedged",
+        "underlying": "BTC",
+        "kind": "call",
+        "tenor_days": 30,
+        "target_strike": 65000,
+        "contracts": 0.05,
+        "rationale": "x",
+    })
+    assert decision.venue == "thalex"
+    assert decision.strategy == "long_call_delta_hedged"
+
+
+def test_parse_rejects_options_strategy_with_hyperliquid_venue():
+    """Explicit venue=hyperliquid + options strategy is cross-venue
+    contamination — reject loudly rather than silently misroute."""
+    with pytest.raises(DecisionParseError, match="venue='thalex'"):
+        parse_decision({
+            "venue": "hyperliquid",
+            "asset": "BTC",
+            "action": "buy",
+            "strategy": "long_put_delta_hedged",
+            "underlying": "BTC",
+            "kind": "put",
+            "tenor_days": 14,
+            "target_strike": 60000,
+            "contracts": 0.02,
+            "rationale": "x",
+        })
+
+
 def test_decision_to_option_intent_for_single_leg():
     """A single-leg options decision must produce a usable OptionIntent."""
     decision = parse_decision({

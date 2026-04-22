@@ -59,8 +59,21 @@ class OptionsContext:
     max_open_positions: int = 3
     open_position_count: int = 0
 
+    # Hedge budget — the options agent's biggest silent failure mode is
+    # proposing a delta-hedged strategy when the Hyperliquid sidecar has no
+    # free margin for the perp leg. We surface both the raw HL collateral
+    # and a pre-computed notional cap so the LLM has no excuse to ignore it.
+    hyperliquid_free_margin: float = 0.0
+    hyperliquid_max_leverage: int = 1
+    max_hedge_notional: float = 0.0
+
     # Recent activity
     recent_options_trades: list = field(default_factory=list)
+    # Skip-feedback loop — entries like "proposal_skipped_insufficient_*"
+    # written by bot_engine on the previous cycle(s). Having this in context
+    # is what lets the LLM self-correct instead of re-proposing the same
+    # unaffordable trade every 3 hours.
+    recent_options_skips: list = field(default_factory=list)
 
     # ------------------------------------------------------------------
     # Serialization
@@ -89,7 +102,11 @@ class OptionsContext:
             "max_contracts_per_trade": self.max_contracts_per_trade,
             "max_open_positions": self.max_open_positions,
             "open_position_count": self.open_position_count,
+            "hyperliquid_free_margin": self.hyperliquid_free_margin,
+            "hyperliquid_max_leverage": self.hyperliquid_max_leverage,
+            "max_hedge_notional": self.max_hedge_notional,
             "recent_options_trades": self.recent_options_trades[:5],
+            "recent_options_skips": self.recent_options_skips[:5],
         }
 
     def to_json(self) -> str:

@@ -87,6 +87,11 @@ async def test_bootstrap_runs_surface_before_decision():
     await asyncio.sleep(0.05)
     await scheduler.stop()
 
+    # Length check first so a missing bootstrap surfaces as a clear
+    # diagnostic instead of an IndexError on the order[0] access.
+    assert len(order) >= 2, (
+        f"expected surface+decision bootstrap to have run; got order={order!r}"
+    )
     assert order[0] == "surface"
     assert order[1] == "decision"
 

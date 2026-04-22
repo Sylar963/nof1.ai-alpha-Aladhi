@@ -387,6 +387,14 @@ class HyperliquidAPI(ExchangeAdapter):
         new positions with; ``free_margin`` is a cross-margin proxy
         (accountValue − totalMarginUsed). Both are reported so the caller can
         pick the conservative one.
+
+        Exceptions from the underlying ``info.user_state`` call are
+        **intentionally allowed to propagate** — no try/except wraps the RPC.
+        Callers in the pre-trade path (e.g. ``_hl_margin_preflight``) use
+        this to fail CLOSED on collateral lookup errors: silently returning
+        zeros would let margin-insolvent trades slip through with a blind
+        "available=0 < required" message, while propagating gives the
+        operator a real stacktrace pointing at the failing RPC.
         """
         state = await self._retry(lambda: self.info.user_state(self.wallet.address))
         if not isinstance(state, dict):

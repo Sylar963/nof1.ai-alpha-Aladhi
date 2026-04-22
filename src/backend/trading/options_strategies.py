@@ -28,11 +28,13 @@ from src.backend.trading.hyperliquid_api import HyperliquidAPI
 from src.backend.trading.options import OptionIntent
 
 
-# Status markers returned by Thalex when an order fails (e.g. insufficient
-# margin, instrument halted, IOC couldn't match). Anything NOT in the set of
-# accepted statuses is treated as a rejection so the bot never records a
-# phantom fill.
-_ACCEPTED_ORDER_STATUSES = {"ok", "open", "filled", "partially_filled"}
+# Accepted canonical statuses from ExchangeAdapter.OrderResult — matches the
+# contract declared on :class:`OrderResult` ("ok | filled | resting | rejected
+# | error"). "resting" means the order is live on the book but not yet filled,
+# which is a legitimate success for GTC limit orders (the Thalex venue uses
+# this for TP/SL brackets). Anything outside this set is treated as a
+# rejection so the bot never records a phantom fill.
+_ACCEPTED_ORDER_STATUSES = {"ok", "filled", "resting"}
 
 
 def _order_ok(order) -> tuple[bool, str]:

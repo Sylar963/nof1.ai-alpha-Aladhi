@@ -950,19 +950,32 @@ class ThalexAPI(ExchangeAdapter):
         if isinstance(raw, dict):
             order_id = str(raw.get("order_id") or raw.get("id") or "")
             raw_status = str(raw.get("status") or "ok").lower()
-            # Thalex surfaces rejection via status strings like "rejected" /
-            # "cancelled" (for IOC orders that couldn't match), or an explicit
-            # ``error``/``reason`` field. Normalize all of those to
-            # ``status="rejected"`` so callers can check a single flag.
+            # Normalize Thalex status strings to the ExchangeAdapter contract
+            # ("ok | filled | resting | rejected | error"). Thalex uses "open"
+            # for a live resting order and "partially_filled" for a partial
+            # fill — the adapter contract has no equivalents, so we fold them
+            # into the closest canonical values.
+            _SUCCESS_RAW = {"open", "filled", "partially_filled", "ok", "resting"}
+            _STATUS_MAP = {
+                "open": "resting",
+                "partially_filled": "filled",
+                "filled": "filled",
+                "resting": "resting",
+                "ok": "ok",
+                "rejected": "rejected",
+                "cancelled": "rejected",
+                "canceled": "rejected",
+                "error": "error",
+            }
             err_payload = raw.get("error") or raw.get("reason")
-            if err_payload and raw_status not in {"open", "filled", "partially_filled"}:
+            if err_payload and raw_status not in _SUCCESS_RAW:
                 error = str(err_payload)
                 status = "rejected"
             elif raw_status in {"rejected", "cancelled", "canceled", "error"}:
-                status = "rejected"
+                status = _STATUS_MAP.get(raw_status, "rejected")
                 error = str(raw.get("reject_reason") or raw.get("error") or raw_status)
             else:
-                status = raw_status or "ok"
+                status = _STATUS_MAP.get(raw_status, raw_status or "ok")
             price = _quote_field(
                 raw,
                 ("price",),
@@ -1004,14 +1017,39 @@ class ThalexAPI(ExchangeAdapter):
         except Exception as exc:  # pylint: disable=broad-except
             logger.warning("Thalex margin_preflight: get_user_state failed — allowing trade: %s", exc)
             return True, ""
-        balance = float(getattr(state, "balance", 0.0) or 0.0)
-        if balance <= 0:
-            return False, f"Thalex balance is {balance:.2f} — no collateral available"
+        # Prefer the venue's free/available cash fields — ``balance`` on
+        # AccountState is portfolio equity (cash + unrealised PnL) and can
+        # overstate what's actually unencumbered when positions are eating
+        # margin. Fall back through the common field names before settling
+        # for ``balance`` as a last resort.
+        summary: dict = {}
+        raw = getattr(state, "raw", None)
+        if isinstance(raw, dict):
+            summary = raw.get("summary") or {}
+        available: Optional[float] = None
+        source = ""
+        for key in ("free_collateral", "available_cash", "available_funds", "cash_collateral"):
+            val = summary.get(key) if isinstance(summary, dict) else None
+            if val is None:
+                val = getattr(state, key, None)
+            if val is None:
+                continue
+            try:
+                available = float(val)
+                source = key
+                break
+            except (TypeError, ValueError):
+                continue
+        if available is None:
+            available = float(getattr(state, "balance", 0.0) or 0.0)
+            source = "balance (fallback)"
+        if available <= 0:
+            return False, f"Thalex {source} is {available:.2f} — no collateral available"
         # 10% buffer for fees/slippage + variation margin moves during fill.
         buffered = required_collateral_usd * 1.10
-        if balance < buffered:
+        if available < buffered:
             return False, (
-                f"Thalex collateral ${balance:,.2f} below required ≈ ${buffered:,.2f} "
+                f"Thalex {source} ${available:,.2f} below required ≈ ${buffered:,.2f} "
                 f"(${required_collateral_usd:,.2f} +10% buffer)"
             )
         return True, ""

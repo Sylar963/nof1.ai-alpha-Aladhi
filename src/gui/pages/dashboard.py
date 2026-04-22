@@ -180,8 +180,38 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
             hedge_toggle_btn = ui.button('⏸ Delta Hedge OFF', on_click=lambda: toggle_delta_hedge())
             hedge_toggle_btn.classes('bg-yellow-600 hover:bg-yellow-700 text-white px-6 py-3')
 
+            # Kill Switch — flattens everything + pauses the loop. Destructive,
+            # so it opens a confirmation dialog defined below.
+            kill_btn = ui.button('🚨 Kill Switch', on_click=lambda: kill_dialog.open())
+            kill_btn.classes('bg-red-800 hover:bg-red-900 text-white px-6 py-3 font-bold')
+
+            # Resume button — only meaningful while the circuit breaker (or
+            # kill switch) has paused the loop. We set its enabled state from
+            # update_dashboard() so it reflects live pause state.
+            resume_btn = ui.button('▶ Resume Trading', on_click=lambda: resume_trading())
+            resume_btn.classes('bg-blue-600 hover:bg-blue-700 text-white px-6 py-3')
+            resume_btn.props('disable')
+
             # Status indicator
             status_indicator = ui.label('⚫ Stopped').classes('text-lg font-bold ml-4')
+            pause_banner = ui.label('').classes('text-sm text-orange-300 ml-4')
+
+    # Kill switch confirmation dialog — mirrors the positions.py close pattern
+    # so behavior is consistent (cancel on the left, destructive action red).
+    kill_dialog = ui.dialog()
+    with kill_dialog, ui.card().classes('w-full'):
+        ui.label('🚨 Activate Kill Switch?').classes('text-xl font-bold text-red-400')
+        ui.label(
+            'This will cancel ALL open orders, close ALL Hyperliquid perp '
+            'positions at market, and pause the trading loop. Thalex option '
+            'positions will be flagged for manual closure.\n\nThis cannot be undone.'
+        ).classes('text-sm text-gray-300 whitespace-pre-wrap mt-2')
+        with ui.row().classes('gap-4 mt-6 justify-end'):
+            ui.button('Cancel', on_click=kill_dialog.close).classes('bg-gray-600')
+            ui.button(
+                'FLATTEN EVERYTHING',
+                on_click=lambda: kill_switch_confirmed(),
+            ).classes('bg-red-700 hover:bg-red-800 font-bold')
 
         # Last refresh timestamp
         with ui.row().classes('gap-4 items-center mt-4'):
@@ -242,6 +272,51 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
         stop_btn.props('disable')
         activity_log.push('✅ Bot stopped successfully!')
         ui.notify('Bot stopped!', type='info')
+
+    async def kill_switch_confirmed():
+        """User confirmed — flatten everything and pause."""
+        if not _ui_ok():
+            return
+        kill_dialog.close()
+        ui.notify('🚨 Kill switch engaged — flattening...', type='warning', position='top')
+        try:
+            result = await bot_service.kill_switch_flatten()
+        except Exception as e:
+            if _ui_ok():
+                ui.notify(f'Kill switch failed: {e}', type='negative')
+            return
+        if not _ui_ok():
+            return
+        closed = len(result.get('positions_closed', []))
+        errs = len(result.get('errors', []))
+        remaining = len(result.get('thalex_positions_remaining', []))
+        ntype = 'positive' if (errs == 0 and remaining == 0) else 'warning'
+        ui.notify(
+            f'Flattened {closed} position(s); {errs} error(s); '
+            f'{remaining} Thalex position(s) still open',
+            type=ntype, position='top',
+        )
+        activity_log.push(
+            f'🚨 Kill switch: closed={closed}, errors={errs}, thalex_remaining={remaining}'
+        )
+
+    async def resume_trading():
+        """Resume from a paused state."""
+        if not _ui_ok():
+            return
+        try:
+            ok = bot_service.resume_trading()
+        except Exception as e:
+            if _ui_ok():
+                ui.notify(f'Resume failed: {e}', type='negative')
+            return
+        if not _ui_ok():
+            return
+        if ok:
+            ui.notify('▶ Trading resumed', type='positive', position='top')
+            activity_log.push('▶ Trading resumed')
+        else:
+            ui.notify('Bot is not paused', type='info')
 
     async def toggle_delta_hedge():
         """Enable or disable live delta hedging from the dashboard."""
@@ -398,6 +473,12 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
                 equity_chart.figure.data[0].x = merged_times
                 equity_chart.figure.data[0].y = merged_values
                 equity_chart.update()
+            else:
+                # Clear any stale points left over from a prior session;
+                # otherwise the chart keeps showing yesterday's equity.
+                equity_chart.figure.data[0].x = []
+                equity_chart.figure.data[0].y = []
+                equity_chart.update()
 
             # Update asset allocation chart
             if positions:
@@ -538,6 +619,18 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
                 _set_status_indicator_tone('text-gray-400')
                 start_btn.props(remove='disable')
                 stop_btn.props('disable')
+
+            # Pause-state banner + Resume button. Paused state is orthogonal to
+            # running (running+paused = loop is alive but skipping trades).
+            if getattr(state, 'is_paused', False):
+                pause_banner.text = f'⏸ PAUSED — {state.pause_reason or "manual"}'
+                pause_banner.classes(remove='text-orange-300 text-gray-500', add='text-orange-300')
+                status_indicator.text = '🟠 Paused'
+                _set_status_indicator_tone('text-orange-400')
+                resume_btn.props(remove='disable')
+            else:
+                pause_banner.text = ''
+                resume_btn.props('disable')
 
             if state.error:
                 status_indicator.text = '🔴 Error'

@@ -107,7 +107,7 @@ async def aggregate_portfolio_greeks(
 
     open_positions: list[dict] = []
     totals = {key: 0.0 for key in _GREEKS_KEYS}
-    for (raw, spec, size, side, signed_size), greeks in zip(parsed, greeks_results):
+    for (raw, spec, size, side, signed_size), greeks in zip(parsed, greeks_results, strict=True):
         if isinstance(greeks, Exception):
             logger.warning(
                 "portfolio aggregator: get_greeks failed for %s: %s",
