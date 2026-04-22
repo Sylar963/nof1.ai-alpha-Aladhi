@@ -90,7 +90,7 @@ async def test_max_leverage_is_cached_across_calls():
     await engine._get_buying_power_snapshot()
     await engine._get_buying_power_snapshot()
 
-    # 3 assets × 2 calls = 6 potential hits; the cache must collapse this to 3.
+    # 3 assets x 2 calls = 6 potential hits; the cache must collapse this to 3.
     assert engine.hyperliquid.get_max_leverage.call_count == 3
 
 

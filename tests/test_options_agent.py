@@ -206,6 +206,7 @@ async def test_agent_drops_sizeless_buy_sell_decisions():
                 "strategy": "long_call_delta_hedged",
                 "underlying": "BTC",
                 "tenor_days": 21,
+                "kind": "call",
                 "contracts": 0.02,
                 "rationale": "buy gamma",
             },

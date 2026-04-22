@@ -975,7 +975,18 @@ class ThalexAPI(ExchangeAdapter):
                 status = _STATUS_MAP.get(raw_status, "rejected")
                 error = str(raw.get("reject_reason") or raw.get("error") or raw_status)
             else:
-                status = _STATUS_MAP.get(raw_status, raw_status or "ok")
+                # Fail CLOSED on anything Thalex emits that we don't know
+                # about — letting a raw/unknown status through previously
+                # meant a future Thalex status change (or a typo) would be
+                # treated as success by every caller, potentially booking
+                # a phantom fill. Map unknowns to "error" and surface the
+                # raw value so the log trail reflects what we actually saw.
+                mapped = _STATUS_MAP.get(raw_status)
+                if mapped is None:
+                    status = "error"
+                    error = str(err_payload or raw_status)
+                else:
+                    status = mapped
             price = _quote_field(
                 raw,
                 ("price",),

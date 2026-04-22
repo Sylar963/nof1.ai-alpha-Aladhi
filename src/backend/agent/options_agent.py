@@ -239,10 +239,10 @@ HEDGE MARGIN HARD CONSTRAINT (delta-hedged strategies only)
 - Delta-hedged strategies (long_call_delta_hedged, long_put_delta_hedged, any
   vol_arb that needs a perp leg) require Hyperliquid collateral for the hedge
   leg. The context includes `hyperliquid_free_margin` and
-  `max_hedge_notional` (= free_margin × HL max_leverage / 1.05 buffer — the
+  `max_hedge_notional` (= free_margin x HL max_leverage / 1.05 buffer — the
   exact number the pre-trade guard will enforce).
 - Estimate hedge notional for your proposal as roughly
-  abs(strategy_delta_btc) × spot. If that exceeds `max_hedge_notional`,
+  abs(strategy_delta_btc) x spot. If that exceeds `max_hedge_notional`,
   either size down until it fits, switch to a non-hedged strategy
   (credit_put_spread / credit_call_spread / iron_condor), or HOLD.
 - If `hyperliquid_free_margin` ≤ 0, do NOT propose any delta-hedged strategy

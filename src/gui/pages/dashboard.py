@@ -40,8 +40,17 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
             return f'{change_pct:.2f}%', 'text-red-400'
         return '0.00%', 'text-gray-400'
 
+    # Full set of Tailwind text-color classes the indicator can hold across
+    # running / stopped / error / paused states. We clear the whole set on
+    # every tone change so a paused->resumed transition doesn't leave the
+    # orange class behind to conflict with the new green/gray tone.
+    _STATUS_TONE_CLASSES = (
+        'text-gray-400 text-green-500 text-red-500 '
+        'text-orange-300 text-orange-400 text-yellow-400'
+    )
+
     def _set_status_indicator_tone(tone: str):
-        status_indicator.classes(remove='text-gray-400 text-green-500 text-red-500')
+        status_indicator.classes(remove=_STATUS_TONE_CLASSES)
         status_indicator.classes(add=tone)
 
     ui.label('Dashboard').classes('text-3xl font-bold mb-4 text-white')
@@ -213,10 +222,13 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
                 on_click=lambda: kill_switch_confirmed(),
             ).classes('bg-red-700 hover:bg-red-800 font-bold')
 
-        # Last refresh timestamp
-        with ui.row().classes('gap-4 items-center mt-4'):
-            last_refresh_label = ui.label('Last refreshed: Never').classes('text-sm text-gray-400')
-            refresh_timer_label = ui.label('').classes('text-xs text-gray-500')
+    # Last refresh timestamp — placed on the dashboard (outside the kill
+    # dialog) so it stays visible as part of the control panel. The previous
+    # indent had it nested inside ``with kill_dialog, ui.card()``, which made
+    # the labels render inside the modal instead of on the page.
+    with ui.row().classes('gap-4 items-center mt-4'):
+        last_refresh_label = ui.label('Last refreshed: Never').classes('text-sm text-gray-400')
+        refresh_timer_label = ui.label('').classes('text-xs text-gray-500')
 
     # ===== CONTROL FUNCTIONS =====
 

@@ -227,6 +227,13 @@ class TradingBotEngine:
         self.pending_proposals: List[TradeProposal] = []
         self.logger.info(f"Trading mode: {self.trading_mode.upper()}")
 
+        # Registry of fire-and-forget tasks. Holding a strong reference until
+        # the task completes prevents the GC from collecting a running task
+        # (asyncio only weak-refs them) and gives us a single place to
+        # inspect outstanding work. ``_spawn_tracked_task`` adds entries
+        # here and removes them in its done-callback.
+        self._background_tasks: set[asyncio.Task] = set()
+
         # File paths
         self.diary_path = Path("data/diary.jsonl")
         self.diary_path.parent.mkdir(parents=True, exist_ok=True)
@@ -346,11 +353,13 @@ class TradingBotEngine:
           have no collateral number so refusing the trade is the only safe
           move — the alternative (skipping the check) would re-open the
           silent-failure bug this preflight exists to close.
-        - ``get_max_leverage`` failures → fail OPEN. Max leverage is a
-          nice-to-have sizing hint; falling back to a conservative 1× would
-          reject many legitimate trades on a transient meta hiccup. Treat
-          it as unbounded (``inf``) so the leverage divisor vanishes and the
-          check only trips on truly missing collateral.
+        - ``get_max_leverage`` failures → fall back to a conservative 1x.
+          The previous fail-OPEN (``float('inf')``) path let a zero-
+          collateral account pass the check on any meta hiccup: with
+          ``effective_leverage = inf`` the ``required`` number collapsed to
+          0 and ``available < required`` could not trip. A transient sizing
+          hint is not worth that failure mode — better to reject a
+          legitimate trade on a bad meta read than to book a phantom fill.
         """
         if notional_usd <= 0 or not self.hyperliquid:
             return
@@ -359,26 +368,35 @@ class TradingBotEngine:
             max_leverage = await self.hyperliquid.get_max_leverage(asset)
         except Exception as exc:  # pylint: disable=broad-except
             self.logger.warning(
-                "Margin preflight: get_max_leverage(%s) failed, treating as unbounded: %s",
+                "Margin preflight: get_max_leverage(%s) failed, falling back to 1x: %s",
                 asset, exc,
             )
-            max_leverage = float("inf")
+            max_leverage = None
         effective_leverage = max_leverage if max_leverage and max_leverage > 0 else 1
         required = (notional_usd / effective_leverage) * 1.05
         # Use the conservative of withdrawable vs. free_margin — both model
         # "what can I open with right now" but the venue's own ``withdrawable``
         # is the ground truth whenever it's populated.
-        available = min(
-            v for v in (info.get("withdrawable"), info.get("free_margin")) if v and v > 0
-        ) if any((info.get("withdrawable"), info.get("free_margin"))) else 0.0
+        #
+        # Materialize the candidate list explicitly so we never call min()
+        # on an empty generator (the previous ``if any(...)`` guard was
+        # incorrect: ``any((None, None))`` is False but ``any((0, 0.01))``
+        # is True even though the generator ``v>0`` test would drop the
+        # zero, and an all-zero info dict would still fall into the min()
+        # call on an empty generator).
+        candidates = [
+            v for v in (info.get("withdrawable"), info.get("free_margin"))
+            if v is not None and v > 0
+        ]
+        available = min(candidates) if candidates else 0.0
         if available < required:
             raise RuntimeError(
                 f"Insufficient Hyperliquid margin for {asset}: "
                 f"required ≈ ${required:,.2f} "
-                f"(notional ${notional_usd:,.2f} / {max_leverage}x + 5% buffer), "
+                f"(notional ${notional_usd:,.2f} / {effective_leverage}x + 5% buffer), "
                 f"available ${available:,.2f} "
-                f"(withdrawable={info.get('withdrawable', 0):,.2f}, "
-                f"free_margin={info.get('free_margin', 0):,.2f})"
+                f"(withdrawable={info.get('withdrawable', 0) or 0:,.2f}, "
+                f"free_margin={info.get('free_margin', 0) or 0:,.2f})"
             )
 
     @staticmethod
@@ -555,7 +573,19 @@ class TradingBotEngine:
                 message = f"Hedge-leg preflight: spot lookup failed: {exc}"
                 self.logger.error(message)
                 return False, message
-            worst_case_hedge_notional = float(contracts_est) * float(spot_for_hedge or 0.0)
+            # Fail CLOSED when spot is missing or non-positive — the earlier
+            # ``or 0.0`` fallback let a hedged options trade bypass the
+            # margin check with a zero notional, which is exactly the
+            # silent-failure mode this preflight exists to prevent.
+            if spot_for_hedge is None or float(spot_for_hedge) <= 0:
+                message = (
+                    f"Hedge-leg preflight aborted: spot price for "
+                    f"{decision.underlying or decision.asset or 'BTC'} "
+                    f"unavailable (got {spot_for_hedge!r}); refusing trade"
+                )
+                self.logger.error(message)
+                return False, message
+            worst_case_hedge_notional = float(contracts_est) * float(spot_for_hedge)
             try:
                 await self._hl_margin_preflight(
                     decision.underlying or "BTC", worst_case_hedge_notional
@@ -1084,7 +1114,17 @@ class TradingBotEngine:
                             exc,
                         )
                     continue
-                await self._execute_thalex_decision(decision_payload)
+                ok, reason = await self._execute_thalex_decision(decision_payload)
+                if not ok:
+                    # Options-scheduler cycle: surface the failure through
+                    # the same path perps + ad-hoc options calls use so the
+                    # circuit breaker, state.error, on_error callback, and
+                    # diary entry all stay consistent across code paths.
+                    self._handle_execution_failure(
+                        "Thalex",
+                        decision.underlying or decision.asset or "BTC",
+                        reason,
+                    )
 
             # Always publish — even an empty trade_decisions array carries the
             # LLM's reasoning text, which the operator wants to see on the
@@ -1878,7 +1918,20 @@ class TradingBotEngine:
                                     # Pre-trade margin check — fails loud if
                                     # the venue can't cover this notional so
                                     # we never record a phantom fill.
-                                    await self._hl_margin_preflight(asset, amount * current_price)
+                                    #
+                                    # Validate on ``net_new_amount``, not
+                                    # ``amount``: a flip closes the existing
+                                    # position first (that leg consumes no
+                                    # free margin, it releases it) and only
+                                    # the new directional exposure counts
+                                    # toward margin. Using ``amount`` here
+                                    # double-counted the close leg and
+                                    # caused legitimate flips to get
+                                    # rejected when ``allocation_usd`` was
+                                    # zero (pure close).
+                                    await self._hl_margin_preflight(
+                                        asset, net_new_amount * current_price
+                                    )
 
                                     # Place market order
                                     if action == 'buy':
@@ -2250,11 +2303,17 @@ class TradingBotEngine:
         proposal execution errors — the task would crash, the proposal would
         stay in its prior state, and the operator had no signal that anything
         went wrong. This wrapper surfaces the exception in the bot log and
-        marks the proposal failed when possible.
+        retains the task in ``self._background_tasks`` so it can't be
+        garbage-collected mid-flight (asyncio only keeps weak references to
+        running tasks).
         """
         task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
 
         def _done(t: asyncio.Task):
+            # Remove first so the set doesn't grow unbounded even if the
+            # exception-logging below raises.
+            self._background_tasks.discard(t)
             if t.cancelled():
                 return
             exc = t.exception()
@@ -2582,6 +2641,18 @@ class TradingBotEngine:
         self.state.is_paused = False
         self.state.pause_reason = None
         self.state.execution_failure_streak = 0
+        # Reset the drawdown baseline to the CURRENT account value so a
+        # manual resume doesn't immediately re-trip the drawdown CB from
+        # the old high-water mark. Without this, resuming while the account
+        # sits at the same level that tripped the breaker would just trip
+        # it again on the next tick.
+        current_value = float(
+            getattr(self.state, "total_value", 0.0) or 0.0
+        )
+        if current_value > 0:
+            self.peak_account_value = current_value
+            self.state.peak_account_value = current_value
+            self.state.drawdown_pct = 0.0
         try:
             self._write_diary_entry({
                 'timestamp': datetime.now(UTC).isoformat(),

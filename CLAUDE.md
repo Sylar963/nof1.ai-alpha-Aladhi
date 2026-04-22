@@ -143,3 +143,4 @@ VALID_ENTRY_KINDS = {
 
 # CODE POLICY
 Do not add a footer with the trailer 'Co-authored-by'.
+DO NOT WRITE COMMENTS UNLESS THEY ARE EXTREMELY NECESSARY

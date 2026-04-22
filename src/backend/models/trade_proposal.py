@@ -75,6 +75,9 @@ class TradeProposal:
         self.status = "executed"
         self.executed_at = datetime.now(UTC)
         self.execution_price = execution_price
+        # A retried proposal may carry ``execution_error`` from its earlier
+        # failure; a successful execution must not surface that stale reason.
+        self.execution_error = None
     
     def mark_failed(self, error: str):
         """Mark proposal as failed to execute"""

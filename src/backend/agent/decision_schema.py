@@ -176,7 +176,18 @@ def parse_decision(payload: dict) -> TradeDecision:
     if action not in VALID_ACTIONS:
         raise DecisionParseError(f"action must be one of {VALID_ACTIONS}, got {action!r}")
 
-    venue = (payload.get("venue") or "hyperliquid").lower()
+    # Type-safe venue resolution — a non-string venue (e.g. int from a
+    # malformed LLM response) would blow up on ``.lower()`` before this
+    # check could report it as a validation error.
+    raw_venue = payload.get("venue")
+    if raw_venue is None:
+        venue = "hyperliquid"
+    elif not isinstance(raw_venue, str):
+        raise DecisionParseError(
+            f"venue must be a string, got {type(raw_venue).__name__}: {raw_venue!r}"
+        )
+    else:
+        venue = raw_venue.lower()
     if venue not in VALID_VENUES:
         raise DecisionParseError(f"venue must be one of {VALID_VENUES}, got {venue!r}")
 
@@ -193,13 +204,15 @@ def parse_decision(payload: dict) -> TradeDecision:
     # venue is explicitly hyperliquid, reject — that's a prompt bug we want
     # to surface, not paper over.
     if strategy is not None:
-        raw_venue = payload.get("venue")
         if raw_venue is None:
             venue = "thalex"
-        elif str(raw_venue).lower() != "thalex":
-            raise DecisionParseError(
-                f"options strategy {strategy!r} requires venue='thalex', got {raw_venue!r}"
-            )
+        else:
+            # ``raw_venue`` is already known to be a string here; the
+            # isinstance check above rejects everything else.
+            if raw_venue.lower() != "thalex":
+                raise DecisionParseError(
+                    f"options strategy {strategy!r} requires venue='thalex', got {raw_venue!r}"
+                )
 
     underlying = payload.get("underlying")
     if strategy is not None and not underlying:
