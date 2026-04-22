@@ -738,6 +738,42 @@ class BotService:
             self._add_event(f"❌ Approval failed: {str(e)}", level="error")
             return False
 
+    async def kill_switch_flatten(self) -> dict:
+        """Cancel all orders + close all HL positions + pause trading.
+
+        Returns the engine's summary dict so the UI can show what succeeded
+        and which Thalex positions still need manual closure.
+        """
+        if not self.bot_engine:
+            return {"errors": ["bot_engine not initialized"]}
+        try:
+            result = await self.bot_engine.flatten_all()
+            err_count = len(result.get("errors", []))
+            remaining = len(result.get("thalex_positions_remaining", []))
+            self._add_event(
+                f"🚨 Kill switch: closed {len(result.get('positions_closed', []))} position(s), "
+                f"{err_count} error(s), {remaining} Thalex position(s) remaining",
+                level="warning" if err_count or remaining else "info",
+            )
+            return result
+        except Exception as e:
+            self.logger.error(f"Kill switch flatten failed: {e}")
+            self._add_event(f"❌ Kill switch failed: {e}", level="error")
+            return {"errors": [str(e)]}
+
+    def resume_trading(self) -> bool:
+        """Resume from a paused state (after circuit breaker or kill switch)."""
+        if not self.bot_engine:
+            return False
+        try:
+            resumed = self.bot_engine.resume_trading()
+            if resumed:
+                self._add_event("▶ Trading resumed")
+            return resumed
+        except Exception as e:
+            self.logger.error(f"Resume failed: {e}")
+            return False
+
     def retry_proposal(self, proposal_id: str) -> bool:
         """Re-execute a previously failed proposal (after margin deposit, etc.)."""
         if not self.bot_engine or not self.bot_engine.is_running:

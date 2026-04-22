@@ -47,6 +47,9 @@ async def build_options_context(
     daily_closes_for_keltner: Optional[list[float]] = None,
     db_session: Any = None,
     recent_trades_limit: int = 5,
+    hyperliquid: Any = None,
+    hedge_underlying: str = "BTC",
+    recent_options_skips: Optional[list[dict]] = None,
 ) -> OptionsContext:
     """Run the full options-intel pipeline and return a snapshot.
 
@@ -163,6 +166,29 @@ async def build_options_context(
     if db_session is not None:
         recent_options_trades = fetch_recent_options_trades(db_session, limit=recent_trades_limit)
 
+    # Hyperliquid hedge budget — the perp leg of delta-hedged options pulls
+    # from HL collateral, so the options agent needs to see it to avoid
+    # proposing strategies we'd have to unwind immediately.
+    hl_free_margin = 0.0
+    hl_max_leverage = 1
+    max_hedge_notional = 0.0
+    if hyperliquid is not None:
+        try:
+            info = await hyperliquid.get_free_margin_info()
+            withdrawable = float(info.get("withdrawable") or 0.0)
+            free_margin = float(info.get("free_margin") or 0.0)
+            candidates = [v for v in (withdrawable, free_margin) if v and v > 0]
+            hl_free_margin = min(candidates) if candidates else 0.0
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("hyperliquid get_free_margin_info failed: %s", exc)
+        try:
+            hl_max_leverage = max(int(await hyperliquid.get_max_leverage(hedge_underlying) or 1), 1)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("hyperliquid get_max_leverage(%s) failed: %s", hedge_underlying, exc)
+        # Mirror the perps preflight math so the LLM's cap matches what the
+        # guard will actually enforce at execution time (/1.05 buffer).
+        max_hedge_notional = round((hl_free_margin * hl_max_leverage) / 1.05, 2) if hl_free_margin > 0 else 0.0
+
     return OptionsContext(
         timestamp_utc=datetime.now(timezone.utc).isoformat(),
         spot=float(spot),
@@ -189,7 +215,11 @@ async def build_options_context(
         max_contracts_per_trade=0.1,
         max_open_positions=3,
         open_position_count=len(portfolio["open_positions"]),
+        hyperliquid_free_margin=round(hl_free_margin, 2),
+        hyperliquid_max_leverage=hl_max_leverage,
+        max_hedge_notional=max_hedge_notional,
         recent_options_trades=recent_options_trades,
+        recent_options_skips=list(recent_options_skips or []),
     )
 
 

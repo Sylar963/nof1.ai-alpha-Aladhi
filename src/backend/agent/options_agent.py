@@ -235,6 +235,31 @@ POSITION SIZING
 - When capital_available < 500 USD: use minimum size (0.01 contracts) only.
   Preserve capital for margin and hedging needs.
 
+HEDGE MARGIN HARD CONSTRAINT (delta-hedged strategies only)
+- Delta-hedged strategies (long_call_delta_hedged, long_put_delta_hedged, any
+  vol_arb that needs a perp leg) require Hyperliquid collateral for the hedge
+  leg. The context includes `hyperliquid_free_margin` and
+  `max_hedge_notional` (= free_margin × HL max_leverage / 1.05 buffer — the
+  exact number the pre-trade guard will enforce).
+- Estimate hedge notional for your proposal as roughly
+  abs(strategy_delta_btc) × spot. If that exceeds `max_hedge_notional`,
+  either size down until it fits, switch to a non-hedged strategy
+  (credit_put_spread / credit_call_spread / iron_condor), or HOLD.
+- If `hyperliquid_free_margin` ≤ 0, do NOT propose any delta-hedged strategy
+  this cycle. Proposing one will be skipped by the guard and logged as
+  `options_proposal_skipped_insufficient_hedge_margin` in
+  `recent_options_skips` — which you will see next cycle. Repeating that
+  pattern is wasted edge.
+- Pure credit spreads and iron condors don't touch HL margin; they remain
+  available regardless of `hyperliquid_free_margin`.
+
+FEEDBACK LOOP
+- `recent_options_skips` lists your last few proposals the engine rejected.
+  Read them before proposing — repeating the same skipped strategy is a sign
+  of not updating on prior feedback. If a hedge-margin skip appears there,
+  treat it as strong evidence to either downsize or avoid hedged strategies
+  until `max_hedge_notional` recovers.
+
 PORTFOLIO CONSTRAINTS
 - Net delta: keep portfolio delta between -0.10 and +0.10 BTC. Read the
   portfolio_greeks.delta field. If adding a trade would push delta outside
