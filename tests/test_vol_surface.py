@@ -39,7 +39,7 @@ def synthetic_chain():
     expiry_15d = datetime(2026, 4, 25, 8, 0, 0, tzinfo=timezone.utc)
     expiry_30d = datetime(2026, 5, 10, 8, 0, 0, tzinfo=timezone.utc)
 
-    # 15-day expiry: smile bottom at ATM 60k, edges higher
+    # 30-day expiry: smile bottom at ATM 60k, edges higher
     chain = [
         _instr("BTC-25APR26-50000-C", expiry_15d, 50000, "call", 0.85, 10500, 0.95),
         _instr("BTC-25APR26-55000-C", expiry_15d, 55000, "call", 0.72, 6000, 0.80),
@@ -130,14 +130,14 @@ def test_returns_empty_surface_for_empty_chain():
     assert surface.atm_iv_by_tenor == {}
 
 
-def test_find_atm_15d_straddle_strike_returns_closest_to_spot(synthetic_chain):
+def test_find_atm_30d_straddle_strike_returns_closest_to_spot(synthetic_chain):
     """Used by the regime classifier to anchor the straddle EM baseline."""
     chain, today, spot = synthetic_chain
     surface = build_vol_surface(chain, spot=spot, today=today)
-    info = surface.atm_straddle_15d
+    info = surface.atm_straddle_30d
     assert info is not None
     assert info["strike"] == 60000
-    assert info["call_price"] == pytest.approx(2500)
-    assert info["put_price"] == pytest.approx(2400)
-    assert info["lower_strike"] == pytest.approx(60000 - 4900)
-    assert info["upper_strike"] == pytest.approx(60000 + 4900)
+    assert info["call_price"] == pytest.approx(3500)
+    assert info["put_price"] == pytest.approx(3400)
+    assert info["lower_strike"] == pytest.approx(60000 - 6900)
+    assert info["upper_strike"] == pytest.approx(60000 + 6900)

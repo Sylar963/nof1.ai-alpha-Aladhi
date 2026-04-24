@@ -31,8 +31,8 @@ def example_context():
         expected_move_pct_by_tenor={7: 0.045, 14: 0.06, 30: 0.085},
         vol_regime="cheap",
         vol_regime_confidence="high",
-        realized_iv_ratio_15d=1.35,
-        straddle_test_15d={
+        realized_iv_ratio_30d=1.35,
+        straddle_test_30d={
             "lower": 55000,
             "upper": 65000,
             "current_spot": 60123.45,
@@ -90,8 +90,8 @@ def test_snapshot_does_not_leak_raw_chain():
         expected_move_pct_by_tenor={},
         vol_regime="unknown",
         vol_regime_confidence="unknown",
-        realized_iv_ratio_15d=0.0,
-        straddle_test_15d={},
+        realized_iv_ratio_30d=0.0,
+        straddle_test_30d={},
         top_mispricings_vs_deribit=huge_mispricings,
         open_positions=[],
         portfolio_greeks={"delta": 0, "gamma": 0, "vega": 0, "theta": 0},

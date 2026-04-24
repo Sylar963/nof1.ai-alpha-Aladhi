@@ -531,7 +531,7 @@ def test_build_positions_view_marks_ai_and_external_option_positions():
         },
     ]
 
-    rows = TradingBotEngine._build_positions_view(
+    view = TradingBotEngine._build_positions_view(
         engine,
         [
             {
@@ -567,6 +567,12 @@ def test_build_positions_view_marks_ai_and_external_option_positions():
             ),
         ],
     )
+    rows = view["combined"]
+    assert set(view.keys()) == {"hyperliquid", "thalex", "combined"}
+    assert len(view["hyperliquid"]) == 1
+    assert len(view["thalex"]) == 2
+    assert all(r["venue"] == "hyperliquid" for r in view["hyperliquid"])
+    assert all(r["venue"] == "thalex" for r in view["thalex"])
 
     assert rows == [
         {

@@ -40,8 +40,17 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
             return f'{change_pct:.2f}%', 'text-red-400'
         return '0.00%', 'text-gray-400'
 
+    # Full set of Tailwind text-color classes the indicator can hold across
+    # running / stopped / error / paused states. We clear the whole set on
+    # every tone change so a paused->resumed transition doesn't leave the
+    # orange class behind to conflict with the new green/gray tone.
+    _STATUS_TONE_CLASSES = (
+        'text-gray-400 text-green-500 text-red-500 '
+        'text-orange-300 text-orange-400 text-yellow-400'
+    )
+
     def _set_status_indicator_tone(tone: str):
-        status_indicator.classes(remove='text-gray-400 text-green-500 text-red-500')
+        status_indicator.classes(remove=_STATUS_TONE_CLASSES)
         status_indicator.classes(add=tone)
 
     ui.label('Dashboard').classes('text-3xl font-bold mb-4 text-white')
@@ -213,10 +222,13 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
                 on_click=lambda: kill_switch_confirmed(),
             ).classes('bg-red-700 hover:bg-red-800 font-bold')
 
-        # Last refresh timestamp
-        with ui.row().classes('gap-4 items-center mt-4'):
-            last_refresh_label = ui.label('Last refreshed: Never').classes('text-sm text-gray-400')
-            refresh_timer_label = ui.label('').classes('text-xs text-gray-500')
+    # Last refresh timestamp — placed on the dashboard (outside the kill
+    # dialog) so it stays visible as part of the control panel. The previous
+    # indent had it nested inside ``with kill_dialog, ui.card()``, which made
+    # the labels render inside the modal instead of on the page.
+    with ui.row().classes('gap-4 items-center mt-4'):
+        last_refresh_label = ui.label('Last refreshed: Never').classes('text-sm text-gray-400')
+        refresh_timer_label = ui.label('').classes('text-xs text-gray-500')
 
     # ===== CONTROL FUNCTIONS =====
 
@@ -352,6 +364,13 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
     refresh_seconds_ago = 0
     displayed_events = set()
 
+    # Keyed caches so the 3s timer updates card fields in place instead of
+    # rebuilding the entire card grid (the previous clear()+rebuild pattern
+    # recreated 50+ DOM elements per tick when 5 assets were tracked).
+    market_card_cache: dict = {}      # asset -> dict of element refs
+    hedge_card_cache: dict = {}        # underlying -> dict of element refs
+    hedge_alert_cache: dict = {'key': None}  # serialized alert signature
+
     async def refresh_market_data():
         """Refresh market data from Hyperliquid without starting bot"""
         nonlocal last_refresh_time, refresh_seconds_ago
@@ -392,6 +411,204 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
                 await asyncio.sleep(2.0)
                 if _ui_ok():
                     refresh_data_loading.text = ''
+
+    def _build_market_card(asset: str, parent) -> dict:
+        """Build one market-data card once; return element refs for reuse.
+
+        Every subsequent tick calls ``.text = ...`` on these refs instead of
+        recreating the whole DOM subtree, which is what killed dashboard
+        smoothness at the 3-second cadence.
+        """
+        refs: dict = {}
+        with parent:
+            with ui.card().classes('p-4 bg-gradient-to-br from-gray-700 to-gray-800') as refs['card']:
+                with ui.row().classes('w-full items-center justify-between mb-2'):
+                    ui.label(asset).classes('text-2xl font-bold text-white')
+                    ui.badge('Hyperliquid + TAAPI').classes('bg-gray-900 text-gray-200')
+                refs['price'] = ui.label('--').classes('text-xl text-green-400 mb-2')
+                with ui.grid(columns=3).classes('w-full gap-2 mb-3'):
+                    with ui.card().classes('p-2 bg-gray-900/40'):
+                        ui.label('24h Change').classes('text-xs text-gray-400')
+                        refs['change'] = ui.label('--').classes('text-sm font-bold text-gray-400')
+                    with ui.card().classes('p-2 bg-gray-900/40'):
+                        ui.label('24h Volume').classes('text-xs text-gray-400')
+                        refs['volume'] = ui.label('--').classes('text-sm font-bold text-white')
+                    with ui.card().classes('p-2 bg-gray-900/40'):
+                        ui.label('Open Interest').classes('text-xs text-gray-400')
+                        refs['oi'] = ui.label('--').classes('text-sm font-bold text-white')
+                with ui.column().classes('gap-1 text-sm'):
+                    refs['sma99'] = ui.label('SMA99 (5m): N/A').classes('text-gray-300')
+                    refs['avwap'] = ui.label('AVWAP 2026: N/A').classes('text-gray-300')
+                    ui.separator()
+                    refs['lt_sma99'] = ui.label('SMA99 (HTF): N/A').classes('text-gray-400')
+                    refs['lt_avwap'] = ui.label('AVWAP 2026: N/A').classes('text-gray-400')
+        return refs
+
+    def _update_market_cards(market_data):
+        """Keyed in-place update of the per-asset market cards."""
+        if not market_data or not isinstance(market_data, list):
+            # No data — show the placeholder once; don't thrash the DOM.
+            if market_card_cache.get('__placeholder__') is None:
+                market_data_container.clear()
+                market_card_cache.clear()
+                with market_data_container:
+                    ph = ui.label('No market data available').classes(
+                        'text-gray-400 text-center py-4'
+                    )
+                market_card_cache['__placeholder__'] = ph
+            return
+
+        current_assets = [a.get('asset', 'N/A') for a in market_data]
+        cached_assets = [
+            k for k in market_card_cache.keys()
+            if k not in {'__placeholder__', '__grid__'}
+        ]
+
+        # Structural change (asset set changed) — rebuild the grid container
+        # once. Otherwise all we do is update element text, which is cheap.
+        if cached_assets != current_assets:
+            market_data_container.clear()
+            market_card_cache.clear()
+            with market_data_container:
+                grid = ui.grid(columns=len(current_assets)).classes('w-full gap-4')
+            market_card_cache['__grid__'] = grid
+            for asset in current_assets:
+                market_card_cache[asset] = _build_market_card(asset, grid)
+
+        for asset_data in market_data:
+            asset = asset_data.get('asset', 'N/A')
+            refs = market_card_cache.get(asset)
+            if refs is None:
+                continue
+            price = asset_data.get('current_price')
+            prev_day_price = asset_data.get('prev_day_price')
+            change_text, change_tone = _format_change(price, prev_day_price)
+
+            refs['price'].text = f'${price:,.2f}' if price is not None else '--'
+            refs['change'].text = change_text
+            refs['change'].classes(
+                remove='text-green-400 text-red-400 text-gray-400',
+                add=change_tone,
+            )
+            refs['volume'].text = _format_compact_number(
+                asset_data.get('volume_24h'), prefix='$'
+            )
+            refs['oi'].text = _format_compact_number(asset_data.get('open_interest'))
+
+            intraday = asset_data.get('intraday', {})
+            sma99 = intraday.get('sma99', 0)
+            avwap = intraday.get('avwap', 0)
+            refs['sma99'].text = (
+                f'SMA99 (5m): {sma99:.2f}' if sma99 else 'SMA99 (5m): N/A'
+            )
+            refs['avwap'].text = (
+                f'AVWAP 2026: {avwap:.2f}' if avwap else 'AVWAP 2026: N/A'
+            )
+            lt = asset_data.get('long_term', {}) or {}
+            lt_sma99 = lt.get('sma99', 0)
+            lt_avwap = lt.get('avwap', 0)
+            lt_interval = lt.get('interval', 'HTF')
+            refs['lt_sma99'].text = (
+                f'SMA99 ({lt_interval}): {lt_sma99:.2f}'
+                if lt_sma99 else f'SMA99 ({lt_interval}): N/A'
+            )
+            refs['lt_avwap'].text = (
+                f'AVWAP 2026: {lt_avwap:.2f}' if lt_avwap else 'AVWAP 2026: N/A'
+            )
+
+    def _update_hedge_alerts(state_error, degraded):
+        """Only rebuild alerts when the alert set actually changes."""
+        # Cheap signature so we can short-circuit identical ticks.
+        sig = (
+            str(state_error) if state_error else None,
+            tuple(sorted((str(k), str(v)) for k, v in (degraded or {}).items())),
+        )
+        if sig == hedge_alert_cache.get('key'):
+            return
+        hedge_alert_cache['key'] = sig
+        hedge_alert_container.clear()
+        with hedge_alert_container:
+            if state_error:
+                with ui.card().classes('w-full bg-yellow-900/40 border border-yellow-700 p-3'):
+                    ui.label('Thalex unavailable').classes('text-yellow-300 font-semibold')
+                    ui.label(str(state_error)).classes('text-sm text-yellow-100')
+            elif degraded:
+                for underlying, reason in degraded.items():
+                    with ui.card().classes('w-full bg-red-900/40 border border-red-700 p-3'):
+                        ui.label(f'{underlying} hedge degraded').classes('text-red-300 font-semibold')
+                        ui.label(reason).classes('text-sm text-red-200')
+            else:
+                ui.label('No hedge alerts').classes('text-gray-400 text-sm')
+
+    def _build_hedge_metric_card(underlying: str, parent) -> dict:
+        refs: dict = {}
+        with parent:
+            with ui.card().classes('p-4 bg-gradient-to-br from-gray-700 to-gray-800'):
+                ui.label(underlying).classes('text-2xl font-bold text-white mb-2')
+                refs['status'] = ui.label('UNKNOWN').classes('text-sm font-semibold text-cyan-300 mb-3')
+                with ui.column().classes('gap-1 text-sm'):
+                    refs['net_delta'] = ui.label('Net option delta: +0.0000').classes('text-gray-300')
+                    refs['target'] = ui.label('Target perp delta: N/A').classes('text-gray-300')
+                    refs['current'] = ui.label('Current perp delta: N/A').classes('text-gray-300')
+                    refs['residual'] = ui.label('Residual delta: N/A').classes('text-gray-300')
+                    refs['threshold'] = ui.label('Threshold: N/A').classes('text-gray-400')
+                    refs['open_opts'] = ui.label('Open options: 0').classes('text-gray-400')
+                    refs['last_rebalance'] = ui.label('Last rebalance: none 0.0000').classes('text-gray-400')
+        return refs
+
+    def _update_hedge_metrics(hedge_metrics):
+        if not hedge_metrics:
+            if hedge_card_cache.get('__placeholder__') is None:
+                hedge_metrics_container.clear()
+                hedge_card_cache.clear()
+                with hedge_metrics_container:
+                    ph = ui.label('No hedge metrics available').classes(
+                        'text-gray-400 text-center py-4'
+                    )
+                hedge_card_cache['__placeholder__'] = ph
+            return
+
+        current_keys = [m.get('underlying', 'N/A') for m in hedge_metrics]
+        cached_keys = [
+            k for k in hedge_card_cache.keys()
+            if k not in {'__placeholder__', '__grid__'}
+        ]
+        if cached_keys != current_keys:
+            hedge_metrics_container.clear()
+            hedge_card_cache.clear()
+            with hedge_metrics_container:
+                grid = ui.grid(columns=max(1, len(current_keys))).classes('w-full gap-4')
+            hedge_card_cache['__grid__'] = grid
+            for underlying in current_keys:
+                hedge_card_cache[underlying] = _build_hedge_metric_card(underlying, grid)
+
+        for metric in hedge_metrics:
+            underlying = metric.get('underlying', 'N/A')
+            refs = hedge_card_cache.get(underlying)
+            if refs is None:
+                continue
+            refs['status'].text = str(metric.get('status', 'unknown')).upper()
+            refs['net_delta'].text = f'Net option delta: {metric.get("net_option_delta", 0.0):+.4f}'
+            target = metric.get('target_perp_delta')
+            current = metric.get('current_perp_delta')
+            residual = metric.get('residual_delta')
+            threshold = metric.get('threshold')
+            refs['target'].text = (
+                f'Target perp delta: {target:+.4f}' if target is not None else 'Target perp delta: N/A'
+            )
+            refs['current'].text = (
+                f'Current perp delta: {current:+.4f}' if current is not None else 'Current perp delta: N/A'
+            )
+            refs['residual'].text = (
+                f'Residual delta: {residual:+.4f}' if residual is not None else 'Residual delta: N/A'
+            )
+            refs['threshold'].text = (
+                f'Threshold: {threshold:.4f}' if threshold is not None else 'Threshold: N/A'
+            )
+            refs['open_opts'].text = f'Open options: {metric.get("open_option_positions", 0)}'
+            last_side = metric.get('last_rebalance_side') or 'none'
+            last_size = metric.get('last_rebalance_size') or 0.0
+            refs['last_rebalance'].text = f'Last rebalance: {last_side} {last_size:.4f}'
 
     async def update_dashboard():
         """Update all dashboard components with latest data"""
@@ -480,109 +697,30 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
                 equity_chart.figure.data[0].y = []
                 equity_chart.update()
 
-            # Update asset allocation chart
+            # Update asset allocation chart — mark-to-market, falling back to
+            # entry price when the live quote isn't populated yet. Using
+            # ``entry_price`` alone drifted from reality as soon as the
+            # market moved (a long opened at 60k reads a third too low when
+            # spot is 90k).
             if positions:
                 labels = [p['symbol'] for p in positions]
-                values = [abs(p['quantity'] * p['entry_price']) for p in positions]
+                values = [
+                    abs(p['quantity'] * (p.get('current_price') or p['entry_price']))
+                    for p in positions
+                ]
 
                 allocation_chart.figure.data[0].labels = labels
                 allocation_chart.figure.data[0].values = values
                 allocation_chart.update()
 
-            # Update market data
+            # Update market data — keyed in-place updates instead of
+            # clear()+rebuild. Only the *structure* (asset set) triggers a
+            # rebuild; per-tick price/volume changes just set label text.
             market_data = getattr(state, 'market_data', None)
-            market_data_container.clear()
-            
-            if market_data and isinstance(market_data, list) and len(market_data) > 0:
-                with market_data_container:
-                    with ui.grid(columns=len(market_data)).classes('w-full gap-4'):
-                        for asset_data in market_data:
-                            asset = asset_data.get('asset', 'N/A')
-                            price = asset_data.get('current_price')
-                            prev_day_price = asset_data.get('prev_day_price')
-                            volume_24h = asset_data.get('volume_24h')
-                            open_interest = asset_data.get('open_interest')
-                            change_text, change_tone = _format_change(price, prev_day_price)
-                            
-                            # Intraday data
-                            intraday = asset_data.get('intraday', {})
-                            sma99 = intraday.get('sma99', 0)
-                            avwap = intraday.get('avwap', 0)
-                            
-                            # Long-term data
-                            lt = asset_data.get('long_term', {})
-                            lt_sma99 = lt.get('sma99', 0)
-                            lt_avwap = lt.get('avwap', 0)
-                            
-                            with ui.card().classes('p-4 bg-gradient-to-br from-gray-700 to-gray-800'):
-                                with ui.row().classes('w-full items-center justify-between mb-2'):
-                                    ui.label(asset).classes('text-2xl font-bold text-white')
-                                    ui.badge('Hyperliquid + TAAPI').classes('bg-gray-900 text-gray-200')
-                                ui.label(f'${price:,.2f}' if price is not None else '--').classes('text-xl text-green-400 mb-2')
-                                with ui.grid(columns=3).classes('w-full gap-2 mb-3'):
-                                    with ui.card().classes('p-2 bg-gray-900/40'):
-                                        ui.label('24h Change').classes('text-xs text-gray-400')
-                                        ui.label(change_text).classes(f'text-sm font-bold {change_tone}')
-                                    with ui.card().classes('p-2 bg-gray-900/40'):
-                                        ui.label('24h Volume').classes('text-xs text-gray-400')
-                                        ui.label(_format_compact_number(volume_24h, prefix='$')).classes('text-sm font-bold text-white')
-                                    with ui.card().classes('p-2 bg-gray-900/40'):
-                                        ui.label('Open Interest').classes('text-xs text-gray-400')
-                                        ui.label(_format_compact_number(open_interest)).classes('text-sm font-bold text-white')
-                                
-                                with ui.column().classes('gap-1 text-sm'):
-                                    ui.label(f'SMA99 (5m): {sma99:.2f}' if sma99 else 'SMA99 (5m): N/A').classes('text-gray-300')
-                                    ui.label(f'AVWAP 2026: {avwap:.2f}' if avwap else 'AVWAP 2026: N/A').classes('text-gray-300')
-                                    ui.separator()
-                                    ui.label(f'SMA99 ({lt.get("interval", "HTF")}): {lt_sma99:.2f}' if lt_sma99 else f'SMA99 ({lt.get("interval", "HTF")}): N/A').classes('text-gray-400')
-                                    ui.label(f'AVWAP 2026: {lt_avwap:.2f}' if lt_avwap else 'AVWAP 2026: N/A').classes('text-gray-400')
-            else:
-                with market_data_container:
-                    ui.label('No market data available').classes('text-gray-400 text-center py-4')
+            _update_market_cards(market_data)
 
-            hedge_alert_container.clear()
-            if state_error:
-                with hedge_alert_container:
-                    with ui.card().classes('w-full bg-yellow-900/40 border border-yellow-700 p-3'):
-                        ui.label('Thalex unavailable').classes('text-yellow-300 font-semibold')
-                        ui.label(str(state_error)).classes('text-sm text-yellow-100')
-            elif degraded:
-                with hedge_alert_container:
-                    for underlying, reason in degraded.items():
-                        with ui.card().classes('w-full bg-red-900/40 border border-red-700 p-3'):
-                            ui.label(f'{underlying} hedge degraded').classes('text-red-300 font-semibold')
-                            ui.label(reason).classes('text-sm text-red-200')
-            else:
-                with hedge_alert_container:
-                    ui.label('No hedge alerts').classes('text-gray-400 text-sm')
-
-            hedge_metrics_container.clear()
-            if hedge_metrics:
-                with hedge_metrics_container:
-                    with ui.grid(columns=max(1, len(hedge_metrics))).classes('w-full gap-4'):
-                        for metric in hedge_metrics:
-                            underlying = metric.get('underlying', 'N/A')
-                            status = str(metric.get('status', 'unknown')).upper()
-                            residual = metric.get('residual_delta')
-                            target = metric.get('target_perp_delta')
-                            current = metric.get('current_perp_delta')
-                            threshold = metric.get('threshold')
-                            last_side = metric.get('last_rebalance_side') or 'none'
-                            last_size = metric.get('last_rebalance_size') or 0.0
-                            with ui.card().classes('p-4 bg-gradient-to-br from-gray-700 to-gray-800'):
-                                ui.label(underlying).classes('text-2xl font-bold text-white mb-2')
-                                ui.label(status).classes('text-sm font-semibold text-cyan-300 mb-3')
-                                with ui.column().classes('gap-1 text-sm'):
-                                    ui.label(f'Net option delta: {metric.get("net_option_delta", 0.0):+.4f}').classes('text-gray-300')
-                                    ui.label(f'Target perp delta: {target:+.4f}' if target is not None else 'Target perp delta: N/A').classes('text-gray-300')
-                                    ui.label(f'Current perp delta: {current:+.4f}' if current is not None else 'Current perp delta: N/A').classes('text-gray-300')
-                                    ui.label(f'Residual delta: {residual:+.4f}' if residual is not None else 'Residual delta: N/A').classes('text-gray-300')
-                                    ui.label(f'Threshold: {threshold:.4f}' if threshold is not None else 'Threshold: N/A').classes('text-gray-400')
-                                    ui.label(f'Open options: {metric.get("open_option_positions", 0)}').classes('text-gray-400')
-                                    ui.label(f'Last rebalance: {last_side} {last_size:.4f}').classes('text-gray-400')
-            else:
-                with hedge_metrics_container:
-                    ui.label('No hedge metrics available').classes('text-gray-400 text-center py-4')
+            _update_hedge_alerts(state_error, degraded)
+            _update_hedge_metrics(hedge_metrics)
 
             # Update activity log with recent events
             recent_events = bot_service.get_recent_events(limit=5)

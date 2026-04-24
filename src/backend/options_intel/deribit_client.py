@@ -191,6 +191,50 @@ class DeribitPublicClient:
         self._cache_put(cache_key, closes)
         return closes
 
+    async def get_volatility_index_data(
+        self,
+        currency: str = "BTC",
+        start_timestamp_ms: int = 0,
+        end_timestamp_ms: int = 0,
+        resolution: str = "1D",
+    ) -> list[list[float]]:
+        """Return Deribit DVOL OHLC bars: ``[[ts_ms, open, high, low, close], ...]``.
+
+        Deribit's DVOL is a 30-day constant-maturity BTC implied-vol index
+        expressed in annualized percent. Used by the one-shot backfill
+        script to seed the regime classifier's history store.
+        """
+        cache_key = (
+            "volatility_index_data",
+            currency,
+            start_timestamp_ms,
+            end_timestamp_ms,
+            resolution,
+        )
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
+
+        params = {
+            "currency": currency,
+            "start_timestamp": str(start_timestamp_ms),
+            "end_timestamp": str(end_timestamp_ms),
+            "resolution": resolution,
+        }
+        payload = await self._get("/public/get_volatility_index_data", params=params)
+        result = payload.get("result") if isinstance(payload, dict) else {}
+        bars = result.get("data") if isinstance(result, dict) else None
+        out: list[list[float]] = []
+        if isinstance(bars, list):
+            for row in bars:
+                if isinstance(row, list) and len(row) >= 5:
+                    try:
+                        out.append([float(x) for x in row[:5]])
+                    except (TypeError, ValueError):
+                        continue
+        self._cache_put(cache_key, out)
+        return out
+
     async def get_index_price(self, index_name: str = "btc_usd") -> float:
         """Return the current index spot price (e.g. ``btc_usd``)."""
         cache_key = ("index_price", index_name)

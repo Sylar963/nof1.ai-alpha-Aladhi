@@ -27,6 +27,11 @@ pytest -k "options" -v
 
 There is no linter, formatter, or type-checker configured. No CI/CD pipeline exists.
 
+## Repo-Specific LLM Reference
+
+- For dependency version bounds and pytest fixture/testing patterns, read `.agents/skills/nof1-stack-and-testing/SKILL.md` before editing stack-sensitive code or tests.
+- Treat `requirements.txt` as the compatibility source of truth.
+
 ## Architecture
 
 ```text
@@ -138,3 +143,4 @@ VALID_ENTRY_KINDS = {
 
 # CODE POLICY
 Do not add a footer with the trailer 'Co-authored-by'.
+DO NOT WRITE COMMENTS UNLESS THEY ARE EXTREMELY NECESSARY

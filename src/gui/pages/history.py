@@ -7,6 +7,7 @@ from datetime import datetime
 from nicegui import ui
 from src.gui.services.bot_service import BotService
 from src.gui.services.state_manager import StateManager
+from src.gui.services.ui_utils import is_ui_alive
 
 
 def create_history(bot_service: BotService, state_manager: StateManager):
@@ -206,9 +207,17 @@ def create_history(bot_service: BotService, state_manager: StateManager):
         'limit': 100
     }
 
+    # Cache of the last rendered rows signature so the 5s timer skips the
+    # (expensive) full table refresh when trade history hasn't changed.
+    last_render_sig: dict = {'value': None}
+
     # Update function
     async def update_history():
         """Update trade history table"""
+        # Bail out if the user navigated away — touching .rows on a deleted
+        # element raises RuntimeError and surfaces as a toast spam.
+        if not is_ui_alive(table):
+            return
         try:
             # Get filtered trade history
             asset = None if current_filters['asset'] == 'All' else current_filters['asset']
@@ -263,8 +272,19 @@ def create_history(bot_service: BotService, state_manager: StateManager):
                         'rationale': trade.get('rationale', ''),
                     })
 
-                table.rows = rows
-                table.update()
+                # Skip the reassignment when the row set is unchanged — the
+                # NiceGUI table re-renders every cell on assignment, which on
+                # a 5s cadence with 100+ rows causes visible jank.
+                sig = (
+                    len(rows),
+                    rows[0].get('timestamp') if rows else None,
+                    rows[-1].get('timestamp') if rows else None,
+                    total_pnl_value,
+                )
+                if sig != last_render_sig['value']:
+                    table.rows = rows
+                    table.update()
+                    last_render_sig['value'] = sig
             else:
                 # Clear statistics when no trades
                 total_trades.text = '0'

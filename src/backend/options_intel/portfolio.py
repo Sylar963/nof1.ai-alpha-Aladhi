@@ -44,6 +44,7 @@ import logging
 from datetime import date
 from typing import Any, Iterable, Optional
 
+from src.backend.options_intel.greeks_bs import black_scholes_greeks
 from src.backend.trading.options import parse_instrument_name
 
 
@@ -57,6 +58,8 @@ async def aggregate_portfolio_greeks(
     positions: Iterable[dict],
     greeks_source: Any,
     today: date,
+    *,
+    spot: Optional[float] = None,
 ) -> dict:
     """Build the open_positions list and net portfolio greeks dict.
 
@@ -135,7 +138,35 @@ async def aggregate_portfolio_greeks(
             except (TypeError, ValueError):
                 continue
             position_view[key] = value_f
-            totals[key] += signed_size * value_f
+
+        # Thalex ticker only publishes iv + delta; fill in gamma/vega/theta
+        # locally via Black-Scholes so the LLM sees a complete greeks row
+        # and the portfolio totals aren't silently under-reporting risk.
+        iv_raw = greeks.get("mark_iv") if isinstance(greeks, dict) else None
+        if iv_raw is None and isinstance(greeks, dict):
+            iv_raw = greeks.get("iv")
+        try:
+            iv_for_bs = float(iv_raw) if iv_raw is not None else 0.0
+        except (TypeError, ValueError):
+            iv_for_bs = 0.0
+        if iv_for_bs > 2.0:
+            iv_for_bs = iv_for_bs / 100.0
+        missing = [k for k in _GREEKS_KEYS if k not in position_view]
+        if missing and spot and iv_for_bs > 0 and days_to_expiry > 0:
+            local = black_scholes_greeks(
+                spot=float(spot),
+                strike=float(spec.strike),
+                iv=iv_for_bs,
+                time_years=days_to_expiry / 365.0,
+                kind=spec.kind,
+            )
+            for key in missing:
+                position_view[key] = local[key]
+            position_view["greeks_source"] = "bs_local"
+
+        for key in _GREEKS_KEYS:
+            if key in position_view:
+                totals[key] += signed_size * position_view[key]
 
         open_positions.append(position_view)
 

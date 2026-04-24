@@ -1,11 +1,11 @@
 """Vol regime classifier — combines two signals into one label.
 
-Signal 1 (your heuristic): the **15-day ATM straddle expected-move test**.
-Look back at the straddle anchor we persisted ~15 days ago and ask: where is
+Signal 1 (your heuristic): the **30-day ATM straddle expected-move test**.
+Look back at the straddle anchor we persisted ~30 days ago and ask: where is
 spot now relative to that historical implied range?
 
-    spot < lower_strike_15d_ago → 'cheap'
-    spot > upper_strike_15d_ago → 'rich'
+    spot < lower_strike_30d_ago → 'cheap'
+    spot > upper_strike_30d_ago → 'rich'
     inside the range            → 'fair'
 
 (Per user direction. The standard "vol cheap if realized exceeded implied"
@@ -13,8 +13,8 @@ read is the *opposite* — we'll verify on first run with live data and flip
 the labels if it turns out the standard read is correct.)
 
 Signal 2 (standard): **realized vs implied vol ratio**.
-Compute close-to-close annualized realized vol over the last 15 days and
-compare to current ATM-15d implied vol:
+Compute close-to-close annualized realized vol over the last 30 days and
+compare to current ATM-30d implied vol:
 
     RV / IV > 1.2 → 'cheap'   (real moves outran implied)
     RV / IV < 0.8 → 'rich'    (implied was bigger than realized)
@@ -56,8 +56,8 @@ class RegimeReading:
 
     # Signal 2 raw
     signal_2_label: str  # 'rich' | 'cheap' | 'fair' | 'unknown'
-    realized_vol_15d: float
-    implied_vol_15d: float
+    realized_vol_30d: float
+    implied_vol_30d: float
     rv_iv_ratio: float
 
     def to_dict(self) -> dict:
@@ -67,17 +67,17 @@ class RegimeReading:
             "signal_1": {
                 "label": self.signal_1_label,
                 "current_spot": self.current_spot,
-                "lower_15d_ago": (
+                "lower_30d_ago": (
                     self.historical_anchor.lower_strike if self.historical_anchor else None
                 ),
-                "upper_15d_ago": (
+                "upper_30d_ago": (
                     self.historical_anchor.upper_strike if self.historical_anchor else None
                 ),
             },
             "signal_2": {
                 "label": self.signal_2_label,
-                "rv_15d": self.realized_vol_15d,
-                "iv_15d": self.implied_vol_15d,
+                "rv_30d": self.realized_vol_30d,
+                "iv_30d": self.implied_vol_30d,
                 "rv_iv_ratio": self.rv_iv_ratio,
             },
         }
@@ -144,11 +144,11 @@ def _signal_2(rv: float, iv: float) -> tuple[str, float]:
 def classify_regime(
     store: IVHistoryStore,
     current_spot: float,
-    current_atm_iv_15d: float,
+    current_atm_iv_30d: float,
     spot_history: list[float],
     now: Optional[datetime] = None,
-    target_age_days: float = 15.0,
-    tenor_days: int = 15,
+    target_age_days: float = 30.0,
+    tenor_days: int = 30,
 ) -> RegimeReading:
     """Combine the two signals into a single regime label.
 
@@ -156,10 +156,10 @@ def classify_regime(
         store: persistent IV history store with anchors written by
             ``builder.refresh_vol_surface``.
         current_spot: spot price right now.
-        current_atm_iv_15d: ATM 15-day implied vol from the latest surface.
+        current_atm_iv_30d: ATM 30-day implied vol from the latest surface.
         spot_history: ~16 daily closes (most recent last) for the RV calc.
         now: defaults to ``datetime.now(UTC)``.
-        target_age_days: how far back to compare against (15 by default).
+        target_age_days: how far back to compare against (30 by default).
         tenor_days: which persisted tenor anchor to look up.
     """
     now = now or datetime.now(timezone.utc)
@@ -168,7 +168,7 @@ def classify_regime(
     s1_label = _signal_1(anchor, current_spot)
 
     rv = realized_vol_close_to_close(spot_history)
-    s2_label, ratio = _signal_2(rv, current_atm_iv_15d)
+    s2_label, ratio = _signal_2(rv, current_atm_iv_30d)
 
     # Combined logic
     if s1_label == "unknown" or s2_label == "unknown":
@@ -188,7 +188,7 @@ def classify_regime(
         historical_anchor=anchor,
         current_spot=current_spot,
         signal_2_label=s2_label,
-        realized_vol_15d=rv,
-        implied_vol_15d=current_atm_iv_15d,
+        realized_vol_30d=rv,
+        implied_vol_30d=current_atm_iv_30d,
         rv_iv_ratio=ratio,
     )

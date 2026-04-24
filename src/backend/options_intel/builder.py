@@ -16,6 +16,8 @@ import logging
 from datetime import date, datetime, timezone
 from typing import Any, Optional
 
+from src.backend.options_intel.chain_enricher import enrich_chain_with_tickers
+from src.backend.options_intel.deribit_chain import normalize_deribit_chain
 from src.backend.options_intel.iv_history_store import IVHistoryRow, IVHistoryStore
 from src.backend.options_intel.mispricing import scan_mispricings
 from src.backend.options_intel.portfolio import aggregate_portfolio_greeks
@@ -26,7 +28,11 @@ from src.backend.options_intel.technicals import (
     compute_opening_range,
 )
 from src.backend.options_intel.trade_history import fetch_recent_options_trades
-from src.backend.options_intel.vol_surface import build_vol_surface
+from src.backend.options_intel.vol_surface import (
+    atm_iv_for_target_tenor,
+    build_vol_surface,
+    merge_surfaces,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -50,6 +56,9 @@ async def build_options_context(
     hyperliquid: Any = None,
     hedge_underlying: str = "BTC",
     recent_options_skips: Optional[list[dict]] = None,
+    surface_age_seconds: Optional[float] = None,
+    surface_stale_multiplier: float = 2.0,
+    vol_surface_interval_seconds: Optional[float] = None,
 ) -> OptionsContext:
     """Run the full options-intel pipeline and return a snapshot.
 
@@ -60,7 +69,7 @@ async def build_options_context(
             ``get_book_summary_by_currency`` and ``get_index_price``.
         iv_history: persistent SQLite store for straddle anchors.
         spot_history: ~16 daily closes (most recent last) for realized vol.
-        persist_anchor: when True, write today's 15-day straddle anchor to
+        persist_anchor: when True, write today's 30-day straddle anchor to
             ``iv_history`` so the regime classifier has a fresh data point.
         top_mispricings: how many of the largest IV gaps to surface.
         min_edge_bps: drop mispricings below this absolute IV diff.
@@ -87,13 +96,28 @@ async def build_options_context(
     except Exception as exc:  # pylint: disable=broad-except
         logger.warning("Deribit book summary fetch failed: %s", exc)
 
-    surface = build_vol_surface(thalex_chain, spot=spot, today=today)
+    # Thalex `public/instruments` carries metadata only (no IV, no mark).
+    # Enrich the relevant subset via `public/ticker` so the surface parser
+    # has the fields it needs. Failures degrade to an unenriched chain.
+    enrich_stats: dict = {"targeted": 0, "enriched": 0, "failed": 0}
+    try:
+        thalex_chain, enrich_stats = await enrich_chain_with_tickers(
+            thalex_chain, thalex=thalex, spot=spot,
+        )
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning("Thalex chain enrichment failed: %s", exc)
 
-    # Persist a 15-day anchor on each refresh so the regime classifier has
+    thalex_surface = build_vol_surface(thalex_chain, spot=spot, today=today)
+    deribit_surface = build_vol_surface(
+        normalize_deribit_chain(deribit_chain), spot=spot, today=today,
+    )
+    surface = merge_surfaces(thalex_surface, deribit_surface)
+
+    # Persist a 30-day anchor on each refresh so the regime classifier has
     # something to look back at after a few days of running.
-    if persist_anchor and surface.atm_straddle_15d:
+    if persist_anchor and surface.atm_straddle_30d:
         try:
-            anchor = surface.atm_straddle_15d
+            anchor = surface.atm_straddle_30d
             iv_history.write(
                 IVHistoryRow(
                     ts=datetime.now(timezone.utc),
@@ -108,10 +132,11 @@ async def build_options_context(
         except Exception as exc:  # pylint: disable=broad-except
             logger.warning("iv_history write failed: %s", exc)
 
+    atm_iv_30d = atm_iv_for_target_tenor(surface.atm_iv_by_tenor, 30) or 0.0
     regime_reading = classify_regime(
         store=iv_history,
         current_spot=spot,
-        current_atm_iv_15d=surface.atm_iv_by_tenor.get(15) or 0.0,
+        current_atm_iv_30d=atm_iv_30d,
         spot_history=spot_history,
     )
 
@@ -157,6 +182,7 @@ async def build_options_context(
         positions=raw_positions,
         greeks_source=thalex,
         today=today_for_signals,
+        spot=float(spot),
     )
 
     # Recent options trade history — last N closed Thalex trades pulled from
@@ -189,6 +215,20 @@ async def build_options_context(
         # guard will actually enforce at execution time (/1.05 buffer).
         max_hedge_notional = round((hl_free_margin * hl_max_leverage) / 1.05, 2) if hl_free_margin > 0 else 0.0
 
+    coverage = _build_vol_data_coverage(
+        atm_iv_by_tenor=surface.atm_iv_by_tenor,
+        open_positions=portfolio["open_positions"],
+        portfolio_greeks=portfolio["portfolio_greeks"],
+        surface_age_seconds=surface_age_seconds,
+        surface_stale_multiplier=surface_stale_multiplier,
+        vol_surface_interval_seconds=vol_surface_interval_seconds,
+    )
+    coverage["sources"] = {
+        "thalex_tenors": sorted(thalex_surface.atm_iv_by_tenor.keys()),
+        "deribit_tenors": sorted(deribit_surface.atm_iv_by_tenor.keys()),
+        "thalex_ticker_enrichment": enrich_stats,
+    }
+
     return OptionsContext(
         timestamp_utc=datetime.now(timezone.utc).isoformat(),
         spot=float(spot),
@@ -201,8 +241,8 @@ async def build_options_context(
         expected_move_pct_by_tenor=surface.expected_move_pct_by_tenor,
         vol_regime=regime_reading.vol_regime,
         vol_regime_confidence=regime_reading.confidence,
-        realized_iv_ratio_15d=regime_reading.rv_iv_ratio,
-        straddle_test_15d={
+        realized_iv_ratio_30d=regime_reading.rv_iv_ratio,
+        straddle_test_30d={
             "lower": regime_reading.historical_anchor.lower_strike if regime_reading.historical_anchor else None,
             "upper": regime_reading.historical_anchor.upper_strike if regime_reading.historical_anchor else None,
             "current_spot": spot,
@@ -220,6 +260,7 @@ async def build_options_context(
         max_hedge_notional=max_hedge_notional,
         recent_options_trades=recent_options_trades,
         recent_options_skips=list(recent_options_skips or []),
+        vol_data_coverage=coverage,
     )
 
 
@@ -273,6 +314,74 @@ def _user_state_field(user_state, key: str, default):
     if isinstance(user_state, dict):
         return user_state.get(key, default)
     return getattr(user_state, key, default)
+
+
+def _build_vol_data_coverage(
+    *,
+    atm_iv_by_tenor: dict,
+    open_positions: list[dict],
+    portfolio_greeks: dict,
+    surface_age_seconds: Optional[float],
+    surface_stale_multiplier: float,
+    vol_surface_interval_seconds: Optional[float],
+) -> dict:
+    covered = sorted(int(k) for k in (atm_iv_by_tenor or {}).keys())
+
+    positions_without_iv: list[dict] = []
+    positions_without_greeks: list[dict] = []
+    missing_tenors: set[int] = set()
+
+    for pos in open_positions or []:
+        instrument = pos.get("instrument_name") or ""
+        dte = pos.get("days_to_expiry")
+        if dte is None:
+            continue
+        try:
+            dte_int = int(dte)
+        except (TypeError, ValueError):
+            continue
+
+        has_direct = dte_int in (atm_iv_by_tenor or {})
+        has_neighbors = (
+            bool(covered)
+            and any(t <= dte_int for t in covered)
+            and any(t >= dte_int for t in covered)
+        )
+        if not has_direct and not has_neighbors:
+            positions_without_iv.append({
+                "instrument": instrument,
+                "days_to_expiry": dte_int,
+                "reason": "tenor_not_in_chain",
+            })
+            missing_tenors.add(dte_int)
+
+        if not all(key in pos for key in ("delta", "gamma", "vega", "theta")):
+            positions_without_greeks.append({
+                "instrument": instrument,
+                "days_to_expiry": dte_int,
+                "reason": "greeks_unavailable",
+            })
+
+    stale = False
+    if (
+        surface_age_seconds is not None
+        and vol_surface_interval_seconds is not None
+        and vol_surface_interval_seconds > 0
+    ):
+        stale = surface_age_seconds > (surface_stale_multiplier * vol_surface_interval_seconds)
+
+    return {
+        "covered_tenors_days": covered,
+        "missing_tenors_days": sorted(missing_tenors),
+        "positions_without_iv": positions_without_iv,
+        "positions_without_greeks": positions_without_greeks,
+        "surface_age_seconds": (
+            round(float(surface_age_seconds), 2)
+            if surface_age_seconds is not None
+            else None
+        ),
+        "surface_stale": stale,
+    }
 
 
 def _spot_change_pct(spot_history: list[float]) -> float:

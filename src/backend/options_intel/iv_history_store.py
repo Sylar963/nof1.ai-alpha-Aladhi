@@ -4,7 +4,7 @@ The store backs the regime classifier's straddle expected-move test by
 keeping a rolling 30-day window of per-tenor anchors. Each row records:
 
 - ``ts``                   — UTC ISO timestamp the anchor was captured
-- ``tenor_days``           — option tenor (e.g. 15 for the 15-day anchor)
+- ``tenor_days``           — option tenor bucket (e.g. 30 for the 30-day anchor)
 - ``atm_iv``               — ATM IV at capture time
 - ``atm_straddle_em``      — ATM straddle premium / spot (implied move %)
 - ``spot_at_init``         — spot price when the anchor was captured
@@ -127,7 +127,7 @@ class IVHistoryStore:
         """Return the row whose age is closest to ``target_age_days``.
 
         Used by the regime classifier: "compare current spot to where the
-        15-day straddle range was 15 days ago".
+        30-day straddle range was 30 days ago".
         """
         now = now or datetime.now(timezone.utc)
         target_ts = now - _days(target_age_days)

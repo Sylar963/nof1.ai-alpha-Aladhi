@@ -31,14 +31,29 @@ from src.backend.trading.options import OptionIntent
 # Accepted canonical statuses from ExchangeAdapter.OrderResult — matches the
 # contract declared on :class:`OrderResult` ("ok | filled | resting | rejected
 # | error"). "resting" means the order is live on the book but not yet filled,
-# which is a legitimate success for GTC limit orders (the Thalex venue uses
-# this for TP/SL brackets). Anything outside this set is treated as a
-# rejection so the bot never records a phantom fill.
+# which is a legitimate success for credit/iron-condor flows (we want the GTC
+# limit to rest and collect the credit). Anything outside this set is treated
+# as a rejection so the bot never records a phantom fill.
 _ACCEPTED_ORDER_STATUSES = {"ok", "filled", "resting"}
 
+# Strictly-filled statuses. Delta-hedged flows require the option leg to be
+# filled (not merely resting) before opening a perp hedge, because hedging a
+# pending order would leave the book in an inconsistent state if the option
+# never fills.
+_FILLED_ORDER_STATUSES = {"filled"}
 
-def _order_ok(order) -> tuple[bool, str]:
-    """Return ``(ok, reason)`` for a submitted venue order.
+
+def _order_ok(order) -> tuple[bool, bool, str]:
+    """Return ``(accepted, filled, reason)`` for a submitted venue order.
+
+    - ``accepted``: the venue received and acknowledged the order. A
+      credit/iron-condor flow can proceed on this.
+    - ``filled``: the order actually crossed and took a position. Delta-
+      hedged flows MUST gate the perp hedge on ``filled==True``; opening a
+      hedge against a resting-only option leaves the book with a naked
+      perp if the option never fills.
+    - ``reason``: human-readable rejection detail when ``accepted`` is
+      False; empty string otherwise.
 
     Works for both normalized :class:`OrderResult` (Thalex) and the raw
     Hyperliquid SDK dict — Hyperliquid rejections surface as a per-status
@@ -47,16 +62,32 @@ def _order_ok(order) -> tuple[bool, str]:
     :meth:`HyperliquidAPI.parse_order_response` knows how to decode.
     """
     if order is None:
-        return False, "no order result returned"
+        return False, False, "no order result returned"
     if isinstance(order, OrderResult):
         status = str(order.status or "").lower()
+        if status in _FILLED_ORDER_STATUSES:
+            return True, True, ""
         if status in _ACCEPTED_ORDER_STATUSES:
-            return True, ""
+            return True, False, ""
         err = order.error or status or "unknown"
-        return False, f"status={status!r} error={err}"
+        return False, False, f"status={status!r} error={err}"
     if isinstance(order, dict):
-        return HyperliquidAPI.parse_order_response(order)
-    return False, f"unknown order type: {type(order).__name__}"
+        accepted, reason = HyperliquidAPI.parse_order_response(order)
+        if not accepted:
+            return False, False, reason
+        # ``parse_order_response`` treats both ``filled`` and ``resting`` as
+        # success; introspect the statuses to tell them apart for the
+        # delta-hedge gate.
+        filled = False
+        try:
+            statuses = order["response"]["data"]["statuses"]
+            filled = any(
+                isinstance(st, dict) and "filled" in st for st in statuses
+            )
+        except (KeyError, TypeError):
+            filled = False
+        return True, filled, ""
+    return False, False, f"unknown order type: {type(order).__name__}"
 
 
 # Default tenor ladder for the multi-tenor target_gamma_btc expansion path.
@@ -216,9 +247,11 @@ class OptionsExecutor:
             order = await self.thalex.place_sell_order(instrument_name, contracts)
         else:
             order = await self.thalex.place_buy_order(instrument_name, contracts)
-        ok_order, reason = _order_ok(order)
-        if not ok_order:
+        accepted, _filled, reason = _order_ok(order)
+        if not accepted:
             return ExecutionResult(ok=False, reason=f"thalex {side} {instrument_name} rejected: {reason}")
+        # Credit spread / iron condor flows are OK with a resting order —
+        # the limit is supposed to wait on the book to capture the credit.
         return ExecutionResult(ok=True, thalex_orders=[order])
 
     async def _execute_delta_hedged(
@@ -257,11 +290,23 @@ class OptionsExecutor:
             )
 
         thalex_order = await self.thalex.place_buy_order(instrument_name, contracts)
-        ok_order, reason = _order_ok(thalex_order)
-        if not ok_order:
+        accepted, filled, reason = _order_ok(thalex_order)
+        if not accepted:
             return ExecutionResult(
                 ok=False,
                 reason=f"thalex buy {instrument_name} rejected: {reason}",
+            )
+        if not filled:
+            # Hedging a resting option leaves the book naked on perp if the
+            # option never fills. Bail out and cancel the pending leg so
+            # the operator can re-enter when liquidity supports a fill.
+            await self._unwind_single_delta_hedged_leg(instrument_name, contracts)
+            return ExecutionResult(
+                ok=False,
+                reason=(
+                    f"thalex buy {instrument_name} accepted but not filled; "
+                    "refusing to hedge a pending option"
+                ),
             )
 
         if not self._delta_hedge_enabled:
@@ -297,13 +342,20 @@ class OptionsExecutor:
                 )
             # Exchange could have accepted the HTTP call but rejected the order
             # (e.g. insufficient margin on perps). Validate + unwind the option
-            # leg if we can't actually run hedged.
-            ok_hedge, reason = _order_ok(hl_orders[-1]) if hl_orders else (False, "no hedge order")
-            if not ok_hedge:
+            # leg if we can't actually run hedged. Hedges are market orders —
+            # they should be ``filled`` immediately; a merely-accepted
+            # (resting) hedge means the book is effectively unhedged, so we
+            # unwind rather than pretend the position is safe.
+            if hl_orders:
+                accepted, filled, reason = _order_ok(hl_orders[-1])
+            else:
+                accepted, filled, reason = False, False, "no hedge order"
+            if not accepted or not filled:
                 await self._unwind_single_delta_hedged_leg(instrument_name, contracts)
+                detail = reason if not accepted else "hedge accepted but not filled"
                 return ExecutionResult(
                     ok=False,
-                    reason=f"hyperliquid hedge rejected for {hedge_asset}: {reason}",
+                    reason=f"hyperliquid hedge rejected for {hedge_asset}: {detail}",
                 )
 
         return ExecutionResult(ok=True, thalex_orders=[thalex_order], hyperliquid_orders=hl_orders)
@@ -460,8 +512,8 @@ class OptionsExecutor:
                     ok=False,
                     reason=f"thalex submit failed for {instrument_name}: {exc}",
                 )
-            ok_order, reason = _order_ok(thalex_order)
-            if not ok_order:
+            accepted, filled, reason = _order_ok(thalex_order)
+            if not accepted:
                 logger.error(
                     "thalex order rejected for %s: %s — unwinding prior legs",
                     instrument_name, reason,
@@ -472,6 +524,24 @@ class OptionsExecutor:
                 return ExecutionResult(
                     ok=False,
                     reason=f"thalex order rejected for {instrument_name}: {reason}",
+                )
+            if self._delta_hedge_enabled and not filled:
+                logger.error(
+                    "thalex order %s accepted but not filled; refusing to hedge pending leg",
+                    instrument_name,
+                )
+                await self._unwind_multi_tenor_legs(
+                    submitted_thalex + [(instrument_name, per_leg_contracts)],
+                    submitted_hl,
+                    underlying,
+                    kind,
+                )
+                return ExecutionResult(
+                    ok=False,
+                    reason=(
+                        f"thalex order {instrument_name} accepted but not filled; "
+                        "refusing to hedge a pending option"
+                    ),
                 )
             thalex_orders.append(thalex_order)
             submitted_thalex.append((instrument_name, per_leg_contracts))
@@ -513,18 +583,19 @@ class OptionsExecutor:
                     ok=False,
                     reason=f"hyperliquid hedge failed for {underlying}: {exc}",
                 )
-            ok_hedge, reason = _order_ok(hl_order)
-            if not ok_hedge:
+            accepted, filled, reason = _order_ok(hl_order)
+            if not accepted or not filled:
+                detail = reason if not accepted else "hedge accepted but not filled"
                 logger.error(
                     "hyperliquid hedge rejected for %s: %s — unwinding",
-                    underlying, reason,
+                    underlying, detail,
                 )
                 await self._unwind_multi_tenor_legs(
                     submitted_thalex, submitted_hl, underlying, kind,
                 )
                 return ExecutionResult(
                     ok=False,
-                    reason=f"hyperliquid hedge rejected for {underlying}: {reason}",
+                    reason=f"hyperliquid hedge rejected for {underlying}: {detail}",
                 )
             hl_orders.append(hl_order)
             submitted_hl.append((hedge_side, hedge_size))
@@ -642,8 +713,8 @@ class OptionsExecutor:
                     ok=False,
                     reason=f"thalex submit failed for {instrument_name}: {exc}",
                 )
-            ok_order, reason = _order_ok(order)
-            if not ok_order:
+            accepted, _filled, reason = _order_ok(order)
+            if not accepted:
                 await self._unwind_multi_leg_orders(submitted_legs)
                 return ExecutionResult(
                     ok=False,

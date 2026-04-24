@@ -4,11 +4,15 @@ Reasoning Page - AI decision visualization with JSON editor and timeline
 
 import json
 import asyncio
+import logging
 from datetime import datetime
 from nicegui import ui
 from src.gui.services.bot_service import BotService
 from src.gui.services.state_manager import StateManager
 from src.gui.services.ui_utils import is_ui_alive
+
+
+logger = logging.getLogger(__name__)
 
 
 def create_reasoning(bot_service: BotService, state_manager: StateManager):
@@ -92,6 +96,28 @@ def create_reasoning(bot_service: BotService, state_manager: StateManager):
     # loop can garbage-collect the coroutine mid-flight ("Task was destroyed
     # but it is pending!"), dropping updates silently.
     background_tasks: list[asyncio.Task] = []
+
+    def _add_background_task(task: asyncio.Task) -> None:
+        """Retain ``task`` and log any exception it raises.
+
+        Consolidates the append + done-callback pair that was duplicated
+        inline at every ``asyncio.create_task(...)`` site on this page.
+        Using a single helper also ensures task exceptions are logged
+        rather than swallowed — the previous inline callbacks only popped
+        the task from the list.
+        """
+        background_tasks.append(task)
+
+        def _done(t: asyncio.Task) -> None:
+            if t in background_tasks:
+                background_tasks.remove(t)
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                logger.error("reasoning background task failed: %s", exc, exc_info=exc)
+
+        task.add_done_callback(_done)
 
     def _set_editor_content(content: dict) -> None:
         """Push new JSON into the NiceGUI json_editor component.
@@ -242,9 +268,7 @@ def create_reasoning(bot_service: BotService, state_manager: StateManager):
         """Handle filter change"""
         if not _ui_ok():
             return
-        task = asyncio.create_task(update_reasoning())
-        background_tasks.append(task)
-        task.add_done_callback(lambda t: background_tasks.remove(t) if t in background_tasks else None)
+        _add_background_task(asyncio.create_task(update_reasoning()))
 
     action_filter.on('update:model-value', on_filter_change)
 
@@ -257,8 +281,4 @@ def create_reasoning(bot_service: BotService, state_manager: StateManager):
     ui.timer(3.0, _guarded_update_reasoning)
 
     # Initial update — retain a reference so the task isn't GC'd mid-flight.
-    _initial_task = asyncio.create_task(update_reasoning())
-    background_tasks.append(_initial_task)
-    _initial_task.add_done_callback(
-        lambda t: background_tasks.remove(t) if t in background_tasks else None
-    )
+    _add_background_task(asyncio.create_task(update_reasoning()))

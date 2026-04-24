@@ -136,6 +136,8 @@ class TradingBotEngine:
         )
         self.options_llm_lifecycle: Optional[OptionsLLMLifecycle] = None
         self._latest_options_context = None  # populated by the 15m surface refresh task
+        self._last_options_surface_refresh_at: Optional[datetime] = None
+        self._options_surface_interval_seconds: Optional[float] = None
         if CONFIG.get("thalex_key_id") and CONFIG.get("thalex_private_key_path"):
             try:
                 from src.backend.trading.thalex_api import ThalexAPI
@@ -181,6 +183,7 @@ class TradingBotEngine:
                             CONFIG.get("options_decision_interval_seconds") or 10800
                         ),
                     )
+                    self._options_surface_interval_seconds = scheduler_config.vol_surface_interval_seconds
                     self.options_scheduler = OptionsScheduler(
                         config=scheduler_config,
                         refresh_vol_surface=self._refresh_options_surface,
@@ -226,6 +229,13 @@ class TradingBotEngine:
         self.trading_mode = CONFIG.get("trading_mode", "auto").lower()
         self.pending_proposals: List[TradeProposal] = []
         self.logger.info(f"Trading mode: {self.trading_mode.upper()}")
+
+        # Registry of fire-and-forget tasks. Holding a strong reference until
+        # the task completes prevents the GC from collecting a running task
+        # (asyncio only weak-refs them) and gives us a single place to
+        # inspect outstanding work. ``_spawn_tracked_task`` adds entries
+        # here and removes them in its done-callback.
+        self._background_tasks: set[asyncio.Task] = set()
 
         # File paths
         self.diary_path = Path("data/diary.jsonl")
@@ -346,11 +356,13 @@ class TradingBotEngine:
           have no collateral number so refusing the trade is the only safe
           move — the alternative (skipping the check) would re-open the
           silent-failure bug this preflight exists to close.
-        - ``get_max_leverage`` failures → fail OPEN. Max leverage is a
-          nice-to-have sizing hint; falling back to a conservative 1× would
-          reject many legitimate trades on a transient meta hiccup. Treat
-          it as unbounded (``inf``) so the leverage divisor vanishes and the
-          check only trips on truly missing collateral.
+        - ``get_max_leverage`` failures → fall back to a conservative 1x.
+          The previous fail-OPEN (``float('inf')``) path let a zero-
+          collateral account pass the check on any meta hiccup: with
+          ``effective_leverage = inf`` the ``required`` number collapsed to
+          0 and ``available < required`` could not trip. A transient sizing
+          hint is not worth that failure mode — better to reject a
+          legitimate trade on a bad meta read than to book a phantom fill.
         """
         if notional_usd <= 0 or not self.hyperliquid:
             return
@@ -359,26 +371,35 @@ class TradingBotEngine:
             max_leverage = await self.hyperliquid.get_max_leverage(asset)
         except Exception as exc:  # pylint: disable=broad-except
             self.logger.warning(
-                "Margin preflight: get_max_leverage(%s) failed, treating as unbounded: %s",
+                "Margin preflight: get_max_leverage(%s) failed, falling back to 1x: %s",
                 asset, exc,
             )
-            max_leverage = float("inf")
+            max_leverage = None
         effective_leverage = max_leverage if max_leverage and max_leverage > 0 else 1
         required = (notional_usd / effective_leverage) * 1.05
         # Use the conservative of withdrawable vs. free_margin — both model
         # "what can I open with right now" but the venue's own ``withdrawable``
         # is the ground truth whenever it's populated.
-        available = min(
-            v for v in (info.get("withdrawable"), info.get("free_margin")) if v and v > 0
-        ) if any((info.get("withdrawable"), info.get("free_margin"))) else 0.0
+        #
+        # Materialize the candidate list explicitly so we never call min()
+        # on an empty generator (the previous ``if any(...)`` guard was
+        # incorrect: ``any((None, None))`` is False but ``any((0, 0.01))``
+        # is True even though the generator ``v>0`` test would drop the
+        # zero, and an all-zero info dict would still fall into the min()
+        # call on an empty generator).
+        candidates = [
+            v for v in (info.get("withdrawable"), info.get("free_margin"))
+            if v is not None and v > 0
+        ]
+        available = min(candidates) if candidates else 0.0
         if available < required:
             raise RuntimeError(
                 f"Insufficient Hyperliquid margin for {asset}: "
                 f"required ≈ ${required:,.2f} "
-                f"(notional ${notional_usd:,.2f} / {max_leverage}x + 5% buffer), "
+                f"(notional ${notional_usd:,.2f} / {effective_leverage}x + 5% buffer), "
                 f"available ${available:,.2f} "
-                f"(withdrawable={info.get('withdrawable', 0):,.2f}, "
-                f"free_margin={info.get('free_margin', 0):,.2f})"
+                f"(withdrawable={info.get('withdrawable', 0) or 0:,.2f}, "
+                f"free_margin={info.get('free_margin', 0) or 0:,.2f})"
             )
 
     @staticmethod
@@ -555,7 +576,24 @@ class TradingBotEngine:
                 message = f"Hedge-leg preflight: spot lookup failed: {exc}"
                 self.logger.error(message)
                 return False, message
-            worst_case_hedge_notional = float(contracts_est) * float(spot_for_hedge or 0.0)
+            # Fail CLOSED when spot is missing or non-positive — the earlier
+            # ``or 0.0`` fallback let a hedged options trade bypass the
+            # margin check with a zero notional, which is exactly the
+            # silent-failure mode this preflight exists to prevent.
+            if spot_for_hedge is None or float(spot_for_hedge) <= 0:
+                message = (
+                    f"Hedge-leg preflight aborted: spot price for "
+                    f"{decision.underlying or decision.asset or 'BTC'} "
+                    f"unavailable (got {spot_for_hedge!r}); refusing trade"
+                )
+                self.logger.error(message)
+                return False, message
+            hedge_buffer = float(CONFIG.get("options_hedge_margin_buffer_pct") or 1.0)
+            if hedge_buffer < 1.0:
+                hedge_buffer = 1.0
+            worst_case_hedge_notional = (
+                float(contracts_est) * float(spot_for_hedge) * hedge_buffer
+            )
             try:
                 await self._hl_margin_preflight(
                     decision.underlying or "BTC", worst_case_hedge_notional
@@ -899,18 +937,29 @@ class TradingBotEngine:
                 # opened in a scoped session so the connection is released
                 # before the surface refresh returns. Failures degrade to an
                 # empty history list rather than blanking the whole snapshot.
-                db_session = None
-                db_session_ctx = None
+                #
+                # Uses a proper ``with`` block so the session is always
+                # released on exceptions — the previous manual
+                # ``__enter__``/``__exit__`` pair leaked connections when
+                # ``build_options_context`` raised between the two calls.
+                from contextlib import nullcontext
+                from src.database.db_manager import get_db_manager
                 try:
-                    from src.database.db_manager import get_db_manager
-                    db_session_ctx = get_db_manager().session_scope()
-                    db_session = db_session_ctx.__enter__()
+                    session_cm = get_db_manager().session_scope()
                 except Exception as exc:  # pylint: disable=broad-except
-                    self.logger.warning("options trade-history session unavailable: %s", exc)
-                    db_session = None
-                    db_session_ctx = None
+                    self.logger.warning(
+                        "options trade-history session unavailable: %s", exc
+                    )
+                    session_cm = nullcontext(None)
 
-                try:
+                with session_cm as db_session:
+                    now_utc = datetime.now(UTC)
+                    prev_refresh = self._last_options_surface_refresh_at
+                    surface_age = (
+                        (now_utc - prev_refresh).total_seconds()
+                        if prev_refresh is not None
+                        else None
+                    )
                     self._latest_options_context = await build_options_context(
                         thalex=self.thalex,
                         deribit=deribit,
@@ -923,13 +972,10 @@ class TradingBotEngine:
                         hyperliquid=self.hyperliquid,
                         hedge_underlying="BTC",
                         recent_options_skips=self._read_recent_options_skips(),
+                        surface_age_seconds=surface_age,
+                        vol_surface_interval_seconds=self._options_surface_interval_seconds,
                     )
-                finally:
-                    if db_session_ctx is not None:
-                        try:
-                            db_session_ctx.__exit__(None, None, None)
-                        except Exception as exc:  # pylint: disable=broad-except
-                            self.logger.debug("db session close failed: %s", exc)
+                    self._last_options_surface_refresh_at = now_utc
 
                 self.logger.info(
                     "OptionsContext refreshed (regime=%s confidence=%s, spot_history=%d closes, "
@@ -945,7 +991,7 @@ class TradingBotEngine:
                 # Deribit client is reused across refreshes; closed in stop().
                 pass
         except Exception as exc:  # pylint: disable=broad-except
-            self.logger.error("vol surface refresh failed: %s", exc)
+            self.logger.exception("vol surface refresh failed: %s", exc)
 
     async def _fetch_btc_daily_closes(self, deribit, days: int = 16) -> List[float]:
         """Fetch ``days`` daily BTC mark prices from Deribit for realized-vol calc.
@@ -1061,6 +1107,7 @@ class TradingBotEngine:
                     "entry_kind": decision.entry_kind,
                     "vol_view": decision.vol_view,
                     "target_gamma_btc": decision.target_gamma_btc,
+                    "risk_flags": list(decision.risk_flags),
                 }
                 options_decision_payloads.append(decision_payload)
                 # Hold decisions surface on the reasoning page but don't
@@ -1086,7 +1133,17 @@ class TradingBotEngine:
                             exc,
                         )
                     continue
-                await self._execute_thalex_decision(decision_payload)
+                ok, reason = await self._execute_thalex_decision(decision_payload)
+                if not ok:
+                    # Options-scheduler cycle: surface the failure through
+                    # the same path perps + ad-hoc options calls use so the
+                    # circuit breaker, state.error, on_error callback, and
+                    # diary entry all stay consistent across code paths.
+                    self._handle_execution_failure(
+                        "Thalex",
+                        decision.underlying or decision.asset or "BTC",
+                        reason,
+                    )
 
             # Always publish — even an empty trade_decisions array carries the
             # LLM's reasoning text, which the operator wants to see on the
@@ -1139,9 +1196,9 @@ class TradingBotEngine:
         venue_name = (venue or "hyperliquid").lower()
         for trade in self.active_trades:
             trade_venue = (trade.get("venue") or "hyperliquid").lower()
-            if trade_venue != venue_name:
-                continue
             if venue_name == "thalex":
+                if trade_venue != "thalex":
+                    continue
                 tracked_instruments = {
                     str(name)
                     for name in (trade.get("instrument_names") or [])
@@ -1153,21 +1210,34 @@ class TradingBotEngine:
                 if instrument_name and instrument_name in tracked_instruments:
                     return "AI"
                 continue
-            if asset and trade.get("asset") == asset:
-                return "AI"
+            if trade_venue == "hyperliquid":
+                if asset and trade.get("asset") == asset:
+                    return "AI"
+                continue
+            if trade_venue == "thalex" and trade.get("hyperliquid_orders"):
+                if asset and trade.get("asset") == asset:
+                    return "AI"
         return "External"
 
     def _build_positions_view(
         self,
         hyperliquid_positions: List[Dict],
         thalex_positions: Optional[List[Any]] = None,
-    ) -> List[Dict]:
-        rows: List[Dict] = []
+    ) -> Dict[str, List[Dict]]:
+        """Return positions split by venue consumer.
+
+        Keys:
+          - ``hyperliquid``: HL-only rows (for the perps LLM prompt).
+          - ``thalex``: Thalex-only rows.
+          - ``combined``: both lists concatenated (for the GUI dashboard).
+        """
+        hl_rows: List[Dict] = []
+        thalex_rows: List[Dict] = []
 
         for pos in hyperliquid_positions:
             asset = str(pos.get("symbol") or pos.get("coin") or "")
             instrument_name = asset
-            rows.append({
+            hl_rows.append({
                 "row_id": f"hyperliquid:{instrument_name}",
                 "symbol": asset,
                 "asset": asset,
@@ -1189,7 +1259,7 @@ class TradingBotEngine:
             side = str(self._position_field(pos, "side") or "long").lower()
             size = abs(float(self._position_field(pos, "size", "quantity") or 0) or 0)
             quantity = size if side == "long" else -size
-            rows.append({
+            thalex_rows.append({
                 "row_id": f"thalex:{instrument_name}",
                 "symbol": instrument_name,
                 "asset": asset,
@@ -1205,7 +1275,11 @@ class TradingBotEngine:
                 "closable": False,
             })
 
-        return rows
+        return {
+            "hyperliquid": hl_rows,
+            "thalex": thalex_rows,
+            "combined": hl_rows + thalex_rows,
+        }
 
     async def _live_thalex_open_positions_count(self) -> int:
         if self.thalex is None:
@@ -1472,10 +1546,12 @@ class TradingBotEngine:
                         thalex_positions,
                     )
 
-                    combined_positions = self._build_positions_view(
+                    positions_by_venue = self._build_positions_view(
                         enriched_hyperliquid_positions,
                         thalex_positions,
                     )
+                    hyperliquid_only_positions = positions_by_venue["hyperliquid"]
+                    combined_positions = positions_by_venue["combined"]
                     self.state.positions = combined_positions
                     self.state.active_trades = list(self.active_trades)
 
@@ -1650,29 +1726,24 @@ class TradingBotEngine:
                         except Exception as e:
                             self.logger.error(f"Error gathering market data for {asset}: {e}")
 
-                    # ===== PHASE 9: Build LLM Context =====
+                    perps_account = dict(dashboard)
+                    perps_account["positions"] = [
+                        {k: v for k, v in pos.items() if k not in ("closable", "row_id")}
+                        for pos in hyperliquid_only_positions
+                    ]
+
                     context_payload = OrderedDict([
                         ("invocation", {
                             "count": self.invocation_count,
                             "current_time": datetime.now(UTC).isoformat()
                         }),
-                        ("account", dashboard),
+                        ("account", perps_account),
                         ("market_data", market_sections),
                         ("instructions", {
                             "assets": self.assets,
                             "note": "Follow the system prompt guidelines strictly"
                         })
                     ])
-
-                    # Inject compact options book summary when available so the
-                    # perps agent can factor in the options desk's net exposure.
-                    if self._latest_options_context is not None:
-                        ctx = self._latest_options_context
-                        context_payload["options_book_summary"] = {
-                            "vol_regime": ctx.vol_regime,
-                            "portfolio_greeks": ctx.portfolio_greeks,
-                            "open_position_count": ctx.open_position_count,
-                        }
 
                     context = json.dumps(context_payload, default=json_default, indent=2)
 
@@ -1726,28 +1797,14 @@ class TradingBotEngine:
                         if asset not in self.assets:
                             continue
 
-                        # Multi-venue routing: Thalex options decisions are
-                        # handled by the OptionsExecutor; everything else falls
-                        # through to the existing Hyperliquid path.
                         if (decision.get('venue') or 'hyperliquid').lower() == 'thalex':
-                            if self.trading_mode == "manual":
-                                try:
-                                    proposal = self._create_thalex_proposal(decision)
-                                    self.pending_proposals.append(proposal)
-                                    self.logger.info(
-                                        "[PROPOSAL] Created: %s %s %s (ID: %s)",
-                                        (decision.get("strategy") or "thalex").upper(),
-                                        decision.get("action", "hold").upper(),
-                                        asset,
-                                        proposal.id[:8],
-                                    )
-                                    self._sync_pending_proposals_state()
-                                except Exception as exc:  # pylint: disable=broad-except
-                                    self.logger.error("Error creating Thalex proposal for %s: %s", asset, exc)
-                                continue
-                            ok, reason = await self._execute_thalex_decision(decision)
-                            if not ok:
-                                self._handle_execution_failure("Thalex", asset, reason)
+                            self.logger.warning(
+                                "perps agent attempted cross-venue decision for %s; "
+                                "ignored (Thalex decisions must originate from the "
+                                "OptionsAgent). decision=%r",
+                                asset,
+                                {k: decision.get(k) for k in ('action', 'venue', 'strategy')},
+                            )
                             continue
 
                         action = decision.get('action')
@@ -1880,7 +1937,20 @@ class TradingBotEngine:
                                     # Pre-trade margin check — fails loud if
                                     # the venue can't cover this notional so
                                     # we never record a phantom fill.
-                                    await self._hl_margin_preflight(asset, amount * current_price)
+                                    #
+                                    # Validate on ``net_new_amount``, not
+                                    # ``amount``: a flip closes the existing
+                                    # position first (that leg consumes no
+                                    # free margin, it releases it) and only
+                                    # the new directional exposure counts
+                                    # toward margin. Using ``amount`` here
+                                    # double-counted the close leg and
+                                    # caused legitimate flips to get
+                                    # rejected when ``allocation_usd`` was
+                                    # zero (pure close).
+                                    await self._hl_margin_preflight(
+                                        asset, net_new_amount * current_price
+                                    )
 
                                     # Place market order
                                     if action == 'buy':
@@ -2245,6 +2315,38 @@ class TradingBotEngine:
             except Exception as e:
                 self.logger.error(f"Error in state update callback: {e}")
 
+    def _spawn_tracked_task(self, coro, label: str) -> asyncio.Task:
+        """Schedule ``coro`` as a fire-and-forget task with failure logging.
+
+        Silent task failures (create_task without done_callback) were masking
+        proposal execution errors — the task would crash, the proposal would
+        stay in its prior state, and the operator had no signal that anything
+        went wrong. This wrapper surfaces the exception in the bot log and
+        retains the task in ``self._background_tasks`` so it can't be
+        garbage-collected mid-flight (asyncio only keeps weak references to
+        running tasks).
+        """
+        task = asyncio.create_task(coro)
+        if not hasattr(self, "_background_tasks"):
+            self._background_tasks = set()
+        try:
+            self._background_tasks.add(task)
+        except AttributeError:
+            pass
+
+        def _done(t: asyncio.Task):
+            tasks = getattr(self, "_background_tasks", None)
+            if tasks is not None:
+                tasks.discard(t)
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                self.logger.error("%s task failed: %s", label, exc, exc_info=exc)
+
+        task.add_done_callback(_done)
+        return task
+
     def _refresh_hedge_state(self) -> None:
         """Copy live hedge-manager telemetry into BotState for the GUI."""
         if self.hedge_manager is None:
@@ -2563,6 +2665,18 @@ class TradingBotEngine:
         self.state.is_paused = False
         self.state.pause_reason = None
         self.state.execution_failure_streak = 0
+        # Reset the drawdown baseline to the CURRENT account value so a
+        # manual resume doesn't immediately re-trip the drawdown CB from
+        # the old high-water mark. Without this, resuming while the account
+        # sits at the same level that tripped the breaker would just trip
+        # it again on the next tick.
+        current_value = float(
+            getattr(self.state, "total_value", 0.0) or 0.0
+        )
+        if current_value > 0:
+            self.peak_account_value = current_value
+            self.state.peak_account_value = current_value
+            self.state.drawdown_pct = 0.0
         try:
             self._write_diary_entry({
                 'timestamp': datetime.now(UTC).isoformat(),
@@ -2614,7 +2728,10 @@ class TradingBotEngine:
             f"[RETRY] Re-executing proposal {proposal_id[:8]}: "
             f"{proposal.action.upper()} {proposal.asset}"
         )
-        asyncio.create_task(self._execute_proposal(proposal))
+        self._spawn_tracked_task(
+            self._execute_proposal(proposal),
+            label=f"retry_proposal[{proposal_id[:8]}]",
+        )
         self._sync_pending_proposals_state()
         self._notify_state_update()
         return True
@@ -2651,9 +2768,14 @@ class TradingBotEngine:
         # Mark as approved
         proposal.approve()
         self.logger.info(f"[APPROVED] Proposal: {proposal.action.upper()} {proposal.asset} (ID: {proposal_id[:8]})")
-        
-        # Execute asynchronously
-        asyncio.create_task(self._execute_proposal(proposal))
+
+        # Execute asynchronously with tracked error logging (silent task
+        # failures here previously stranded proposals in 'approved' state
+        # without any signal to the operator).
+        self._spawn_tracked_task(
+            self._execute_proposal(proposal),
+            label=f"approve_proposal[{proposal_id[:8]}]",
+        )
 
         # Update state
         self._sync_pending_proposals_state()

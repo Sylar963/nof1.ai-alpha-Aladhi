@@ -2,9 +2,9 @@
 
 The classifier combines two signals into a single label:
 
-- Signal 1: ATM 15-day straddle expected-move test (your heuristic)
-    - current_spot < lower_strike_15d_ago → 'cheap'
-    - current_spot > upper_strike_15d_ago → 'rich'
+- Signal 1: ATM 30-day straddle expected-move test (your heuristic)
+    - current_spot < lower_strike_30d_ago → 'cheap'
+    - current_spot > upper_strike_30d_ago → 'rich'
     - inside the range                    → 'fair'
 
 - Signal 2: realized vs implied vol ratio
@@ -30,7 +30,7 @@ from src.backend.options_intel.regime import (
 )
 
 
-def _row(spot, lower, upper, age_days, atm_iv=0.65, em=0.08, tenor=15, now=None):
+def _row(spot, lower, upper, age_days, atm_iv=0.65, em=0.08, tenor=30, now=None):
     now = now or datetime.now(timezone.utc)
     return IVHistoryRow(
         ts=now - timedelta(days=age_days),
@@ -49,15 +49,15 @@ def _row(spot, lower, upper, age_days, atm_iv=0.65, em=0.08, tenor=15, now=None)
 
 
 def test_classify_cheap_when_spot_below_historical_lower(tmp_path):
-    """Spot dropped below the implied range from 15 days ago → 'cheap' (per user heuristic)."""
+    """Spot dropped below the implied range from 30 days ago → 'cheap' (per user heuristic)."""
     store = IVHistoryStore(db_path=str(tmp_path / "iv.db"))
     now = datetime.now(timezone.utc)
-    store.write(_row(spot=60000, lower=58000, upper=62000, age_days=15, now=now))
+    store.write(_row(spot=60000, lower=58000, upper=62000, age_days=30, now=now))
 
     reading = classify_regime(
         store=store,
         current_spot=57000.0,
-        current_atm_iv_15d=0.65,
+        current_atm_iv_30d=0.65,
         spot_history=[60000.0] * 16,  # flat → RV ≈ 0 → unknown for signal 2
         now=now,
     )
@@ -67,12 +67,12 @@ def test_classify_cheap_when_spot_below_historical_lower(tmp_path):
 def test_classify_rich_when_spot_above_historical_upper(tmp_path):
     store = IVHistoryStore(db_path=str(tmp_path / "iv.db"))
     now = datetime.now(timezone.utc)
-    store.write(_row(spot=60000, lower=58000, upper=62000, age_days=15, now=now))
+    store.write(_row(spot=60000, lower=58000, upper=62000, age_days=30, now=now))
 
     reading = classify_regime(
         store=store,
         current_spot=63000.0,
-        current_atm_iv_15d=0.65,
+        current_atm_iv_30d=0.65,
         spot_history=[60000.0] * 16,
         now=now,
     )
@@ -82,12 +82,12 @@ def test_classify_rich_when_spot_above_historical_upper(tmp_path):
 def test_classify_fair_when_spot_inside_historical_range(tmp_path):
     store = IVHistoryStore(db_path=str(tmp_path / "iv.db"))
     now = datetime.now(timezone.utc)
-    store.write(_row(spot=60000, lower=58000, upper=62000, age_days=15, now=now))
+    store.write(_row(spot=60000, lower=58000, upper=62000, age_days=30, now=now))
 
     reading = classify_regime(
         store=store,
         current_spot=60500.0,
-        current_atm_iv_15d=0.65,
+        current_atm_iv_30d=0.65,
         spot_history=[60000.0] * 16,
         now=now,
     )
@@ -109,7 +109,7 @@ def test_classify_cheap_when_realized_vol_outran_implied(tmp_path):
     reading = classify_regime(
         store=store,
         current_spot=60000.0,
-        current_atm_iv_15d=0.30,  # implied is low
+        current_atm_iv_30d=0.30,  # implied is low
         spot_history=spot_history,
         now=now,
     )
@@ -125,7 +125,7 @@ def test_classify_rich_when_realized_vol_below_implied(tmp_path):
     reading = classify_regime(
         store=store,
         current_spot=60000.0,
-        current_atm_iv_15d=1.50,  # absurdly high implied
+        current_atm_iv_30d=1.50,  # absurdly high implied
         spot_history=spot_history,
     )
     assert reading.signal_2_label == "rich"
@@ -139,14 +139,14 @@ def test_classify_rich_when_realized_vol_below_implied(tmp_path):
 def test_combined_label_high_confidence_when_signals_agree(tmp_path):
     store = IVHistoryStore(db_path=str(tmp_path / "iv.db"))
     now = datetime.now(timezone.utc)
-    store.write(_row(spot=60000, lower=58000, upper=62000, age_days=15, now=now))
+    store.write(_row(spot=60000, lower=58000, upper=62000, age_days=30, now=now))
 
     # Spot below lower (signal 1 = cheap) AND high RV (signal 2 = cheap)
     spot_history = [60000 * (1.08 if i % 2 == 0 else 0.92) for i in range(16)]
     reading = classify_regime(
         store=store,
         current_spot=57000.0,
-        current_atm_iv_15d=0.30,
+        current_atm_iv_30d=0.30,
         spot_history=spot_history,
         now=now,
     )
@@ -157,7 +157,7 @@ def test_combined_label_high_confidence_when_signals_agree(tmp_path):
 def test_combined_label_low_confidence_when_signals_disagree(tmp_path):
     store = IVHistoryStore(db_path=str(tmp_path / "iv.db"))
     now = datetime.now(timezone.utc)
-    store.write(_row(spot=60000, lower=58000, upper=62000, age_days=15, now=now))
+    store.write(_row(spot=60000, lower=58000, upper=62000, age_days=30, now=now))
 
     # Spot above upper (signal 1 = rich) but flat history (signal 2 = rich) → both rich
     # We need disagreement: signal 1 = rich, signal 2 = cheap
@@ -165,7 +165,7 @@ def test_combined_label_low_confidence_when_signals_disagree(tmp_path):
     reading = classify_regime(
         store=store,
         current_spot=63000.0,  # signal 1 = rich
-        current_atm_iv_15d=0.30,  # signal 2 = cheap
+        current_atm_iv_30d=0.30,  # signal 2 = cheap
         spot_history=spot_history,
         now=now,
     )
@@ -182,7 +182,7 @@ def test_combined_label_unknown_when_history_empty(tmp_path):
     reading = classify_regime(
         store=store,
         current_spot=60000.0,
-        current_atm_iv_15d=0.65,
+        current_atm_iv_30d=0.65,
         spot_history=[60000.0] * 16,
     )
     assert reading.vol_regime == "unknown"

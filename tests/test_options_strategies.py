@@ -72,11 +72,11 @@ class FakeThalex(ExchangeAdapter):
 
     async def place_buy_order(self, asset, amount, slippage=0.01):
         self.calls.append(_FakeOrder(self.venue, "buy", asset, amount))
-        return OrderResult(venue=self.venue, order_id="t1", asset=asset, side="buy", amount=amount, status="ok")
+        return OrderResult(venue=self.venue, order_id="t1", asset=asset, side="buy", amount=amount, status="filled")
 
     async def place_sell_order(self, asset, amount, slippage=0.01):
         self.calls.append(_FakeOrder(self.venue, "sell", asset, amount))
-        return OrderResult(venue=self.venue, order_id="t2", asset=asset, side="sell", amount=amount, status="ok")
+        return OrderResult(venue=self.venue, order_id="t2", asset=asset, side="sell", amount=amount, status="filled")
 
     async def place_take_profit(self, asset, is_buy, amount, tp_price): return OrderResult(venue=self.venue, order_id="", asset=asset, side="tp", amount=amount, status="not_supported")
     async def place_stop_loss(self, asset, is_buy, amount, sl_price): return OrderResult(venue=self.venue, order_id="", asset=asset, side="sl", amount=amount, status="not_supported")
@@ -103,12 +103,12 @@ class FakeHyperliquid(ExchangeAdapter):
     async def place_buy_order(self, asset, amount, slippage=0.01):
         self.calls.append(_FakeOrder(self.venue, "buy", asset, amount))
         self.perp_position_size += amount
-        return OrderResult(venue=self.venue, order_id="h1", asset=asset, side="buy", amount=amount, status="ok")
+        return OrderResult(venue=self.venue, order_id="h1", asset=asset, side="buy", amount=amount, status="filled")
 
     async def place_sell_order(self, asset, amount, slippage=0.01):
         self.calls.append(_FakeOrder(self.venue, "sell", asset, amount))
         self.perp_position_size -= amount
-        return OrderResult(venue=self.venue, order_id="h2", asset=asset, side="sell", amount=amount, status="ok")
+        return OrderResult(venue=self.venue, order_id="h2", asset=asset, side="sell", amount=amount, status="filled")
 
     async def place_take_profit(self, asset, is_buy, amount, tp_price): return OrderResult(venue=self.venue, order_id="", asset=asset, side="tp", amount=amount, status="ok")
     async def place_stop_loss(self, asset, is_buy, amount, sl_price): return OrderResult(venue=self.venue, order_id="", asset=asset, side="sl", amount=amount, status="ok")
