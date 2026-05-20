@@ -700,6 +700,65 @@ class DatabaseManager:
                 for row in rows
             ]
 
+    def save_options_reasoning(
+        self,
+        *,
+        triggered_by_events: list,
+        context_snapshot: dict,
+        llm_reasoning: Optional[str],
+        llm_decisions: list,
+    ) -> int:
+        import json as _json
+        from src.database.models import OptionsReasoningEntry
+
+        with self.session_scope() as session:
+            row = OptionsReasoningEntry(
+                triggered_by_events=_json.dumps(triggered_by_events),
+                context_snapshot=_json.dumps(context_snapshot),
+                llm_reasoning=llm_reasoning,
+                llm_decisions=_json.dumps(llm_decisions),
+            )
+            session.add(row)
+            session.flush()
+            return row.id
+
+    def get_recent_options_reasoning(self, limit: int = 20) -> List[Dict[str, Any]]:
+        import json as _json
+        from src.database.models import OptionsReasoningEntry
+
+        with self.session_scope() as session:
+            rows = (
+                session.query(OptionsReasoningEntry)
+                .order_by(OptionsReasoningEntry.id.desc())
+                .limit(limit)
+                .all()
+            )
+            return [
+                {
+                    "id": row.id,
+                    "created_at": row.created_at,
+                    "triggered_by_events": _json.loads(row.triggered_by_events) if row.triggered_by_events else [],
+                    "context_snapshot": _json.loads(row.context_snapshot) if row.context_snapshot else {},
+                    "llm_reasoning": row.llm_reasoning,
+                    "llm_decisions": _json.loads(row.llm_decisions) if row.llm_decisions else [],
+                    "outcome": _json.loads(row.outcome) if row.outcome else None,
+                }
+                for row in rows
+            ]
+
+    def update_reasoning_outcome(self, entry_id: int, *, outcome: dict) -> None:
+        import json as _json
+        from src.database.models import OptionsReasoningEntry
+
+        with self.session_scope() as session:
+            row = (
+                session.query(OptionsReasoningEntry)
+                .filter_by(id=entry_id)
+                .one_or_none()
+            )
+            if row is not None:
+                row.outcome = _json.dumps(outcome)
+
 
 # Global database manager instance (singleton pattern)
 _db_manager: Optional[DatabaseManager] = None

@@ -7,7 +7,7 @@ import asyncio
 import logging
 from datetime import datetime
 from nicegui import ui
-from src.gui.services.bot_service import BotService
+from src.gui.services.bot_service import BotService, get_options_reasoning_history
 from src.gui.services.state_manager import StateManager
 from src.gui.services.ui_utils import RenderGate, is_ui_alive
 
@@ -287,13 +287,50 @@ def create_reasoning(bot_service: BotService, state_manager: StateManager):
 
     action_filter.on('update:model-value', on_filter_change)
 
+    history_container = ui.column().classes('w-full mt-6')
+
+    def _refresh_history():
+        if not _ui_ok():
+            return
+        history_container.clear()
+        rows = get_options_reasoning_history(limit=20)
+        if not rows:
+            return
+        with history_container:
+            ui.label('Options Reasoning History').classes('text-xl font-bold text-white mb-2')
+            for row in rows:
+                created_at = row.get("created_at")
+                ts = created_at.isoformat() if hasattr(created_at, "isoformat") else str(created_at)
+                with ui.card().classes('w-full p-3 mb-2 bg-gray-800'):
+                    triggers = row.get("triggered_by_events") or []
+                    trigger_labels = ", ".join(t.get("type", "?") for t in triggers) or "scheduled"
+                    decisions = row.get("llm_decisions") or []
+                    ui.label(
+                        f"{ts}  •  triggers: {trigger_labels}  •  {len(decisions)} decisions"
+                    ).classes('text-sm text-white')
+                    with ui.expansion('Reasoning').classes('w-full'):
+                        ui.label(row.get("llm_reasoning") or "(no reasoning text)").classes(
+                            'text-xs text-gray-300 whitespace-pre-wrap'
+                        )
+                    with ui.expansion('Decisions').classes('w-full'):
+                        for d in decisions:
+                            ui.label(str(d)).classes('text-xs text-gray-300')
+                    outcome = row.get("outcome")
+                    if outcome is not None:
+                        with ui.expansion('Outcome').classes('w-full'):
+                            ui.label(str(outcome)).classes('text-xs text-gray-300')
+
     async def _guarded_update_reasoning():
         if not _ui_ok():
             return
         await update_reasoning()
+        if not _ui_ok():
+            return
+        _refresh_history()
 
     # Auto-refresh every 3 seconds
     ui.timer(3.0, _guarded_update_reasoning)
 
     # Initial update — retain a reference so the task isn't GC'd mid-flight.
+    _refresh_history()
     _add_background_task(asyncio.create_task(update_reasoning()))

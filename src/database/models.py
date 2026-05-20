@@ -363,6 +363,21 @@ class OptionStructureSnapshot(Base):
         return f"<OptionStructureSnapshot(id={self.structure_id[:8]}, kind={self.kind}, closed={self.closed_at is not None})>"
 
 
+class OptionsReasoningEntry(Base):
+    __tablename__ = "options_reasoning_entries"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    created_at = Column(DateTime, nullable=False, default=func.now(), index=True)
+    triggered_by_events = Column(Text, nullable=False, default="[]")
+    context_snapshot = Column(Text, nullable=False)
+    llm_reasoning = Column(Text, nullable=True)
+    llm_decisions = Column(Text, nullable=False, default="[]")
+    outcome = Column(Text, nullable=True)
+
+    def __repr__(self):
+        return f"<OptionsReasoningEntry(id={self.id}, created_at={self.created_at})>"
+
+
 # Database initialization helper
 def create_tables(engine):
     """Create all tables in the database."""

@@ -252,6 +252,11 @@ async def build_options_context(
         open_positions=portfolio["open_positions"],
         portfolio_greeks=portfolio["portfolio_greeks"],
         structures=portfolio.get("structures", []),
+        structure_views=_build_structure_views(
+            portfolio.get("structures", []),
+            portfolio.get("open_positions", []),
+        ),
+        triggered_by_events=[],
         capital_available=capital_available,
         max_contracts_per_trade=0.1,
         max_open_positions=3,
@@ -263,6 +268,50 @@ async def build_options_context(
         recent_options_skips=list(recent_options_skips or []),
         vol_data_coverage=coverage,
     )
+
+
+def _build_structure_views(
+    structures: list,
+    open_positions: list,
+) -> list:
+    """Build StructureView projections from classifier output + DB lifecycle.
+
+    Looks up each structure's opened_at from OptionStructureSnapshot to compute
+    days_open. Fail-soft: if the DB is unavailable, days_open defaults to 0
+    and the views still emit with the rest of the structure data intact.
+    """
+    from src.backend.options_intel.snapshot import StructureView
+    from datetime import datetime, timezone
+
+    if not structures:
+        return []
+
+    opened_at_by_id = {}
+    try:
+        from src.database.db_manager import get_db_manager as _get_db_manager
+        for row in _get_db_manager().get_open_structures():
+            opened_at_by_id[row["structure_id"]] = row["opened_at"]
+    except Exception:
+        logger.warning(
+            "structure_views: DB lookup for opened_at failed; days_open will default to 0",
+            exc_info=True,
+        )
+        opened_at_by_id = {}
+
+    now = datetime.now(timezone.utc)
+    views = []
+    for structure in structures:
+        opened_at = opened_at_by_id.get(structure.get("structure_id"))
+        if opened_at is not None:
+            if opened_at.tzinfo is None:
+                opened_at = opened_at.replace(tzinfo=timezone.utc)
+            days_open = (now - opened_at).days
+        else:
+            days_open = 0
+        views.append(
+            StructureView.from_classifier_dict(structure, open_positions, days_open=days_open)
+        )
+    return views
 
 
 def _extract_positions(user_state) -> list[dict]:

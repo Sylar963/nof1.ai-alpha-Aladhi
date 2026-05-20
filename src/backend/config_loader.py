@@ -118,6 +118,7 @@ CONFIG = {
     # 3h decision loop alongside the existing 5m perps loop.
     "options_scheduler_enabled": _get_bool("OPTIONS_SCHEDULER_ENABLED", False),
     "options_structure_layer": _get_bool("OPTIONS_STRUCTURE_LAYER", False),
+    "options_structure_prompt": _get_bool("OPTIONS_STRUCTURE_PROMPT", False),
     "options_vol_surface_interval_seconds": _get_int(
         "OPTIONS_VOL_SURFACE_INTERVAL_SECONDS", 900
     ),

@@ -24,6 +24,23 @@ def build_positions_view(state_payload: dict) -> dict:
     }
 
 
+def _get_db_manager_for_reasoning():
+    from src.database.db_manager import get_db_manager
+    return get_db_manager()
+
+
+def get_options_reasoning_history(limit: int = 20) -> list:
+    try:
+        db = _get_db_manager_for_reasoning()
+        return db.get_recent_options_reasoning(limit=limit)
+    except Exception:
+        logging.getLogger(__name__).warning(
+            "get_options_reasoning_history failed; returning empty list",
+            exc_info=True,
+        )
+        return []
+
+
 class BotService:
     """Service layer for bot management and data access"""
 

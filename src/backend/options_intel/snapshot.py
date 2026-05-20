@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from typing import Optional
 
 
 # Hard byte budget for the serialized snapshot. Roughly aligned with a
@@ -53,6 +54,8 @@ class OptionsContext:
     open_positions: list = field(default_factory=list)
     portfolio_greeks: dict = field(default_factory=dict)
     structures: list = field(default_factory=list)
+    structure_views: list = field(default_factory=list)
+    triggered_by_events: list = field(default_factory=list)
 
     # Risk
     capital_available: float = 0.0
@@ -88,7 +91,7 @@ class OptionsContext:
 
     def to_dict(self) -> dict:
         """Return a dict suitable for the LLM, with hard caps on list lengths."""
-        return {
+        payload = {
             "timestamp_utc": self.timestamp_utc,
             "spot": self.spot,
             "spot_24h_change_pct": self.spot_24h_change_pct,
@@ -116,7 +119,132 @@ class OptionsContext:
             "recent_options_skips": self.recent_options_skips[:5],
             "vol_data_coverage": self.vol_data_coverage,
         }
+        from src.backend.config_loader import CONFIG
+        if CONFIG.get("options_structure_prompt"):
+            if self.structure_views:
+                payload["structures"] = [v.to_dict() for v in self.structure_views]
+            if self.triggered_by_events:
+                payload["triggered_by_events"] = [e.to_dict() for e in self.triggered_by_events]
+        return payload
 
     def to_json(self) -> str:
         """Serialize to JSON. Compact, no indentation, sorted keys."""
         return json.dumps(self.to_dict(), separators=(",", ":"), sort_keys=True, default=str)
+
+
+@dataclass(frozen=True)
+class StructureView:
+    structure_id: str
+    kind: str
+    underlying: str
+    tenor_days: int
+    days_open: int
+    legs: tuple[dict, ...]
+    net_premium: float
+    is_credit: bool
+    max_loss: Optional[float]
+    max_profit: Optional[float]
+    breakevens: tuple[float, ...]
+    short_leg_delta: Optional[float]
+    breach_state: str
+    pnl_abs: float
+    pnl_pct: float
+    aggregate_greeks: dict
+
+    @classmethod
+    def from_classifier_dict(
+        cls,
+        structure: dict,
+        open_positions: list,
+        days_open: int,
+    ) -> "StructureView":
+        positions_by_name = {pos["instrument_name"]: pos for pos in open_positions or []}
+        expanded_legs: list = []
+        for instrument_name in structure.get("legs", []) or []:
+            pos = positions_by_name.get(instrument_name)
+            if pos is None:
+                expanded_legs.append({
+                    "instrument_name": instrument_name,
+                    "kind": None,
+                    "side": None,
+                    "strike": None,
+                    "contracts": None,
+                    "abs_delta": None,
+                })
+                continue
+            delta_value = pos.get("delta")
+            abs_delta = abs(float(delta_value)) if delta_value is not None else None
+            expanded_legs.append({
+                "instrument_name": instrument_name,
+                "kind": pos.get("kind"),
+                "side": pos.get("side"),
+                "strike": float(pos["strike"]) if pos.get("strike") is not None else None,
+                "contracts": float(pos["size"]) if pos.get("size") is not None else None,
+                "abs_delta": abs_delta,
+            })
+
+        tenor_days_min = int(structure.get("tenor_days_min", 0) or 0)
+        tenor_days_max = int(structure.get("tenor_days_max", tenor_days_min) or tenor_days_min)
+        if tenor_days_min and tenor_days_max:
+            tenor_days = min(tenor_days_min, tenor_days_max)
+        else:
+            tenor_days = tenor_days_min or tenor_days_max
+
+        max_loss = structure.get("max_loss")
+        max_profit = structure.get("max_profit")
+        short_leg_delta = structure.get("short_leg_delta")
+
+        return cls(
+            structure_id=str(structure["structure_id"]),
+            kind=str(structure["kind"]),
+            underlying=str(structure.get("underlying", "")),
+            tenor_days=int(tenor_days or 0),
+            days_open=int(days_open),
+            legs=tuple(expanded_legs),
+            net_premium=float(structure.get("net_premium", 0.0) or 0.0),
+            is_credit=bool(structure.get("is_credit", False)),
+            max_loss=float(max_loss) if max_loss is not None else None,
+            max_profit=float(max_profit) if max_profit is not None else None,
+            breakevens=tuple(float(b) for b in (structure.get("breakevens") or [])),
+            short_leg_delta=float(short_leg_delta) if short_leg_delta is not None else None,
+            breach_state=str(structure.get("breach_state", "nominal")),
+            pnl_abs=float(structure.get("pnl_abs", 0.0) or 0.0),
+            pnl_pct=float(structure.get("pnl_pct", 0.0) or 0.0),
+            aggregate_greeks=dict(structure.get("aggregate_greeks") or {}),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "structure_id": self.structure_id,
+            "kind": self.kind,
+            "underlying": self.underlying,
+            "tenor_days": self.tenor_days,
+            "days_open": self.days_open,
+            "legs": [dict(leg) for leg in self.legs],
+            "net_premium": self.net_premium,
+            "is_credit": self.is_credit,
+            "max_loss": self.max_loss,
+            "max_profit": self.max_profit,
+            "breakevens": list(self.breakevens),
+            "short_leg_delta": self.short_leg_delta,
+            "breach_state": self.breach_state,
+            "pnl_abs": self.pnl_abs,
+            "pnl_pct": self.pnl_pct,
+            "aggregate_greeks": dict(self.aggregate_greeks),
+        }
+
+
+@dataclass(frozen=True)
+class EventSummary:
+    type: str
+    fired_at: str
+    description: str
+    structure_id: Optional[str]
+
+    def to_dict(self) -> dict:
+        return {
+            "type": self.type,
+            "fired_at": self.fired_at,
+            "description": self.description,
+            "structure_id": self.structure_id,
+        }

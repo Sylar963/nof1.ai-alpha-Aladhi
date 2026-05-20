@@ -67,3 +67,15 @@ def test_options_structure_layer_default_off(monkeypatch):
 def test_options_structure_layer_on_via_env(monkeypatch):
     monkeypatch.setenv("OPTIONS_STRUCTURE_LAYER", "1")
     assert config_loader._get_bool("OPTIONS_STRUCTURE_LAYER", False) is True
+
+
+def test_options_structure_prompt_default_off(monkeypatch):
+    monkeypatch.delenv("OPTIONS_STRUCTURE_PROMPT", raising=False)
+    from src.backend.config_loader import _get_bool
+    assert _get_bool("OPTIONS_STRUCTURE_PROMPT", False) is False
+
+
+def test_options_structure_prompt_on_via_env(monkeypatch):
+    monkeypatch.setenv("OPTIONS_STRUCTURE_PROMPT", "1")
+    from src.backend.config_loader import _get_bool
+    assert _get_bool("OPTIONS_STRUCTURE_PROMPT", False) is True
