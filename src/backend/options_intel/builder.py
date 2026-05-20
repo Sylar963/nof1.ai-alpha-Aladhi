@@ -251,6 +251,7 @@ async def build_options_context(
         top_mispricings_vs_deribit=mispricing_report.top,
         open_positions=portfolio["open_positions"],
         portfolio_greeks=portfolio["portfolio_greeks"],
+        structures=portfolio.get("structures", []),
         capital_available=capital_available,
         max_contracts_per_trade=0.1,
         max_open_positions=3,

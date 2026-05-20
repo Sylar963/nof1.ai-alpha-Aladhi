@@ -1,0 +1,91 @@
+from datetime import date
+
+import pytest
+
+from src.backend.options_intel.portfolio import aggregate_portfolio_greeks
+
+
+class FakeGreeksSource:
+    def __init__(self, table):
+        self.table = table
+
+    async def get_greeks(self, instrument_name):
+        return self.table.get(instrument_name, {})
+
+
+@pytest.mark.asyncio
+async def test_aggregate_emits_structures_for_credit_put_spread():
+    positions = [
+        {"instrument_name": "BTC-27JUN26-100000-P", "size": 0.1, "side": "short"},
+        {"instrument_name": "BTC-27JUN26-90000-P", "size": 0.1, "side": "long"},
+    ]
+    greeks = {
+        "BTC-27JUN26-100000-P": {"delta": -0.30, "gamma": 0.001, "vega": 50, "theta": -5, "mark_iv": 0.60},
+        "BTC-27JUN26-90000-P": {"delta": -0.10, "gamma": 0.0005, "vega": 20, "theta": -2, "mark_iv": 0.65},
+    }
+    result = await aggregate_portfolio_greeks(
+        positions=positions,
+        greeks_source=FakeGreeksSource(greeks),
+        today=date(2026, 6, 13),
+        spot=100000.0,
+    )
+    assert "structures" in result
+    assert len(result["structures"]) == 1
+    s = result["structures"][0]
+    assert s["kind"] == "credit_put_spread"
+    assert s["underlying"] == "BTC"
+    assert s["is_credit"] is True
+
+
+@pytest.mark.asyncio
+async def test_aggregate_empty_positions_emits_no_structures():
+    result = await aggregate_portfolio_greeks(
+        positions=[],
+        greeks_source=FakeGreeksSource({}),
+        today=date(2026, 6, 13),
+    )
+    assert result["structures"] == []
+
+
+@pytest.mark.asyncio
+async def test_aggregate_emits_unknown_for_single_short_leg():
+    positions = [
+        {"instrument_name": "BTC-27JUN26-100000-P", "size": 0.1, "side": "short"},
+    ]
+    greeks = {
+        "BTC-27JUN26-100000-P": {"delta": -0.30, "gamma": 0.001, "vega": 50, "theta": -5, "mark_iv": 0.60},
+    }
+    result = await aggregate_portfolio_greeks(
+        positions=positions,
+        greeks_source=FakeGreeksSource(greeks),
+        today=date(2026, 6, 13),
+        spot=100000.0,
+    )
+    assert len(result["structures"]) == 1
+    assert result["structures"][0]["kind"] == "unknown"
+
+
+def test_options_context_to_dict_does_not_include_structures():
+    from src.backend.options_intel.snapshot import OptionsContext
+
+    ctx = OptionsContext(
+        timestamp_utc="2026-05-20T00:00:00Z",
+        spot=100000.0,
+        spot_24h_change_pct=0.0,
+        opening_range={},
+        keltner={},
+        atm_iv_by_tenor={},
+        skew_25d_by_tenor={},
+        term_structure_slope=0.0,
+        expected_move_pct_by_tenor={},
+        vol_regime="fair",
+        vol_regime_confidence="high",
+        realized_iv_ratio_30d=1.0,
+        straddle_test_30d={},
+    )
+    object.__setattr__(ctx, "structures", [{"kind": "credit_put_spread"}])
+    payload = ctx.to_dict()
+    assert "structures" not in payload, (
+        "structures must remain a non-prompted field in Phase 1 — adding it to "
+        "to_dict would change the LLM prompt"
+    )

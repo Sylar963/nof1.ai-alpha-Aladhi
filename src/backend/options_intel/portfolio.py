@@ -42,9 +42,11 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import date
+from decimal import Decimal
 from typing import Any, Iterable, Optional
 
 from src.backend.options_intel.greeks_bs import black_scholes_greeks
+from src.backend.options_intel.structure import OptionLeg, classify
 from src.backend.trading.options import parse_instrument_name
 
 
@@ -52,6 +54,21 @@ logger = logging.getLogger(__name__)
 
 
 _GREEKS_KEYS = ("delta", "gamma", "vega", "theta")
+_PRICE_KEYS = ("mark_price",)
+
+
+def _bs_price(*, spot: float, strike: float, iv: float, time_years: float, kind: str) -> float:
+    import math
+    if spot <= 0 or strike <= 0 or iv <= 0 or time_years <= 0:
+        return 0.0
+    vol_sqrt_t = iv * math.sqrt(time_years)
+    d1 = (math.log(spot / strike) + 0.5 * iv * iv * time_years) / vol_sqrt_t
+    d2 = d1 - vol_sqrt_t
+    def _ncdf(x: float) -> float:
+        return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+    if kind == "call":
+        return spot * _ncdf(d1) - strike * _ncdf(d2)
+    return strike * _ncdf(-d2) - spot * _ncdf(-d1)
 
 
 async def aggregate_portfolio_greeks(
@@ -129,7 +146,7 @@ async def aggregate_portfolio_greeks(
             "kind": spec.kind,
             "strike": spec.strike,
         }
-        for key in _GREEKS_KEYS:
+        for key in _GREEKS_KEYS + _PRICE_KEYS:
             value = greeks.get(key)
             if value is None:
                 continue
@@ -163,6 +180,14 @@ async def aggregate_portfolio_greeks(
             for key in missing:
                 position_view[key] = local[key]
             position_view["greeks_source"] = "bs_local"
+        if "mark_price" not in position_view and spot and iv_for_bs > 0 and days_to_expiry > 0:
+            position_view["mark_price"] = _bs_price(
+                spot=float(spot),
+                strike=float(spec.strike),
+                iv=iv_for_bs,
+                time_years=days_to_expiry / 365.0,
+                kind=spec.kind,
+            )
 
         for key in _GREEKS_KEYS:
             if key in position_view:
@@ -170,7 +195,53 @@ async def aggregate_portfolio_greeks(
 
         open_positions.append(position_view)
 
+    structure_legs: list[OptionLeg] = []
+    for position_view in open_positions:
+        try:
+            structure_legs.append(
+                OptionLeg(
+                    instrument_name=position_view["instrument_name"],
+                    kind=position_view["kind"],
+                    strike=Decimal(str(position_view["strike"])),
+                    side=position_view["side"],
+                    contracts=Decimal(str(position_view["size"])),
+                    days_to_expiry=int(position_view["days_to_expiry"]),
+                    mark_price=Decimal(str(position_view["mark_price"])) if "mark_price" in position_view else Decimal("0"),
+                    delta=Decimal(str(position_view["delta"])) if "delta" in position_view else None,
+                    gamma=Decimal(str(position_view["gamma"])) if "gamma" in position_view else None,
+                    vega=Decimal(str(position_view["vega"])) if "vega" in position_view else None,
+                    theta=Decimal(str(position_view["theta"])) if "theta" in position_view else None,
+                )
+            )
+        except (KeyError, ValueError) as exc:
+            logger.debug("portfolio aggregator: skipping leg for classifier: %s", exc)
+            continue
+
+    structures: list[dict] = []
+    if structure_legs:
+        result = classify(structure_legs)
+        structures.append({
+            "structure_id": result.structure_id,
+            "kind": result.kind.value,
+            "underlying": result.underlying,
+            "tenor_days_min": result.tenor_days_min,
+            "tenor_days_max": result.tenor_days_max,
+            "net_premium": float(result.net_premium),
+            "is_credit": result.is_credit,
+            "max_loss": float(result.max_loss) if result.max_loss is not None else None,
+            "max_profit": float(result.max_profit) if result.max_profit is not None else None,
+            "breakevens": [float(b) for b in result.breakevens],
+            "short_leg_delta": float(result.short_leg_delta) if result.short_leg_delta is not None else None,
+            "breach_state": result.breach_state.value,
+            "pnl_abs": float(result.pnl_abs),
+            "pnl_pct": float(result.pnl_pct),
+            "aggregate_greeks": {k: float(v) for k, v in result.aggregate_greeks.items()},
+            "confidence": result.confidence,
+            "legs": [leg.instrument_name for leg in result.legs],
+        })
+
     return {
         "open_positions": open_positions,
         "portfolio_greeks": totals,
+        "structures": structures,
     }
