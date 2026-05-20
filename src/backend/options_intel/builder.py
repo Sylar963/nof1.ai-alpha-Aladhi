@@ -38,6 +38,27 @@ from src.backend.options_intel.vol_surface import (
 logger = logging.getLogger(__name__)
 
 
+def _describe_event_for_builder(event_type: str, payload: dict) -> str:
+    if event_type == "regime_flip":
+        return f"vol regime {payload.get('from')} -> {payload.get('to')}"
+    if event_type == "delta_band_breach":
+        return f"portfolio delta {payload.get('delta_btc')} BTC exceeds threshold {payload.get('threshold_btc')}"
+    if event_type == "structure_breach":
+        return f"structure {payload.get('structure_id')} {payload.get('from')} -> {payload.get('to')}"
+    if event_type == "dte_threshold":
+        return f"structure {payload.get('structure_id')} reached tenor_days_min={payload.get('tenor_days_min')}"
+    if event_type == "mispricing_actionable":
+        score = payload.get("score", 0.0)
+        try:
+            score_str = f"{float(score):.2f}"
+        except (TypeError, ValueError):
+            score_str = str(score)
+        return f"mispricing {payload.get('instrument_name')} score={score_str}"
+    if event_type == "max_interval_elapsed":
+        return f"heartbeat after {payload.get('interval_sec')}s"
+    return event_type
+
+
 async def build_options_context(
     thalex,
     deribit,
@@ -59,6 +80,7 @@ async def build_options_context(
     surface_age_seconds: Optional[float] = None,
     surface_stale_multiplier: float = 2.0,
     vol_surface_interval_seconds: Optional[float] = None,
+    events: "list | None" = None,
 ) -> OptionsContext:
     """Run the full options-intel pipeline and return a snapshot.
 
@@ -229,7 +251,7 @@ async def build_options_context(
         "thalex_ticker_enrichment": enrich_stats,
     }
 
-    return OptionsContext(
+    ctx = OptionsContext(
         timestamp_utc=datetime.now(timezone.utc).isoformat(),
         spot=float(spot),
         spot_24h_change_pct=_spot_change_pct(spot_history),
@@ -268,6 +290,25 @@ async def build_options_context(
         recent_options_skips=list(recent_options_skips or []),
         vol_data_coverage=coverage,
     )
+
+    if events:
+        from src.backend.options_intel.snapshot import EventSummary
+        triggered = []
+        for ev in events:
+            t = ev.type.value if hasattr(ev.type, "value") else str(ev.type)
+            fired_at_str = ev.fired_at.isoformat() if hasattr(ev.fired_at, "isoformat") else str(ev.fired_at)
+            payload = ev.payload if isinstance(ev.payload, dict) else {}
+            structure_id = payload.get("structure_id") if isinstance(payload, dict) else None
+            description = _describe_event_for_builder(t, payload)
+            triggered.append(EventSummary(
+                type=t,
+                fired_at=fired_at_str,
+                description=description,
+                structure_id=structure_id,
+            ))
+        ctx.triggered_by_events = triggered
+
+    return ctx
 
 
 def _build_structure_views(
