@@ -67,6 +67,28 @@ def persist_options_structures(db_manager, current_structures: list[dict]) -> No
             db_manager.mark_structure_closed(row["structure_id"])
 
 
+def persist_options_reasoning(
+    db_manager,
+    *,
+    triggered_by_events: list,
+    context_snapshot: dict,
+    llm_reasoning,
+    llm_decisions: list,
+) -> int:
+    return db_manager.save_options_reasoning(
+        triggered_by_events=triggered_by_events,
+        context_snapshot=context_snapshot,
+        llm_reasoning=llm_reasoning,
+        llm_decisions=llm_decisions,
+    )
+
+
+def update_reasoning_outcome_safely(db_manager, *, entry_id, outcome: dict) -> None:
+    if entry_id is None:
+        return
+    db_manager.update_reasoning_outcome(entry_id, outcome=outcome)
+
+
 @dataclass
 class BotState:
     """Bot state for UI updates"""
@@ -1109,6 +1131,36 @@ class TradingBotEngine:
             decisions = await agent.decide(self._latest_options_context)
             self.logger.info("OptionsAgent emitted %d decisions", len(decisions))
 
+            reasoning_entry_id = None
+            if CONFIG.get("options_structure_prompt"):
+                try:
+                    context_payload = (
+                        self._latest_options_context.to_dict()
+                        if hasattr(self._latest_options_context, "to_dict")
+                        else {}
+                    )
+                    triggered_events = getattr(
+                        self._latest_options_context, "triggered_by_events", []
+                    ) or []
+                    triggered_payload = [
+                        ev.to_dict() if hasattr(ev, "to_dict") else ev
+                        for ev in triggered_events
+                    ]
+                    agent_payload = getattr(agent, "last_payload", {}) or {}
+                    llm_reasoning_text = agent_payload.get("reasoning")
+                    decisions_payload = agent_payload.get("trade_decisions", [])
+                    from src.database.db_manager import get_db_manager as _get_db_manager
+                    reasoning_entry_id = await asyncio.to_thread(
+                        persist_options_reasoning,
+                        _get_db_manager(),
+                        triggered_by_events=triggered_payload,
+                        context_snapshot=context_payload,
+                        llm_reasoning=llm_reasoning_text,
+                        llm_decisions=decisions_payload,
+                    )
+                except Exception as exc:
+                    self.logger.warning("options reasoning persistence failed: %s", exc)
+
             # Surface options reasoning + decisions on the GUI alongside perps.
             # ``getattr`` keeps tests that swap in a minimal fake OptionsAgent
             # (no ``last_payload`` attribute) green.
@@ -1179,6 +1231,29 @@ class TradingBotEngine:
                         decision.underlying or decision.asset or "BTC",
                         reason,
                     )
+
+            if CONFIG.get("options_structure_prompt") and reasoning_entry_id is not None:
+                try:
+                    outcome_payload = {
+                        "executed_count": len(decisions),
+                        "decisions": [
+                            {
+                                "strategy": d.get("strategy"),
+                                "action": d.get("action"),
+                                "asset": d.get("asset"),
+                            }
+                            for d in options_decision_payloads
+                        ],
+                    }
+                    from src.database.db_manager import get_db_manager as _get_db_manager
+                    await asyncio.to_thread(
+                        update_reasoning_outcome_safely,
+                        _get_db_manager(),
+                        entry_id=reasoning_entry_id,
+                        outcome=outcome_payload,
+                    )
+                except Exception as exc:
+                    self.logger.warning("options reasoning outcome back-fill failed: %s", exc)
 
             # Always publish — even an empty trade_decisions array carries the
             # LLM's reasoning text, which the operator wants to see on the
