@@ -1366,9 +1366,9 @@ class TradingBotEngine:
             now = datetime.now(timezone.utc)
             now_ms = int(now.timestamp() * 1000)
 
-            # We need enough 5m candles for Keltner(130,130,4) + SMA(99):
-            # ~131 candles × 5min = ~11 hours of 5m data
-            candles_needed_5m = 200  # generous buffer
+            # 5m powers the LLM intraday context. 200 bars = ~16.7h is
+            # plenty for Keltner(130,4) warmup + recent history.
+            candles_needed_5m = 200
             start_5m_ms = now_ms - candles_needed_5m * 5 * 60 * 1000
 
             # Daily candles from the AVWAP anchor (2026-01-01)
@@ -1379,19 +1379,27 @@ class TradingBotEngine:
             lt_bar_mins = interval_minutes.get(interval, 240)
             start_long_ms = now_ms - 200 * lt_bar_mins * 60 * 1000
 
-            # Fetch all three candle sets in parallel from Hyperliquid
-            candles_5m, candles_daily, candles_long = await asyncio.gather(
+            # 15m candles power the Open Range & Keltner chart. 2130 bars
+            # ≈ 533h: 2000 displayed plus 130 for Keltner warmup so the
+            # bands span the entire visible window.
+            candles_15m_fetch = 2130
+            start_15m_ms = now_ms - candles_15m_fetch * 15 * 60 * 1000
+
+            # Fetch all four candle sets in parallel from Hyperliquid
+            candles_5m, candles_daily, candles_long, candles_15m = await asyncio.gather(
                 self.hyperliquid.get_candles(asset, "5m", start_5m_ms, now_ms),
                 self.hyperliquid.get_candles(asset, "1d", start_daily_ms, now_ms),
                 self.hyperliquid.get_candles(asset, interval, start_long_ms, now_ms),
+                self.hyperliquid.get_candles(asset, "15m", start_15m_ms, now_ms),
             )
 
             if not candles_5m:
                 raise ValueError(f"Hyperliquid returned no 5m candles for {asset}")
 
             self.logger.info(
-                "Hyperliquid candles for %s: 5m=%d, 1d=%d, %s=%d",
+                "Hyperliquid candles for %s: 5m=%d, 1d=%d, %s=%d, 15m=%d",
                 asset, len(candles_5m), len(candles_daily), interval, len(candles_long),
+                len(candles_15m),
             )
 
             indicators = build_indicator_bundle(
@@ -1399,6 +1407,7 @@ class TradingBotEngine:
                 candles_daily=candles_daily,
                 candles_long=candles_long,
                 long_interval=interval,
+                candles_15m=candles_15m,
                 current_spot=current_price,
             )
             return indicators
@@ -1635,20 +1644,34 @@ class TradingBotEngine:
                             lt_avwap = lt_indicators.get("avwap")
                             lt_keltner = lt_indicators.get("keltner", {})
 
+                            # Extract 15m chart frame (Open Range & Keltner UI chart).
+                            # Missing on the TAAPI fallback path — the GUI falls back
+                            # to the 5m intraday frame there.
+                            chart_indicators = indicators.get("chart_intraday", {}) or {}
+                            chart_sma99_series = chart_indicators.get("sma99", [])
+                            chart_avwap = chart_indicators.get("avwap")
+                            chart_keltner = chart_indicators.get("keltner", {})
+                            chart_opening_range = chart_indicators.get("opening_range", {})
+
                             keltner_5m_middle = keltner_5m.get("middle", [])
                             keltner_5m_upper = keltner_5m.get("upper", [])
                             keltner_5m_lower = keltner_5m.get("lower", [])
                             lt_keltner_middle = lt_keltner.get("middle", [])
                             lt_keltner_upper = lt_keltner.get("upper", [])
                             lt_keltner_lower = lt_keltner.get("lower", [])
+                            chart_keltner_middle = chart_keltner.get("middle", [])
+                            chart_keltner_upper = chart_keltner.get("upper", [])
+                            chart_keltner_lower = chart_keltner.get("lower", [])
                             recent_price_points = list(self.price_history[asset])[-10:]
                             recent_timestamps = [p["t"] for p in recent_price_points]
 
                             price_candles_5m = indicators["5m"].get("price_candles", {}) or {}
                             price_candles_lt = lt_indicators.get("price_candles", {}) or {}
+                            chart_price_candles = chart_indicators.get("price_candles", {}) or {}
                             # Prefer candle close timestamps so indicator & price charts share an x-axis
                             candle_times_5m = price_candles_5m.get("time") or []
                             candle_times_lt = price_candles_lt.get("time") or []
+                            chart_candle_times = chart_price_candles.get("time") or []
                             keltner_5m_timestamps = (
                                 candle_times_5m[-len(keltner_5m_middle):]
                                 if keltner_5m_middle and len(candle_times_5m) >= len(keltner_5m_middle)
@@ -1658,6 +1681,11 @@ class TradingBotEngine:
                                 candle_times_lt[-len(lt_keltner_middle):]
                                 if lt_keltner_middle and len(candle_times_lt) >= len(lt_keltner_middle)
                                 else (recent_timestamps[-len(lt_keltner_middle):] if lt_keltner_middle else [])
+                            )
+                            chart_keltner_timestamps = (
+                                chart_candle_times[-len(chart_keltner_middle):]
+                                if chart_keltner_middle and len(chart_candle_times) >= len(chart_keltner_middle)
+                                else (chart_candle_times if chart_candle_times else [])
                             )
 
                             def _latest(series):
@@ -1682,8 +1710,7 @@ class TradingBotEngine:
                                     "position": position,
                                 }
 
-                            # Build market data structure
-                            market_sections.append({
+                            section = {
                                 "asset": asset,
                                 "current_price": current_price,
                                 "intraday": {
@@ -1721,7 +1748,29 @@ class TradingBotEngine:
                                 "funding_annualized_pct": funding * 24 * 365 * 100 if funding else None,
                                 "recent_mid_prices": [p['mid'] for p in recent_price_points],
                                 "recent_timestamps": recent_timestamps,
-                            })
+                            }
+                            # Only include chart_intraday when the upstream
+                            # actually built it (Hyperliquid path). The TAAPI
+                            # fallback omits the 15m frame; the GUI's
+                            # ``chart_intraday or intraday`` fallback then
+                            # picks up the 5m frame instead.
+                            if chart_indicators and chart_price_candles.get('time'):
+                                section["chart_intraday"] = {
+                                    "interval": "15m",
+                                    "sma99": _latest(chart_sma99_series),
+                                    "avwap": chart_avwap,
+                                    "keltner": _keltner_snapshot(chart_keltner_middle, chart_keltner_upper, chart_keltner_lower),
+                                    "opening_range": chart_opening_range,
+                                    "series": {
+                                        "sma99": chart_sma99_series,
+                                        "keltner_middle": chart_keltner_middle,
+                                        "keltner_upper": chart_keltner_upper,
+                                        "keltner_lower": chart_keltner_lower,
+                                        "timestamps": chart_keltner_timestamps,
+                                        "price_candles": chart_price_candles,
+                                    },
+                                }
+                            market_sections.append(section)
 
                         except Exception as e:
                             self.logger.error(f"Error gathering market data for {asset}: {e}")

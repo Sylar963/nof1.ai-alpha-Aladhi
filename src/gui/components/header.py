@@ -4,6 +4,7 @@ Header Component - Top navigation bar with quick metrics
 
 from nicegui import ui
 from src.gui.services.state_manager import StateManager
+from src.gui.services.ui_utils import RenderGate
 
 
 def create_header(state_manager: StateManager):
@@ -13,6 +14,8 @@ def create_header(state_manager: StateManager):
     Args:
         state_manager: Global state manager instance
     """
+    gate = RenderGate()
+
     def _set_tone(label, tone: str):
         label.classes(remove='text-green-500 text-red-500 text-gray-400')
         label.classes(add=tone)
@@ -49,6 +52,16 @@ def create_header(state_manager: StateManager):
             async def update_header():
                 state = state_manager.get_state()
 
+                sig = (
+                    state.balance,
+                    state.total_return_pct,
+                    state.sharpe_ratio,
+                    state.is_running,
+                    bool(state.error),
+                )
+                if not gate.changed(sig):
+                    return
+
                 # Update balance
                 balance_label.text = f"${state.balance:,.2f}"
 
@@ -76,5 +89,7 @@ def create_header(state_manager: StateManager):
                     status_label.text = '🔴 Error'
                     _set_tone(status_label, 'text-red-500')
 
-            # Refresh every second
-            ui.timer(1.0, update_header)
+            # Balance / return / sharpe only change on bot cycle (5 min) or
+            # user-driven trades, so 3s polling is plenty even before the
+            # RenderGate filters out unchanged ticks.
+            ui.timer(3.0, update_header)

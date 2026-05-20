@@ -270,7 +270,7 @@ class BotService:
             price = snapshot.get('price')
             indicators = indicator_payloads.get(asset) or {}
             long_term_interval = str(CONFIG.get('interval', '4h'))
-            sections.append({
+            section = {
                 'asset': asset,
                 'current_price': price,
                 'price': price,
@@ -281,7 +281,16 @@ class BotService:
                 'timestamp': snapshot.get('timestamp'),
                 'intraday': cls._build_indicator_frame(indicators.get('5m') or {}, price),
                 'long_term': cls._build_indicator_frame(indicators.get(long_term_interval) or {}, price, interval=long_term_interval),
-            })
+            }
+            # 15m frame for the Open Range & Keltner chart. The TAAPI
+            # fallback path doesn't build a 15m frame, so we only emit
+            # ``chart_intraday`` when the upstream actually produced one —
+            # this lets the GUI's ``chart_intraday or intraday`` fallback
+            # land on the 5m frame instead of an empty 15m frame.
+            chart_15m = indicators.get('chart_intraday')
+            if chart_15m and (chart_15m.get('price_candles') or {}).get('time'):
+                section['chart_intraday'] = cls._build_indicator_frame(chart_15m, price, interval='15m')
+            sections.append(section)
         return sections
 
     async def stop(self):

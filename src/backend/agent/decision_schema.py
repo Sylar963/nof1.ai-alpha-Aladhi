@@ -31,9 +31,13 @@ VALID_ACTIONS = {"buy", "sell", "hold"}
 VALID_STRATEGIES = {
     "credit_put_spread",
     "credit_call_spread",
+    "debit_put_spread",
+    "debit_call_spread",
     "iron_condor",
+    "iron_butterfly",
     "long_call_delta_hedged",
     "long_put_delta_hedged",
+    "long_straddle",
     "vol_arb",
 }
 VALID_KINDS = {"call", "put"}

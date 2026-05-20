@@ -9,7 +9,7 @@ from datetime import datetime
 from nicegui import ui
 from src.gui.services.bot_service import BotService
 from src.gui.services.state_manager import StateManager
-from src.gui.services.ui_utils import is_ui_alive
+from src.gui.services.ui_utils import RenderGate, is_ui_alive
 
 
 logger = logging.getLogger(__name__)
@@ -17,6 +17,8 @@ logger = logging.getLogger(__name__)
 
 def create_reasoning(bot_service: BotService, state_manager: StateManager):
     """Create AI reasoning page with JSON editor and decision timeline"""
+
+    gate = RenderGate()
 
     def _normalize_confidence(confidence: float | int | None) -> tuple[float, int]:
         if confidence is None:
@@ -147,6 +149,19 @@ def create_reasoning(bot_service: BotService, state_manager: StateManager):
             reasoning_data.get('reasoning')
             or reasoning_data.get('trade_decisions') is not None
         )
+
+        # Reasoning payload only changes once per bot cycle. Sign on the
+        # outer fields plus the user-selected action filter so flipping
+        # the filter still re-renders.
+        sig = (
+            has_data,
+            (reasoning_data or {}).get('cycle_id'),
+            (reasoning_data or {}).get('timestamp'),
+            len((reasoning_data or {}).get('trade_decisions') or []),
+            (action_filter.value or '').upper(),
+        )
+        if not gate.changed(sig):
+            return
         if has_data:
             _set_editor_content({'json': reasoning_data})
 
