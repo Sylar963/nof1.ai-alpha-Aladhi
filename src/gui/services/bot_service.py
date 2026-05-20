@@ -16,7 +16,7 @@ from src.database.db_manager import get_db_manager
 
 
 def build_positions_view(state_payload: dict) -> dict:
-    flag_on = os.environ.get("OPTIONS_STRUCTURE_LAYER") == "1"
+    flag_on = bool(CONFIG.get("options_structure_layer"))
     return {
         "thalex_positions": state_payload.get("thalex_positions", []),
         "thalex_structures": state_payload.get("structures", []) if flag_on else [],

@@ -61,17 +61,9 @@ def test_get_env_strips_inline_comment_from_url(monkeypatch):
 
 def test_options_structure_layer_default_off(monkeypatch):
     monkeypatch.delenv("OPTIONS_STRUCTURE_LAYER", raising=False)
-    from importlib import reload
-    from src.backend import config_loader
-    reload(config_loader)
-    value = config_loader.CONFIG.get("options_structure_layer")
-    assert value in (None, "0", 0, False)
+    assert config_loader._get_bool("OPTIONS_STRUCTURE_LAYER", False) is False
 
 
 def test_options_structure_layer_on_via_env(monkeypatch):
     monkeypatch.setenv("OPTIONS_STRUCTURE_LAYER", "1")
-    from importlib import reload
-    from src.backend import config_loader
-    reload(config_loader)
-    value = config_loader.CONFIG.get("options_structure_layer")
-    assert str(value) == "1" or value is True
+    assert config_loader._get_bool("OPTIONS_STRUCTURE_LAYER", False) is True

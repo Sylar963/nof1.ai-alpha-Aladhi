@@ -136,8 +136,9 @@ def test_persist_structures_upserts_open_marks_closed():
 
 def test_bot_service_exposes_structures_when_flag_on(monkeypatch):
     from src.gui.services.bot_service import build_positions_view
+    from src.backend.config_loader import CONFIG
 
-    monkeypatch.setenv("OPTIONS_STRUCTURE_LAYER", "1")
+    monkeypatch.setitem(CONFIG, "options_structure_layer", True)
     state_payload = {
         "thalex_positions": [
             {"instrument_name": "BTC-27JUN26-100000-P", "size": 0.1, "side": "short", "kind": "put", "strike": 100000, "days_to_expiry": 14, "delta": -0.30},
@@ -160,8 +161,9 @@ def test_bot_service_exposes_structures_when_flag_on(monkeypatch):
 
 def test_bot_service_omits_structures_when_flag_off(monkeypatch):
     from src.gui.services.bot_service import build_positions_view
+    from src.backend.config_loader import CONFIG
 
-    monkeypatch.delenv("OPTIONS_STRUCTURE_LAYER", raising=False)
+    monkeypatch.setitem(CONFIG, "options_structure_layer", False)
     state_payload = {
         "thalex_positions": [],
         "structures": [{"structure_id": "x", "kind": "credit_put_spread"}],

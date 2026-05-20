@@ -1094,7 +1094,7 @@ class TradingBotEngine:
             # construct an OptionsAgent with the bot's existing TradingAgent
             # as the LLM transport. PR C will swap this for a dedicated
             # async LLM client.
-            if os.environ.get("OPTIONS_STRUCTURE_LAYER") == "1":
+            if CONFIG.get("options_structure_layer"):
                 structures = getattr(self._latest_options_context, "structures", []) or []
                 try:
                     from src.database.db_manager import get_db_manager as _get_db_manager
