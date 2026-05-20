@@ -573,6 +573,7 @@ class BotService:
                     from src.backend.trading.thalex_api import ThalexAPI
 
                     thalex = ThalexAPI()
+                    await asyncio.wait_for(thalex.connect(), timeout=12.0)
                     thalex_state = await thalex.get_user_state()
                     normalized_positions.extend(
                         self._normalize_position(position, price_map)
