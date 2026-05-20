@@ -44,6 +44,29 @@ CIRCUIT_BREAKER_CONSECUTIVE_FAILS = int(CONFIG.get("CIRCUIT_BREAKER_CONSECUTIVE_
 CIRCUIT_BREAKER_DRAWDOWN_PCT = float(CONFIG.get("CIRCUIT_BREAKER_DRAWDOWN_PCT") or 5.0)
 
 
+def persist_options_structures(db_manager, current_structures: list[dict]) -> None:
+    from decimal import Decimal as _Decimal
+
+    current_ids = {s["structure_id"] for s in current_structures}
+
+    for s in current_structures:
+        db_manager.upsert_structure_snapshot(
+            structure_id=s["structure_id"],
+            underlying=s["underlying"],
+            kind=s["kind"],
+            legs_json=s.get("legs", []),
+            entry_net_premium=_Decimal(str(s["net_premium"])),
+            last_pnl_abs=_Decimal(str(s["pnl_abs"])),
+            last_pnl_pct=_Decimal(str(s["pnl_pct"])),
+            last_breach_state=s["breach_state"],
+        )
+
+    previously_open = db_manager.get_open_structures()
+    for row in previously_open:
+        if row["structure_id"] not in current_ids:
+            db_manager.mark_structure_closed(row["structure_id"])
+
+
 @dataclass
 class BotState:
     """Bot state for UI updates"""
@@ -1070,6 +1093,14 @@ class TradingBotEngine:
             # construct an OptionsAgent with the bot's existing TradingAgent
             # as the LLM transport. PR C will swap this for a dedicated
             # async LLM client.
+            if os.environ.get("OPTIONS_STRUCTURE_LAYER") == "1":
+                structures = getattr(self._latest_options_context, "structures", []) or []
+                try:
+                    from src.database.db_manager import get_db_manager as _get_db_manager
+                    persist_options_structures(_get_db_manager(), structures)
+                except Exception as exc:
+                    self.logger.warning("options structure persistence failed: %s", exc)
+
             agent = OptionsAgent(llm=self._options_llm_adapter())
             decisions = await agent.decide(self._latest_options_context)
             self.logger.info("OptionsAgent emitted %d decisions", len(decisions))

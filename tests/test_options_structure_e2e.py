@@ -89,3 +89,46 @@ def test_options_context_to_dict_does_not_include_structures():
         "structures must remain a non-prompted field in Phase 1 — adding it to "
         "to_dict would change the LLM prompt"
     )
+
+
+def test_persist_structures_upserts_open_marks_closed():
+    """persist_options_structures writes new structures, updates existing ones, and
+    closes structures that disappeared since the previous cycle."""
+    from src.backend.bot_engine import persist_options_structures
+    from src.database.db_manager import DatabaseManager
+
+    db = DatabaseManager(db_url="sqlite:///:memory:")
+
+    structures_cycle_1 = [{
+        "structure_id": "abc123",
+        "underlying": "BTC",
+        "kind": "credit_put_spread",
+        "tenor_days_min": 14,
+        "tenor_days_max": 14,
+        "net_premium": 20.0,
+        "is_credit": True,
+        "max_loss": 980.0,
+        "max_profit": 20.0,
+        "breakevens": [99800.0],
+        "short_leg_delta": -0.30,
+        "breach_state": "warning",
+        "pnl_abs": 0.0,
+        "pnl_pct": 0.0,
+        "aggregate_greeks": {"delta": -0.20, "gamma": 0.0005, "vega": 30, "theta": -3},
+        "confidence": 1.0,
+        "legs": ["BTC-27JUN26-100000-P", "BTC-27JUN26-90000-P"],
+    }]
+
+    persist_options_structures(db, structures_cycle_1)
+    open_ids = {row["structure_id"] for row in db.get_open_structures()}
+    assert open_ids == {"abc123"}
+
+    structures_cycle_2 = [{**structures_cycle_1[0], "pnl_abs": 5.0, "pnl_pct": 0.25, "breach_state": "warning"}]
+    persist_options_structures(db, structures_cycle_2)
+    rows = db.get_open_structures()
+    assert len(rows) == 1
+    assert rows[0]["last_pnl_abs"] == 5.0
+
+    persist_options_structures(db, [])
+    open_ids = {row["structure_id"] for row in db.get_open_structures()}
+    assert open_ids == set()
