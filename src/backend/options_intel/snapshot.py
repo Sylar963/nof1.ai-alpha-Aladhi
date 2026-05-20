@@ -52,6 +52,7 @@ class OptionsContext:
     # Portfolio
     open_positions: list = field(default_factory=list)
     portfolio_greeks: dict = field(default_factory=dict)
+    structures: list = field(default_factory=list)
 
     # Risk
     capital_available: float = 0.0

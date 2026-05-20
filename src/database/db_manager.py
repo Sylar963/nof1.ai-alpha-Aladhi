@@ -619,6 +619,87 @@ class DatabaseManager:
                 'pending_proposals': session.query(TradeProposal).filter(TradeProposal.status == 'pending').count(),
             }
 
+    def upsert_structure_snapshot(
+        self,
+        *,
+        structure_id: str,
+        underlying: str,
+        kind: str,
+        legs_json: list,
+        entry_net_premium,
+        last_pnl_abs,
+        last_pnl_pct,
+        last_breach_state: str,
+        metadata_json: Optional[dict] = None,
+    ) -> None:
+        import json as _json
+        from src.database.models import OptionStructureSnapshot
+
+        with self.session_scope() as session:
+            existing = (
+                session.query(OptionStructureSnapshot)
+                .filter_by(structure_id=structure_id)
+                .one_or_none()
+            )
+            if existing is None:
+                row = OptionStructureSnapshot(
+                    structure_id=structure_id,
+                    underlying=underlying,
+                    kind=kind,
+                    legs_json=_json.dumps(legs_json),
+                    entry_net_premium=float(entry_net_premium),
+                    last_pnl_abs=float(last_pnl_abs),
+                    last_pnl_pct=float(last_pnl_pct),
+                    last_breach_state=last_breach_state,
+                    metadata_json=_json.dumps(metadata_json) if metadata_json else None,
+                )
+                session.add(row)
+            else:
+                existing.kind = kind
+                existing.last_pnl_abs = float(last_pnl_abs)
+                existing.last_pnl_pct = float(last_pnl_pct)
+                existing.last_breach_state = last_breach_state
+                existing.last_seen_at = datetime.utcnow()
+                if existing.closed_at is not None:
+                    existing.closed_at = None
+
+    def mark_structure_closed(self, structure_id: str) -> None:
+        from datetime import datetime
+        from src.database.models import OptionStructureSnapshot
+
+        with self.session_scope() as session:
+            row = (
+                session.query(OptionStructureSnapshot)
+                .filter_by(structure_id=structure_id)
+                .one_or_none()
+            )
+            if row is not None and row.closed_at is None:
+                row.closed_at = datetime.utcnow()
+
+    def get_open_structures(self) -> List[Dict[str, Any]]:
+        from src.database.models import OptionStructureSnapshot
+
+        with self.session_scope() as session:
+            rows = (
+                session.query(OptionStructureSnapshot)
+                .filter(OptionStructureSnapshot.closed_at.is_(None))
+                .all()
+            )
+            return [
+                {
+                    "structure_id": row.structure_id,
+                    "underlying": row.underlying,
+                    "kind": row.kind,
+                    "opened_at": row.opened_at,
+                    "last_seen_at": row.last_seen_at,
+                    "entry_net_premium": row.entry_net_premium,
+                    "last_pnl_abs": row.last_pnl_abs,
+                    "last_pnl_pct": row.last_pnl_pct,
+                    "last_breach_state": row.last_breach_state,
+                }
+                for row in rows
+            ]
+
 
 # Global database manager instance (singleton pattern)
 _db_manager: Optional[DatabaseManager] = None

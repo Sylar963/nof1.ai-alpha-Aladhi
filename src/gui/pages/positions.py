@@ -3,7 +3,7 @@ Positions Page - Active trading positions with real-time PnL tracking
 """
 
 from nicegui import ui
-from src.gui.services.bot_service import BotService
+from src.gui.services.bot_service import BotService, build_positions_view
 from src.gui.services.state_manager import StateManager
 from src.gui.services.ui_utils import RenderGate, is_ui_alive
 
@@ -54,6 +54,50 @@ def create_positions(bot_service: BotService, state_manager: StateManager):
             total_exposure = ui.label('$0.00').classes('text-3xl font-bold text-white')
             ui.label('Total Exposure').classes('text-sm text-gray-200 mt-1')
     
+    structures_container = ui.column().classes('w-full mb-6')
+
+    def _render_structures(state):
+        structures_container.clear()
+        view = build_positions_view({
+            "thalex_positions": [],
+            "structures": state.structures if hasattr(state, 'structures') else [],
+            "hyperliquid_positions": [],
+        })
+        if not view["thalex_structures"]:
+            return
+        with structures_container:
+            ui.label('Thalex Structures').classes('text-xl font-bold text-white mb-2')
+            for structure in view["thalex_structures"]:
+                with ui.card().classes('w-full p-3 mb-2 bg-gray-800'):
+                    with ui.row().classes('items-center justify-between w-full'):
+                        kind_label = structure["kind"].replace("_", " ").title()
+                        ui.label(kind_label).classes('text-md font-semibold text-white')
+                        badge_color = {
+                            'nominal': 'green',
+                            'warning': 'orange',
+                            'breached': 'red',
+                        }.get(structure.get("breach_state", ""), 'grey')
+                        ui.badge(structure.get("breach_state", "unknown"), color=badge_color)
+                    ui.label(
+                        f"Premium: {structure.get('net_premium', 0):+.2f} "
+                        f"({'credit' if structure.get('is_credit') else 'debit'})  "
+                        f"DTE: {structure.get('tenor_days_min', '?')}-{structure.get('tenor_days_max', '?')}  "
+                        f"P&L: {structure.get('pnl_abs', 0):+.2f} ({structure.get('pnl_pct', 0)*100:+.2f}%)"
+                    ).classes('text-sm text-gray-300')
+                    if structure.get("max_loss") is not None:
+                        max_profit = structure.get("max_profit")
+                        max_profit_str = f"{max_profit:.2f}" if max_profit is not None else 'unbounded'
+                        ui.label(
+                            f"Max loss: {structure['max_loss']:.2f}  Max profit: {max_profit_str}"
+                        ).classes('text-xs text-gray-400')
+                    if structure.get("breakevens"):
+                        ui.label(
+                            "Breakevens: " + ", ".join(f"{b:.0f}" for b in structure["breakevens"])
+                        ).classes('text-xs text-gray-400')
+                    with ui.expansion('Legs').classes('w-full'):
+                        for leg in structure.get("legs", []):
+                            ui.label(f"• {leg}").classes('text-xs text-gray-300')
+
     # Positions table
     with ui.card().classes('w-full p-4'):
         ui.label('Position Details').classes('text-xl font-bold text-white mb-4')
@@ -238,6 +282,7 @@ def create_positions(bot_service: BotService, state_manager: StateManager):
             return
         try:
             state = state_manager.get_state()
+            _render_structures(state)
             positions = state.positions or []
 
             # Skip the (table-rebuilding) refresh when positions are byte-for-

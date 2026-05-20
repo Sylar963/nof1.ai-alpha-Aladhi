@@ -57,3 +57,13 @@ def test_get_env_strips_inline_comment_from_url(monkeypatch):
         config_loader._get_env("HYPERLIQUID_BASE_URL")
         == "https://api.hyperliquid-testnet.xyz"
     )
+
+
+def test_options_structure_layer_default_off(monkeypatch):
+    monkeypatch.delenv("OPTIONS_STRUCTURE_LAYER", raising=False)
+    assert config_loader._get_bool("OPTIONS_STRUCTURE_LAYER", False) is False
+
+
+def test_options_structure_layer_on_via_env(monkeypatch):
+    monkeypatch.setenv("OPTIONS_STRUCTURE_LAYER", "1")
+    assert config_loader._get_bool("OPTIONS_STRUCTURE_LAYER", False) is True
