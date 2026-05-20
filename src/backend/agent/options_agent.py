@@ -98,13 +98,17 @@ WHEN vol_regime == "rich" (IV >> RV, realized_iv_ratio_30d < 0.8):
     - skew_25d negative (puts expensive)  → credit_put_spread
     - skew_25d positive (calls expensive) → credit_call_spread
     - skew_25d near zero                  → iron_condor (sell both wings)
+    - skew_25d near zero + high pin conviction (pre-expiry, max-pain cluster) → iron_butterfly
   Spot trending (keltner "above" or "below", or opening_range breakout):
     - Uptrend  → credit_call_spread (fade the overpriced calls into strength)
     - Downtrend → credit_put_spread (fade the overpriced puts into weakness)
 
 WHEN vol_regime == "cheap" (IV << RV, realized_iv_ratio_30d > 1.2):
-  Spot trending up   → long_call_delta_hedged (buy gamma, scalp delta on perps)
-  Spot trending down → long_put_delta_hedged
+  Spot trending up   + low vol_regime_confidence  → debit_call_spread
+  Spot trending up   + high vol_regime_confidence → long_call_delta_hedged (buy gamma, scalp delta on perps)
+  Spot trending down + low vol_regime_confidence  → debit_put_spread
+  Spot trending down + high vol_regime_confidence → long_put_delta_hedged
+  Spot ranging       + high IV expansion conviction → long_straddle
   Spot ranging       → long_call_delta_hedged + long_put_delta_hedged
                         (synthetic straddle via gamma — wait for breakout)
 
@@ -136,6 +140,29 @@ STRIKE SELECTION
 
 
 _POSITION_MANAGEMENT = """\
+**Structure-aware management.** When the prompt includes a `structures` array
+(present only when the structure recognition layer is enabled), iterate through
+it BEFORE proposing any new entry. For each structure check in this order:
+
+1. `breach_state` — if `breached` or `tenor_days` < 2, decide close/roll/let-expire
+   based on `pnl_pct`. If `pnl_pct >= 0.5` and credit structure, close to lock
+   profit. If `pnl_pct <= -0.5` and `tenor_days` > 2, consider rolling. Otherwise
+   let expire if max_loss is acceptable.
+2. `pnl_pct` >= 0.65 for credit structures -> take profit, do not hold the last
+   35%.
+3. `pnl_pct` <= -0.8 for any structure -> cut-loss unless the thesis still holds
+   (vol regime + directional bias both still favor the structure).
+4. `days_open` >= 21 for credit spreads -> consider rolling out even if not
+   profitable yet; theta decay slows past day 21.
+5. `breach_state == "warning"` -> flag for attention but no forced action;
+   re-check next cycle.
+
+Only after handling every structure should you consider new entries. When
+proposing a new entry, rank held structures against `top_mispricings_vs_deribit`:
+if a mispricing overlaps an existing structure (same underlying, overlapping
+tenor or strike), prefer closing the existing structure over adding more
+exposure.
+
 POSITION MANAGEMENT — rolling, profit-taking, and cut-loss
 
 You are responsible for managing existing positions, not just opening new ones.
