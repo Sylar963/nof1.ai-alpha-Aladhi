@@ -136,6 +136,8 @@ class StructureSource:
         now = self._clock()
         current_ids: set[str] = set()
         for s in structures:
+            if not isinstance(s, dict):
+                continue
             sid = s.get("structure_id")
             current_breach = s.get("breach_state")
             if not isinstance(sid, str) or not isinstance(current_breach, str):
@@ -198,6 +200,8 @@ class DTESource:
         now = self._clock()
         current_ids: set[str] = set()
         for s in structures:
+            if not isinstance(s, dict):
+                continue
             sid = s.get("structure_id")
             tenor_min = s.get("tenor_days_min")
             if not isinstance(sid, str) or not isinstance(tenor_min, int):

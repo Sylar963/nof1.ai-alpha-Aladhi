@@ -1,7 +1,5 @@
-import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 
@@ -60,21 +58,73 @@ async def test_run_options_decision_cycle_stamps_events_into_context(monkeypatch
     assert "heartbeat" in stamped[0].description
 
 
-@pytest.mark.asyncio
-async def test_engine_constructs_event_bus_when_flag_on(monkeypatch):
-    monkeypatch.setitem(CONFIG, "options_scheduler_enabled", True)
-    monkeypatch.setitem(CONFIG, "options_event_bus_enabled", True)
-    from src.backend.bot_engine import TradingBotEngine
-    with patch.object(TradingBotEngine, "__init__", lambda self, **k: None):
-        engine = TradingBotEngine()
+def test_scheduler_wiring_exposes_event_bus_and_sources_when_constructed_with_them():
     from src.backend.trading.options_event_bus import EventBus
-    assert EventBus is not None
+    from src.backend.trading.options_event_sources import HeartbeatSource
+    from src.backend.trading.options_scheduler import (
+        OptionsScheduler,
+        OptionsSchedulerConfig,
+    )
+
+    bus = EventBus(dedup_window_sec=300.0)
+    heartbeat = HeartbeatSource(interval_sec=10800.0)
+
+    async def _noop():
+        return None
+
+    sched = OptionsScheduler(
+        config=OptionsSchedulerConfig(
+            vol_surface_interval_seconds=0.0,
+            options_decision_interval_seconds=0.0,
+        ),
+        refresh_vol_surface=_noop,
+        run_options_decision=_noop,
+        event_bus=bus,
+        event_sources=[heartbeat],
+        event_poll_seconds=30.0,
+        latest_state_provider=lambda: None,
+    )
+
+    assert sched._event_bus is bus
+    assert sched._event_sources == [heartbeat]
+    assert sched._event_poll_seconds >= 0.1
 
 
-@pytest.mark.asyncio
-async def test_engine_event_bus_off_by_default():
-    from src.backend.config_loader import CONFIG
-    assert CONFIG.get("options_event_bus_enabled") in (False, None)
+def test_scheduler_event_poll_seconds_clamped_to_minimum():
+    from src.backend.trading.options_event_bus import EventBus
+    from src.backend.trading.options_scheduler import (
+        OptionsScheduler,
+        OptionsSchedulerConfig,
+    )
+
+    async def _noop():
+        return None
+
+    sched = OptionsScheduler(
+        config=OptionsSchedulerConfig(
+            vol_surface_interval_seconds=0.0,
+            options_decision_interval_seconds=0.0,
+        ),
+        refresh_vol_surface=_noop,
+        run_options_decision=_noop,
+        event_bus=EventBus(),
+        event_sources=[],
+        event_poll_seconds=0.0,
+    )
+    assert sched._event_poll_seconds == 0.1
+
+    sched2 = OptionsScheduler(
+        config=OptionsSchedulerConfig(
+            vol_surface_interval_seconds=0.0,
+            options_decision_interval_seconds=0.0,
+        ),
+        refresh_vol_surface=_noop,
+        run_options_decision=_noop,
+        event_bus=EventBus(),
+        event_sources=[],
+        event_poll_seconds=-5.0,
+    )
+    assert sched2._event_poll_seconds == 0.1
 
 
 @pytest.mark.asyncio

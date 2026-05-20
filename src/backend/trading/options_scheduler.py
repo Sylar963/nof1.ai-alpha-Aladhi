@@ -80,7 +80,7 @@ class OptionsScheduler:
         self._bootstrap_done = asyncio.Event()
         self._event_bus = event_bus
         self._event_sources = list(event_sources) if event_sources else []
-        self._event_poll_seconds = event_poll_seconds
+        self._event_poll_seconds = max(float(event_poll_seconds), 0.1)
         self._latest_state_provider = latest_state_provider
 
     async def start(self) -> None:
@@ -306,7 +306,10 @@ class OptionsScheduler:
                         if callable(mark):
                             try:
                                 mark(now)
-                            except Exception:  # pylint: disable=broad-except
-                                pass
+                            except Exception as exc:  # pylint: disable=broad-except
+                                logger.exception(
+                                    "OptionsScheduler[event] mark_cycle_ran on %s failed: %s",
+                                    type(src).__name__, exc,
+                                )
         except asyncio.CancelledError:
             raise

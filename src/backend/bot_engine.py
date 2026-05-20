@@ -1143,7 +1143,11 @@ class TradingBotEngine:
         if t == "dte_threshold":
             return f"structure {payload.get('structure_id')} reached tenor_days_min={payload.get('tenor_days_min')}"
         if t == "mispricing_actionable":
-            return f"mispricing {payload.get('instrument_name')} score={payload.get('score'):.2f}"
+            try:
+                score_str = f"{float(payload.get('score')):.2f}"
+            except (TypeError, ValueError):
+                score_str = "N/A"
+            return f"mispricing {payload.get('instrument_name')} score={score_str}"
         if t == "max_interval_elapsed":
             return f"heartbeat after {payload.get('interval_sec')}s"
         return t
