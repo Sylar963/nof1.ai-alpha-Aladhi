@@ -89,8 +89,11 @@ def test_from_classifier_dict_handles_missing_leg_lookup():
     view = StructureView.from_classifier_dict(raw, _open_positions(), days_open=0)
     assert len(view.legs) == 2
     missing = next(leg for leg in view.legs if leg["instrument_name"] == "MISSING-LEG")
-    assert missing.get("kind") is None
-    assert missing.get("strike") is None
+    assert missing["kind"] is None
+    assert missing["side"] is None
+    assert missing["strike"] is None
+    assert missing["contracts"] is None
+    assert missing["abs_delta"] is None
 
 
 def test_structure_view_to_dict_round_trip():

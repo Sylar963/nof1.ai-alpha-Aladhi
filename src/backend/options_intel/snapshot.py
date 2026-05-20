@@ -163,7 +163,14 @@ class StructureView:
         for instrument_name in structure.get("legs", []) or []:
             pos = positions_by_name.get(instrument_name)
             if pos is None:
-                expanded_legs.append({"instrument_name": instrument_name})
+                expanded_legs.append({
+                    "instrument_name": instrument_name,
+                    "kind": None,
+                    "side": None,
+                    "strike": None,
+                    "contracts": None,
+                    "abs_delta": None,
+                })
                 continue
             delta_value = pos.get("delta")
             abs_delta = abs(float(delta_value)) if delta_value is not None else None

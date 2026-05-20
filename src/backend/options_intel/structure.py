@@ -407,12 +407,12 @@ def classify_many(legs: Sequence[OptionLeg]) -> list[OptionStructure]:
 
     classified: list[OptionStructure] = []
     orphans: list[OptionLeg] = []
-    for group in by_tenor.values():
-        sub = classify(group)
+    for tenor in sorted(by_tenor.keys()):
+        sub = classify(by_tenor[tenor])
         if sub.kind != StructureKind.UNKNOWN:
             classified.append(sub)
         else:
-            orphans.extend(group)
+            orphans.extend(by_tenor[tenor])
 
     if classified:
         if orphans:

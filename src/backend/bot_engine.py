@@ -29,6 +29,7 @@ from src.backend.trading.options_scheduler import (
 )
 from src.backend.trading.options_strategies import DeltaHedger, OptionsExecutor
 from src.backend.utils.prompt_utils import json_default
+from src.database.db_manager import get_db_manager
 
 
 # Failed proposals linger in pending_proposals so the UI can offer Retry.
@@ -989,7 +990,6 @@ class TradingBotEngine:
                 # ``__enter__``/``__exit__`` pair leaked connections when
                 # ``build_options_context`` raised between the two calls.
                 from contextlib import nullcontext
-                from src.database.db_manager import get_db_manager
                 try:
                     session_cm = get_db_manager().session_scope()
                 except Exception as exc:  # pylint: disable=broad-except
@@ -1119,9 +1119,8 @@ class TradingBotEngine:
             if CONFIG.get("options_structure_layer"):
                 structures = getattr(self._latest_options_context, "structures", []) or []
                 try:
-                    from src.database.db_manager import get_db_manager as _get_db_manager
                     await asyncio.to_thread(
-                        persist_options_structures, _get_db_manager(), structures
+                        persist_options_structures, get_db_manager(), structures
                     )
                 except Exception as exc:
                     self.logger.warning("options structure persistence failed: %s", exc)
@@ -1149,10 +1148,9 @@ class TradingBotEngine:
                     agent_payload = getattr(agent, "last_payload", {}) or {}
                     llm_reasoning_text = agent_payload.get("reasoning")
                     decisions_payload = agent_payload.get("trade_decisions", [])
-                    from src.database.db_manager import get_db_manager as _get_db_manager
                     reasoning_entry_id = await asyncio.to_thread(
                         persist_options_reasoning,
-                        _get_db_manager(),
+                        get_db_manager(),
                         triggered_by_events=triggered_payload,
                         context_snapshot=context_payload,
                         llm_reasoning=llm_reasoning_text,
@@ -1235,7 +1233,7 @@ class TradingBotEngine:
             if CONFIG.get("options_structure_prompt") and reasoning_entry_id is not None:
                 try:
                     outcome_payload = {
-                        "executed_count": len(decisions),
+                        "proposed_count": len(decisions),
                         "decisions": [
                             {
                                 "strategy": d.get("strategy"),
@@ -1245,10 +1243,9 @@ class TradingBotEngine:
                             for d in options_decision_payloads
                         ],
                     }
-                    from src.database.db_manager import get_db_manager as _get_db_manager
                     await asyncio.to_thread(
                         update_reasoning_outcome_safely,
-                        _get_db_manager(),
+                        get_db_manager(),
                         entry_id=reasoning_entry_id,
                         outcome=outcome_payload,
                     )

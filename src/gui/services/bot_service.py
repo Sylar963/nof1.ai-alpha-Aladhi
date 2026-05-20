@@ -34,6 +34,10 @@ def get_options_reasoning_history(limit: int = 20) -> list:
         db = _get_db_manager_for_reasoning()
         return db.get_recent_options_reasoning(limit=limit)
     except Exception:
+        logging.getLogger(__name__).warning(
+            "get_options_reasoning_history failed; returning empty list",
+            exc_info=True,
+        )
         return []
 
 

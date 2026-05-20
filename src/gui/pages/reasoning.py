@@ -290,6 +290,8 @@ def create_reasoning(bot_service: BotService, state_manager: StateManager):
     history_container = ui.column().classes('w-full mt-6')
 
     def _refresh_history():
+        if not _ui_ok():
+            return
         history_container.clear()
         rows = get_options_reasoning_history(limit=20)
         if not rows:
@@ -322,6 +324,8 @@ def create_reasoning(bot_service: BotService, state_manager: StateManager):
         if not _ui_ok():
             return
         await update_reasoning()
+        if not _ui_ok():
+            return
         _refresh_history()
 
     # Auto-refresh every 3 seconds

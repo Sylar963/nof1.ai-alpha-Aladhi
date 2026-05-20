@@ -77,13 +77,18 @@ VENUE
 DEFINED-RISK STRATEGIES (the only allowed values for `strategy`)
 - credit_put_spread        — sell premium below support, defined risk
 - credit_call_spread       — sell premium above resistance, defined risk
+- debit_put_spread         — directional bearish, defined risk (IV cheap)
+- debit_call_spread        — directional bullish, defined risk (IV cheap)
 - iron_condor              — sell both spreads simultaneously (vol crush)
+- iron_butterfly           — tighter iron condor with shared short strike (pin play)
 - long_call_delta_hedged   — directional long, gamma-scalped on perps
 - long_put_delta_hedged    — directional short, gamma-scalped on perps
+- long_straddle            — long both call and put at same strike (IV expansion)
 - vol_arb                  — exploit Thalex IV mispricing vs Deribit
 
 NAKED LEGS ARE FORBIDDEN. Every short premium position MUST be wrapped as a
-vertical (credit_*_spread) or as both legs of an iron condor."""
+vertical (credit_*_spread), as both wings of an iron condor or iron butterfly,
+or as a defined-risk debit spread."""
 
 
 _STRATEGY_SELECTION = """\

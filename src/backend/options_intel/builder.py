@@ -281,7 +281,7 @@ def _build_structure_views(
     and the views still emit with the rest of the structure data intact.
     """
     from src.backend.options_intel.snapshot import StructureView
-    from datetime import datetime
+    from datetime import datetime, timezone
 
     if not structures:
         return []
@@ -292,13 +292,22 @@ def _build_structure_views(
         for row in _get_db_manager().get_open_structures():
             opened_at_by_id[row["structure_id"]] = row["opened_at"]
     except Exception:
+        logger.warning(
+            "structure_views: DB lookup for opened_at failed; days_open will default to 0",
+            exc_info=True,
+        )
         opened_at_by_id = {}
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     views = []
     for structure in structures:
         opened_at = opened_at_by_id.get(structure.get("structure_id"))
-        days_open = (now - opened_at).days if opened_at is not None else 0
+        if opened_at is not None:
+            if opened_at.tzinfo is None:
+                opened_at = opened_at.replace(tzinfo=timezone.utc)
+            days_open = (now - opened_at).days
+        else:
+            days_open = 0
         views.append(
             StructureView.from_classifier_dict(structure, open_positions, days_open=days_open)
         )
