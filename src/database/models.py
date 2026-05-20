@@ -340,6 +340,29 @@ class MarketData(Base):
         return f"<MarketData(id={self.id}, asset={self.asset}, timestamp={self.timestamp}, close={self.close})>"
 
 
+class OptionStructureSnapshot(Base):
+    __tablename__ = "option_structure_snapshots"
+
+    structure_id = Column(String(40), primary_key=True)
+    underlying = Column(String(20), nullable=False, index=True)
+    kind = Column(String(32), nullable=False, index=True)
+    legs_json = Column(Text, nullable=False)
+
+    opened_at = Column(DateTime, nullable=False, default=func.now())
+    last_seen_at = Column(DateTime, nullable=False, default=func.now(), onupdate=func.now())
+    closed_at = Column(DateTime, nullable=True, index=True)
+
+    entry_net_premium = Column(Float, nullable=False)
+    last_pnl_abs = Column(Float, nullable=False, default=0.0)
+    last_pnl_pct = Column(Float, nullable=False, default=0.0)
+    last_breach_state = Column(String(16), nullable=False, default="nominal")
+
+    metadata_json = Column(Text, nullable=True)
+
+    def __repr__(self):
+        return f"<OptionStructureSnapshot(id={self.structure_id[:8]}, kind={self.kind}, closed={self.closed_at is not None})>"
+
+
 # Database initialization helper
 def create_tables(engine):
     """Create all tables in the database."""
