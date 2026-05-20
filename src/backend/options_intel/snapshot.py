@@ -12,6 +12,7 @@ The LLM's job is to reason about regime + greeks + mispricings, not to scan
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -54,6 +55,8 @@ class OptionsContext:
     open_positions: list = field(default_factory=list)
     portfolio_greeks: dict = field(default_factory=dict)
     structures: list = field(default_factory=list)
+    structure_views: list = field(default_factory=list)
+    triggered_by_events: list = field(default_factory=list)
 
     # Risk
     capital_available: float = 0.0
@@ -89,7 +92,7 @@ class OptionsContext:
 
     def to_dict(self) -> dict:
         """Return a dict suitable for the LLM, with hard caps on list lengths."""
-        return {
+        payload = {
             "timestamp_utc": self.timestamp_utc,
             "spot": self.spot,
             "spot_24h_change_pct": self.spot_24h_change_pct,
@@ -117,6 +120,12 @@ class OptionsContext:
             "recent_options_skips": self.recent_options_skips[:5],
             "vol_data_coverage": self.vol_data_coverage,
         }
+        if os.environ.get("OPTIONS_STRUCTURE_PROMPT") == "1":
+            if self.structure_views:
+                payload["structures"] = [v.to_dict() for v in self.structure_views]
+            if self.triggered_by_events:
+                payload["triggered_by_events"] = [e.to_dict() for e in self.triggered_by_events]
+        return payload
 
     def to_json(self) -> str:
         """Serialize to JSON. Compact, no indentation, sorted keys."""
