@@ -1098,7 +1098,9 @@ class TradingBotEngine:
                 structures = getattr(self._latest_options_context, "structures", []) or []
                 try:
                     from src.database.db_manager import get_db_manager as _get_db_manager
-                    persist_options_structures(_get_db_manager(), structures)
+                    await asyncio.to_thread(
+                        persist_options_structures, _get_db_manager(), structures
+                    )
                 except Exception as exc:
                     self.logger.warning("options structure persistence failed: %s", exc)
                 self.state.structures = structures

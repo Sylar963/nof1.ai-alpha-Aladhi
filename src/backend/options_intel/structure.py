@@ -179,7 +179,13 @@ def _match_template(legs: Sequence[OptionLeg]) -> tuple[StructureKind, float]:
         calls = [leg for leg in legs if leg.kind == "call"]
         puts = [leg for leg in legs if leg.kind == "put"]
         tenors = {leg.days_to_expiry for leg in legs}
-        if len(calls) == 2 and len(puts) == 2 and len(tenors) == 1:
+        contracts_set = {leg.contracts for leg in legs}
+        if (
+            len(calls) == 2
+            and len(puts) == 2
+            and len(tenors) == 1
+            and len(contracts_set) == 1
+        ):
             calls_by_side = {leg.side: leg for leg in calls}
             puts_by_side = {leg.side: leg for leg in puts}
             if (

@@ -93,3 +93,40 @@ def test_get_open_structures_excludes_closed(db):
     db.mark_structure_closed("closed_1")
     open_ids = {row["structure_id"] for row in db.get_open_structures()}
     assert open_ids == {"open_1"}
+
+
+def test_upsert_refreshes_last_seen_at_even_when_payload_unchanged(db):
+    import time
+
+    db.upsert_structure_snapshot(
+        structure_id="abc123",
+        underlying="BTC",
+        kind="credit_put_spread",
+        legs_json=[],
+        entry_net_premium=Decimal("20"),
+        last_pnl_abs=Decimal("0"),
+        last_pnl_pct=Decimal("0"),
+        last_breach_state="nominal",
+    )
+    with db.session_scope() as session:
+        first_seen = (
+            session.query(OptionStructureSnapshot).filter_by(structure_id="abc123").one().last_seen_at
+        )
+
+    time.sleep(0.02)
+    db.upsert_structure_snapshot(
+        structure_id="abc123",
+        underlying="BTC",
+        kind="credit_put_spread",
+        legs_json=[],
+        entry_net_premium=Decimal("20"),
+        last_pnl_abs=Decimal("0"),
+        last_pnl_pct=Decimal("0"),
+        last_breach_state="nominal",
+    )
+    with db.session_scope() as session:
+        second_seen = (
+            session.query(OptionStructureSnapshot).filter_by(structure_id="abc123").one().last_seen_at
+        )
+
+    assert second_seen > first_seen

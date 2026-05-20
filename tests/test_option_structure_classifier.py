@@ -389,3 +389,25 @@ def test_breach_state_nominal_when_delta_low_dte_high():
     ]
     s = classify(legs)
     assert s.breach_state == BreachState.NOMINAL
+
+
+def test_classify_iron_condor_with_uneven_contracts_is_unknown():
+    legs = [
+        _put_leg_full(95000, "short", mark="300"),
+        _put_leg_full(90000, "long", mark="100"),
+        _call_leg(105000, "short", mark="300"),
+        OptionLeg(
+            instrument_name="BTC-27JUN26-110000-C",
+            kind="call",
+            strike=Decimal("110000"),
+            side="long",
+            contracts=Decimal("0.2"),
+            days_to_expiry=14,
+            mark_price=Decimal("100"),
+            delta=Decimal("0.10"),
+            gamma=None, vega=None, theta=None,
+        ),
+    ]
+    s = classify(legs)
+    assert s.kind == StructureKind.UNKNOWN
+    assert s.confidence == 0.0

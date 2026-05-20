@@ -659,6 +659,7 @@ class DatabaseManager:
                 existing.last_pnl_abs = float(last_pnl_abs)
                 existing.last_pnl_pct = float(last_pnl_pct)
                 existing.last_breach_state = last_breach_state
+                existing.last_seen_at = datetime.utcnow()
                 if existing.closed_at is not None:
                     existing.closed_at = None
 
