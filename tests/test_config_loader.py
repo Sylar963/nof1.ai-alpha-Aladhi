@@ -79,3 +79,22 @@ def test_options_structure_prompt_on_via_env(monkeypatch):
     monkeypatch.setenv("OPTIONS_STRUCTURE_PROMPT", "1")
     from src.backend.config_loader import _get_bool
     assert _get_bool("OPTIONS_STRUCTURE_PROMPT", False) is True
+
+
+def test_phase3_event_bus_config_defaults(monkeypatch):
+    for name in (
+        "OPTIONS_EVENT_BUS_ENABLED",
+        "OPTIONS_HEARTBEAT_SEC",
+        "OPTIONS_DELTA_BAND_BTC",
+        "OPTIONS_DTE_TRIGGER_DAYS",
+        "OPTIONS_MISPRICING_TRIGGER_SCORE",
+        "OPTIONS_EVENT_POLL_SECONDS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    assert config_loader._get_bool("OPTIONS_EVENT_BUS_ENABLED", False) is False
+    assert config_loader._get_float("OPTIONS_HEARTBEAT_SEC", 10800.0) == 10800.0
+    assert config_loader._get_float("OPTIONS_DELTA_BAND_BTC", 0.10) == 0.10
+    assert config_loader._get_int("OPTIONS_DTE_TRIGGER_DAYS", 2) == 2
+    assert config_loader._get_float("OPTIONS_MISPRICING_TRIGGER_SCORE", 0.85) == 0.85
+    assert config_loader._get_float("OPTIONS_EVENT_POLL_SECONDS", 30.0) == 30.0

@@ -52,6 +52,16 @@ def _get_int(name: str, default: int | None = None) -> int | None:
         raise RuntimeError(f"Invalid integer for {name}: {raw}") from exc
 
 
+def _get_float(name: str, default: float | None = None) -> float | None:
+    raw = _clean_env_value(os.getenv(name))
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid float for {name}: {raw}") from exc
+
+
 def _require_positive(name: str, value: float | int | None) -> float | int | None:
     """Fail fast when a config value must be strictly positive."""
     if value is None:
@@ -119,6 +129,12 @@ CONFIG = {
     "options_scheduler_enabled": _get_bool("OPTIONS_SCHEDULER_ENABLED", False),
     "options_structure_layer": _get_bool("OPTIONS_STRUCTURE_LAYER", False),
     "options_structure_prompt": _get_bool("OPTIONS_STRUCTURE_PROMPT", False),
+    "options_event_bus_enabled": _get_bool("OPTIONS_EVENT_BUS_ENABLED", False),
+    "options_heartbeat_sec": _get_float("OPTIONS_HEARTBEAT_SEC", 10800.0),
+    "options_delta_band_btc": _get_float("OPTIONS_DELTA_BAND_BTC", 0.10),
+    "options_dte_trigger_days": _get_int("OPTIONS_DTE_TRIGGER_DAYS", 2),
+    "options_mispricing_trigger_score": _get_float("OPTIONS_MISPRICING_TRIGGER_SCORE", 0.85),
+    "options_event_poll_seconds": _get_float("OPTIONS_EVENT_POLL_SECONDS", 30.0),
     "options_vol_surface_interval_seconds": _get_int(
         "OPTIONS_VOL_SURFACE_INTERVAL_SECONDS", 900
     ),
