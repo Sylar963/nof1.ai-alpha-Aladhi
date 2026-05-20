@@ -32,7 +32,8 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Awaitable, Callable, Optional
+from datetime import datetime, timezone
+from typing import Any, Awaitable, Callable, Optional
 
 
 logger = logging.getLogger(__name__)
@@ -54,6 +55,7 @@ class OptionsSchedulerConfig:
 
 
 AsyncCallable = Callable[[], Awaitable[None]]
+DecisionCallable = Callable[..., Awaitable[None]]
 
 
 class OptionsScheduler:
@@ -63,7 +65,12 @@ class OptionsScheduler:
         self,
         config: OptionsSchedulerConfig,
         refresh_vol_surface: AsyncCallable,
-        run_options_decision: AsyncCallable,
+        run_options_decision: DecisionCallable,
+        *,
+        event_bus: "EventBus | None" = None,
+        event_sources: "list | None" = None,
+        event_poll_seconds: float = 30.0,
+        latest_state_provider: Callable[[], Any] | None = None,
     ) -> None:
         self.config = config
         self._refresh_vol_surface = refresh_vol_surface
@@ -71,6 +78,10 @@ class OptionsScheduler:
         self._tasks: list[asyncio.Task] = []
         self._running = False
         self._bootstrap_done = asyncio.Event()
+        self._event_bus = event_bus
+        self._event_sources = list(event_sources) if event_sources else []
+        self._event_poll_seconds = event_poll_seconds
+        self._latest_state_provider = latest_state_provider
 
     async def start(self) -> None:
         """Spawn the background tasks.
@@ -109,6 +120,9 @@ class OptionsScheduler:
                     )
                 )
             )
+
+        if self._event_bus is not None:
+            self._tasks.append(asyncio.create_task(self._event_loop()))
 
     # Vol surface: HTTP fetches + math, normally ~30s. Generous 5-min cap.
     _VOL_SURFACE_TIMEOUT: float = 300.0
@@ -242,5 +256,57 @@ class OptionsScheduler:
                     )
                     break
                 await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            raise
+
+    async def _event_loop(self) -> None:
+        try:
+            await self._bootstrap_done.wait()
+            while self._running:
+                await asyncio.sleep(self._event_poll_seconds)
+                if not self._running:
+                    break
+                bot_state = None
+                if self._latest_state_provider is not None:
+                    try:
+                        bot_state = self._latest_state_provider()
+                    except Exception as exc:  # pylint: disable=broad-except
+                        logger.warning(
+                            "OptionsScheduler[event] latest_state_provider failed: %s",
+                            exc,
+                        )
+                        bot_state = None
+                for src in self._event_sources:
+                    try:
+                        events = src.poll(bot_state)
+                    except Exception as exc:  # pylint: disable=broad-except
+                        logger.warning(
+                            "OptionsScheduler[event] source %s.poll failed: %s",
+                            type(src).__name__, exc,
+                        )
+                        continue
+                    for event in events or []:
+                        self._event_bus.emit(event)
+                if self._event_bus.pending_count() > 0:
+                    drained = self._event_bus.drain()
+                    try:
+                        await asyncio.wait_for(
+                            self._run_options_decision(events=drained),
+                            timeout=self._DECISION_TIMEOUT,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.error("OptionsScheduler[event] decision timed out")
+                        continue
+                    except Exception as exc:  # pylint: disable=broad-except
+                        logger.error("OptionsScheduler[event] decision failed: %s", exc)
+                        continue
+                    now = datetime.now(timezone.utc)
+                    for src in self._event_sources:
+                        mark = getattr(src, "mark_cycle_ran", None)
+                        if callable(mark):
+                            try:
+                                mark(now)
+                            except Exception:  # pylint: disable=broad-except
+                                pass
         except asyncio.CancelledError:
             raise
