@@ -222,24 +222,59 @@ class TradingBotEngine:
                 # Wire the two-cadence scheduler. Disabled by default — set
                 # OPTIONS_SCHEDULER_ENABLED=1 to turn on the live decision loop.
                 if CONFIG.get("options_scheduler_enabled"):
+                    event_bus = None
+                    event_sources: list = []
+                    heartbeat_source = None
+
+                    if CONFIG.get("options_event_bus_enabled"):
+                        from src.backend.trading.options_event_bus import EventBus
+                        from src.backend.trading.options_event_sources import (
+                            HeartbeatSource, RegimeSource, DeltaBandSource,
+                            StructureSource, DTESource, MispricingSource,
+                        )
+                        event_bus = EventBus(dedup_window_sec=300.0)
+                        heartbeat_source = HeartbeatSource(
+                            interval_sec=float(CONFIG.get("options_heartbeat_sec") or 10800.0),
+                        )
+                        event_sources = [
+                            heartbeat_source,
+                            RegimeSource(),
+                            DeltaBandSource(
+                                threshold_btc=float(CONFIG.get("options_delta_band_btc") or 0.10),
+                            ),
+                            StructureSource(),
+                            DTESource(
+                                threshold_days=int(CONFIG.get("options_dte_trigger_days") or 2),
+                            ),
+                            MispricingSource(
+                                score_threshold=float(CONFIG.get("options_mispricing_trigger_score") or 0.85),
+                            ),
+                        ]
+
+                    scheduler_decision_interval = (
+                        0.0 if event_bus is not None else float(CONFIG.get("options_decision_interval_seconds") or 10800)
+                    )
                     scheduler_config = OptionsSchedulerConfig(
                         vol_surface_interval_seconds=float(
                             CONFIG.get("options_vol_surface_interval_seconds") or 900
                         ),
-                        options_decision_interval_seconds=float(
-                            CONFIG.get("options_decision_interval_seconds") or 10800
-                        ),
+                        options_decision_interval_seconds=scheduler_decision_interval,
                     )
                     self._options_surface_interval_seconds = scheduler_config.vol_surface_interval_seconds
                     self.options_scheduler = OptionsScheduler(
                         config=scheduler_config,
                         refresh_vol_surface=self._refresh_options_surface,
                         run_options_decision=self._run_options_decision_cycle,
+                        event_bus=event_bus,
+                        event_sources=event_sources,
+                        event_poll_seconds=float(CONFIG.get("options_event_poll_seconds") or 30.0),
+                        latest_state_provider=lambda: self._latest_options_context,
                     )
                     self.logger.info(
-                        "OptionsScheduler enabled (surface=%.0fs, decision=%.0fs)",
+                        "OptionsScheduler enabled (surface=%.0fs, decision=%.0fs, event_bus=%s)",
                         scheduler_config.vol_surface_interval_seconds,
                         scheduler_config.options_decision_interval_seconds,
+                        "on" if event_bus is not None else "off",
                     )
             except Exception as exc:  # pylint: disable=broad-except
                 self.logger.warning("Thalex venue not initialized: %s", exc)
@@ -1096,7 +1131,28 @@ class TradingBotEngine:
             self.logger.warning("Deribit first-hour minute fetch failed: %s", exc)
             return []
 
-    async def _run_options_decision_cycle(self) -> None:
+    def _describe_event_for_summary(self, event) -> str:
+        t = event.type.value if hasattr(event.type, "value") else str(event.type)
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        if t == "regime_flip":
+            return f"vol regime {payload.get('from')} -> {payload.get('to')}"
+        if t == "delta_band_breach":
+            return f"portfolio delta {payload.get('delta_btc')} BTC exceeds threshold {payload.get('threshold_btc')}"
+        if t == "structure_breach":
+            return f"structure {payload.get('structure_id')} {payload.get('from')} -> {payload.get('to')}"
+        if t == "dte_threshold":
+            return f"structure {payload.get('structure_id')} reached tenor_days_min={payload.get('tenor_days_min')}"
+        if t == "mispricing_actionable":
+            try:
+                score_str = f"{float(payload.get('score')):.2f}"
+            except (TypeError, ValueError):
+                score_str = "N/A"
+            return f"mispricing {payload.get('instrument_name')} score={score_str}"
+        if t == "max_interval_elapsed":
+            return f"heartbeat after {payload.get('interval_sec')}s"
+        return t
+
+    async def _run_options_decision_cycle(self, events: list | None = None) -> None:
         """Background task: run the options agent against the cached snapshot.
 
         Reads ``self._latest_options_context`` (populated by the vol surface
@@ -1108,6 +1164,23 @@ class TradingBotEngine:
         if self._latest_options_context is None:
             self.logger.info("OptionsContext not yet available; skipping decision cycle")
             return
+        if events:
+            try:
+                from src.backend.options_intel.snapshot import EventSummary
+                summaries = []
+                for ev in events:
+                    description = self._describe_event_for_summary(ev)
+                    structure_id = ev.payload.get("structure_id") if isinstance(ev.payload, dict) else None
+                    fired_at_str = ev.fired_at.isoformat() if hasattr(ev.fired_at, "isoformat") else str(ev.fired_at)
+                    summaries.append(EventSummary(
+                        type=ev.type.value if hasattr(ev.type, "value") else str(ev.type),
+                        fired_at=fired_at_str,
+                        description=description,
+                        structure_id=structure_id,
+                    ))
+                self._latest_options_context.triggered_by_events = summaries
+            except Exception as exc:
+                self.logger.warning("failed to stamp triggered_by_events: %s", exc)
         try:
             # Lazy import keeps the LLM client off the import path until needed.
             from src.backend.agent.options_agent import OptionsAgent
