@@ -46,7 +46,7 @@ from decimal import Decimal
 from typing import Any, Iterable, Optional
 
 from src.backend.options_intel.greeks_bs import black_scholes_greeks
-from src.backend.options_intel.structure import OptionLeg, classify
+from src.backend.options_intel.structure import OptionLeg, classify, classify_many
 from src.backend.trading.options import parse_instrument_name
 
 
@@ -219,26 +219,27 @@ async def aggregate_portfolio_greeks(
 
     structures: list[dict] = []
     if structure_legs:
-        result = classify(structure_legs)
-        structures.append({
-            "structure_id": result.structure_id,
-            "kind": result.kind.value,
-            "underlying": result.underlying,
-            "tenor_days_min": result.tenor_days_min,
-            "tenor_days_max": result.tenor_days_max,
-            "net_premium": float(result.net_premium),
-            "is_credit": result.is_credit,
-            "max_loss": float(result.max_loss) if result.max_loss is not None else None,
-            "max_profit": float(result.max_profit) if result.max_profit is not None else None,
-            "breakevens": [float(b) for b in result.breakevens],
-            "short_leg_delta": float(result.short_leg_delta) if result.short_leg_delta is not None else None,
-            "breach_state": result.breach_state.value,
-            "pnl_abs": float(result.pnl_abs),
-            "pnl_pct": float(result.pnl_pct),
-            "aggregate_greeks": {k: float(v) for k, v in result.aggregate_greeks.items()},
-            "confidence": result.confidence,
-            "legs": [leg.instrument_name for leg in result.legs],
-        })
+        results = classify_many(structure_legs)
+        for result in results:
+            structures.append({
+                "structure_id": result.structure_id,
+                "kind": result.kind.value,
+                "underlying": result.underlying,
+                "tenor_days_min": result.tenor_days_min,
+                "tenor_days_max": result.tenor_days_max,
+                "net_premium": float(result.net_premium),
+                "is_credit": result.is_credit,
+                "max_loss": float(result.max_loss) if result.max_loss is not None else None,
+                "max_profit": float(result.max_profit) if result.max_profit is not None else None,
+                "breakevens": [float(b) for b in result.breakevens],
+                "short_leg_delta": float(result.short_leg_delta) if result.short_leg_delta is not None else None,
+                "breach_state": result.breach_state.value,
+                "pnl_abs": float(result.pnl_abs),
+                "pnl_pct": float(result.pnl_pct),
+                "aggregate_greeks": {k: float(v) for k, v in result.aggregate_greeks.items()},
+                "confidence": result.confidence,
+                "legs": [leg.instrument_name for leg in result.legs],
+            })
 
     return {
         "open_positions": open_positions,

@@ -390,3 +390,33 @@ def classify(
         aggregate_greeks=aggregate_greeks,
         confidence=confidence,
     )
+
+
+def classify_many(legs: Sequence[OptionLeg]) -> list[OptionStructure]:
+    legs_tuple = tuple(legs)
+    if not legs_tuple:
+        return []
+
+    primary = classify(legs_tuple)
+    if primary.kind != StructureKind.UNKNOWN:
+        return [primary]
+
+    by_tenor: dict[int, list[OptionLeg]] = {}
+    for leg in legs_tuple:
+        by_tenor.setdefault(leg.days_to_expiry, []).append(leg)
+
+    classified: list[OptionStructure] = []
+    orphans: list[OptionLeg] = []
+    for group in by_tenor.values():
+        sub = classify(group)
+        if sub.kind != StructureKind.UNKNOWN:
+            classified.append(sub)
+        else:
+            orphans.extend(group)
+
+    if classified:
+        if orphans:
+            classified.append(classify(orphans))
+        return classified
+
+    return [primary]

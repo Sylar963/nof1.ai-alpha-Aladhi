@@ -411,3 +411,50 @@ def test_classify_iron_condor_with_uneven_contracts_is_unknown():
     s = classify(legs)
     assert s.kind == StructureKind.UNKNOWN
     assert s.confidence == 0.0
+
+
+from src.backend.options_intel.structure import classify_many
+
+
+def test_classify_many_single_structure():
+    legs = [
+        _put_leg_full(100000, "short", mark="300"),
+        _put_leg_full(90000, "long", mark="100"),
+    ]
+    structures = classify_many(legs)
+    assert len(structures) == 1
+    assert structures[0].kind == StructureKind.CREDIT_PUT_SPREAD
+
+
+def test_classify_many_splits_two_separate_structures_by_tenor():
+    legs = [
+        _put_leg_full(100000, "short", mark="300", dte=14),
+        _put_leg_full(90000, "long", mark="100", dte=14),
+        _call_leg(105000, "short", mark="300", dte=28),
+        _call_leg(110000, "long", mark="100", dte=28),
+    ]
+    structures = classify_many(legs)
+    kinds = {s.kind for s in structures}
+    assert kinds == {StructureKind.CREDIT_PUT_SPREAD, StructureKind.CREDIT_CALL_SPREAD}
+
+
+def test_classify_many_handles_orphan_naked_long():
+    legs = [
+        _put_leg_full(100000, "short", mark="300", dte=14),
+        _put_leg_full(90000, "long", mark="100", dte=14),
+        _call_leg(105000, "long", mark="200", dte=28),
+    ]
+    structures = classify_many(legs)
+    kinds = {s.kind for s in structures}
+    assert StructureKind.CREDIT_PUT_SPREAD in kinds
+    assert StructureKind.LONG_CALL in kinds
+
+
+def test_classify_many_returns_single_unknown_when_no_split_helps():
+    legs = [
+        _put_leg_full(100000, "short", mark="300", dte=14),
+        _call_leg(105000, "long", mark="200", dte=14),
+    ]
+    structures = classify_many(legs)
+    assert len(structures) == 1
+    assert structures[0].kind == StructureKind.UNKNOWN
