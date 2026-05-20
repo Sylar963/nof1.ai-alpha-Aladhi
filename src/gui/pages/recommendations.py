@@ -313,7 +313,7 @@ def create_recommendations(bot_service: BotService, state_manager: StateManager)
                 ui.notify(f'Error: {str(e)}', type='negative')
     
     # Auto-refresh every 2 seconds
-    ui.timer(2.0, update_proposals)
+    ui.timer(3.0, update_proposals)
     
     # Initial update
     # (timer will handle subsequent updates)

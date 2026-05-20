@@ -9,11 +9,13 @@ import plotly.graph_objects as go
 from nicegui import ui
 from src.gui.services.bot_service import BotService
 from src.gui.services.state_manager import StateManager
-from src.gui.services.ui_utils import is_ui_alive
+from src.gui.services.ui_utils import RenderGate, is_ui_alive
 
 
 def create_dashboard(bot_service: BotService, state_manager: StateManager):
     """Create dashboard page with real-time metrics, charts, and controls"""
+
+    gate = RenderGate()
 
     def _ui_ok() -> bool:
         """Helper to check if this page is still the active one."""
@@ -619,6 +621,67 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
         try:
             state = state_manager.get_state()
 
+            # Always refresh the "Last refreshed: N seconds ago" label - it
+            # has to tick every cycle independent of state changes, so it
+            # runs before the gate that suppresses the rest of the update.
+            if last_refresh_time:
+                refresh_seconds_ago = int(time.time() - last_refresh_time)
+                if refresh_seconds_ago < 60:
+                    last_refresh_label.text = f'Last refreshed: {refresh_seconds_ago} seconds ago'
+                else:
+                    minutes = refresh_seconds_ago // 60
+                    last_refresh_label.text = f'Last refreshed: {minutes} minutes ago'
+                refresh_timer_label.text = '(auto-updating)'
+            else:
+                last_refresh_label.text = 'Last refreshed: Never'
+                refresh_timer_label.text = '(click Refresh Data to fetch data)'
+
+            # Bail before any DB query (equity curve / recent events) when
+            # state hasn't moved since last tick. Bot cycles bump
+            # invocation_count; user actions (pause, hedge toggle) and
+            # trade fills get caught by their own fields.
+            hedge_status_now = getattr(state, 'hedge_status', None) or {}
+            degraded_now = hedge_status_now.get('degraded_underlyings') or {}
+            market_data_now = getattr(state, 'market_data', None) or []
+            md_sig: tuple = ()
+            if isinstance(market_data_now, list):
+                md_sig = tuple(
+                    (m.get('asset'), m.get('price'), m.get('volume_24h'))
+                    for m in market_data_now if isinstance(m, dict)
+                )
+            elif isinstance(market_data_now, dict):
+                md_sig = tuple(
+                    (k, (v or {}).get('price'), (v or {}).get('volume_24h'))
+                    for k, v in market_data_now.items()
+                )
+            sig = (
+                getattr(state, 'invocation_count', 0),
+                state.balance, state.total_return_pct, state.sharpe_ratio,
+                state.is_running, bool(getattr(state, 'is_paused', False)),
+                bool(state.error),
+                hedge_status_now.get('health'),
+                hedge_status_now.get('enabled'),
+                hedge_status_now.get('available'),
+                hedge_status_now.get('active_underlyings'),
+                hedge_status_now.get('tracked_underlyings'),
+                hedge_status_now.get('state_error'),
+                tuple(sorted(degraded_now.items())) if degraded_now else (),
+                tuple(
+                    (p.get('symbol'), p.get('quantity'), p.get('current_price'),
+                     p.get('unrealized_pnl'), p.get('opened_by'))
+                    for p in (state.positions or [])
+                ),
+                tuple(
+                    (m.get('underlying'), m.get('status'),
+                     m.get('current_perp_delta'), m.get('residual_delta'),
+                     m.get('last_rebalance_side'), m.get('last_rebalance_size'))
+                    for m in (state.hedge_metrics or [])
+                ),
+                md_sig,
+            )
+            if not gate.changed(sig):
+                return
+
             # Update metrics cards
             balance_value.text = f'${state.balance:,.2f}'
             balance_breakdown = getattr(state, 'balance_breakdown', {}) or {}
@@ -774,19 +837,6 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
                 status_indicator.text = '🔴 Error'
                 _set_status_indicator_tone('text-red-500')
                 activity_log.push(f'Error: {state.error}')
-
-            # Update refresh timestamp
-            if last_refresh_time:
-                refresh_seconds_ago = int(time.time() - last_refresh_time)
-                if refresh_seconds_ago < 60:
-                    last_refresh_label.text = f'Last refreshed: {refresh_seconds_ago} seconds ago'
-                else:
-                    minutes = refresh_seconds_ago // 60
-                    last_refresh_label.text = f'Last refreshed: {minutes} minutes ago'
-                refresh_timer_label.text = '(auto-updating)'
-            else:
-                last_refresh_label.text = 'Last refreshed: Never'
-                refresh_timer_label.text = '(click Refresh Data to fetch data)'
 
         except Exception as e:
             activity_log.push(f'Dashboard update error: {str(e)}')

@@ -5,11 +5,13 @@ Positions Page - Active trading positions with real-time PnL tracking
 from nicegui import ui
 from src.gui.services.bot_service import BotService
 from src.gui.services.state_manager import StateManager
-from src.gui.services.ui_utils import is_ui_alive
+from src.gui.services.ui_utils import RenderGate, is_ui_alive
 
 
 def create_positions(bot_service: BotService, state_manager: StateManager):
     """Create positions page with live table and action buttons"""
+
+    gate = RenderGate()
 
     def _ui_ok():
         return is_ui_alive(table)
@@ -237,7 +239,29 @@ def create_positions(bot_service: BotService, state_manager: StateManager):
         try:
             state = state_manager.get_state()
             positions = state.positions or []
-            
+
+            # Skip the (table-rebuilding) refresh when positions are byte-for-
+            # byte identical to last tick. Captures the fields the table and
+            # summary cards actually display.
+            sig = tuple(
+                (
+                    p.get('row_id') or f"{p.get('venue', 'hyperliquid')}:{p.get('instrument_name') or p.get('symbol')}",
+                    p.get('symbol'),
+                    p.get('venue'),
+                    p.get('opened_by'),
+                    p.get('quantity'),
+                    p.get('entry_price'),
+                    p.get('current_price'),
+                    p.get('unrealized_pnl'),
+                    p.get('leverage'),
+                    p.get('liquidation_price'),
+                    bool(p.get('closable', True)),
+                )
+                for p in positions
+            )
+            if not gate.changed(sig):
+                return
+
             # Show/hide empty message
             empty_message.visible = len(positions) == 0
             table.visible = len(positions) > 0
@@ -307,7 +331,7 @@ def create_positions(bot_service: BotService, state_manager: StateManager):
                 ui.notify(f'Error updating positions: {str(e)}', type='warning')
     
     # Auto-refresh every 2 seconds
-    ui.timer(2.0, update_positions)
+    ui.timer(3.0, update_positions)
     
     # Initial update
     # Note: Can't await in sync context, timer will handle it

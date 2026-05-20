@@ -287,6 +287,7 @@ def build_indicator_bundle(
     candles_daily: list[dict],
     candles_long: list[dict],
     long_interval: str,
+    candles_15m: list[dict] | None = None,
     current_spot: Optional[float] = None,
 ) -> dict:
     """Build the full indicator bundle matching TAAPI's ``fetch_asset_indicators`` output.
@@ -294,15 +295,21 @@ def build_indicator_bundle(
     Args:
         candles_5m: 5-minute OHLCV candles for today (or recent).
                     Must cover at least the first hour for opening range.
+                    Drives the LLM intraday context.
         candles_daily: Daily OHLCV candles from the AVWAP anchor date to now.
         candles_long: Higher-timeframe candles (e.g. 4h) — need >= 131 for
                       Keltner(130,130,4) + SMA99.
         long_interval: The interval label (e.g. "4h", "15m").
+        candles_15m: Optional 15-minute OHLCV candles, used purely to power
+                     the "Open Range & Keltner" UI chart. Bot decisions are
+                     unaffected. ~2130 bars covers a 2000-bar chart plus
+                     130-bar Keltner warmup.
         current_spot: Latest spot price for position labels.
 
     Returns:
-        Dict matching the ``fetch_asset_indicators`` shape:
-        ``{"5m": {...}, "<long_interval>": {...}}``
+        Dict matching the ``fetch_asset_indicators`` shape, with an extra
+        ``"chart_intraday"`` key when ``candles_15m`` is supplied:
+        ``{"5m": {...}, "<long_interval>": {...}, "chart_intraday": {...}}``
     """
     result = {"5m": {}, long_interval: {}}
 
@@ -326,7 +333,8 @@ def build_indicator_bundle(
     or_result["or_end_ms"] = or_end_ms
     result["5m"]["opening_range"] = or_result
 
-    # Raw OHLC for the chart (both intraday 5m and long-term frame)
+    # Raw OHLC for the main price chart on the Market page. The Open
+    # Range & Keltner chart pulls 15m bars from ``chart_intraday`` below.
     price_candles_5m = to_price_candles(candles_5m, max_bars=200)
     result["5m"]["price_candles"] = price_candles_5m
 
@@ -367,14 +375,59 @@ def build_indicator_bundle(
     else:
         result[long_interval]["timestamps"] = []
 
+    # --- 15m chart frame (Open Range & Keltner UI chart) ---
+    # Separate from the 5m intraday frame so the LLM keeps using its own
+    # higher-cadence view of the market. The chart frame is purely for UI.
+    if candles_15m:
+        closes_15m = [c["c"] for c in candles_15m]
+        highs_15m = [c["h"] for c in candles_15m]
+        lows_15m = [c["l"] for c in candles_15m]
+        n_15m = len(candles_15m)
+
+        result["chart_intraday"] = {
+            "interval": "15m",
+            "sma99": compute_sma_series(closes_15m, period=99, results=n_15m),
+            "keltner": compute_keltner_series(
+                highs_15m, lows_15m, closes_15m,
+                period=130, atr_length=130, multiplier=4.0, results=n_15m,
+            ),
+            "avwap": avwap,
+        }
+
+        # OR on 15m bars: the 20:00-20:15 window aligns to exactly one 15m
+        # candle so high/low collapse to that candle's high/low.
+        or_candles_15m = [c for c in candles_15m if or_start_ms <= c["t"] < or_end_ms]
+        or_result_15m = compute_opening_range(or_candles_15m, current_spot)
+        or_result_15m["or_start_ms"] = or_start_ms
+        or_result_15m["or_end_ms"] = or_end_ms
+        result["chart_intraday"]["opening_range"] = or_result_15m
+
+        # Cap chart at 2000 bars (~500h / ~21 days at 15m). Even with
+        # Plotly this renders quickly; with the RenderGate we only ship
+        # the payload on actual bot cycles.
+        price_candles_15m = to_price_candles(candles_15m, max_bars=2000)
+        result["chart_intraday"]["price_candles"] = price_candles_15m
+
+        keltner_15m_middle = result["chart_intraday"]["keltner"].get("middle", [])
+        candle_times_15m = price_candles_15m.get("time", [])
+        if keltner_15m_middle and len(candle_times_15m) >= len(keltner_15m_middle):
+            result["chart_intraday"]["timestamps"] = candle_times_15m[-len(keltner_15m_middle):]
+        elif candle_times_15m:
+            result["chart_intraday"]["timestamps"] = candle_times_15m
+        else:
+            result["chart_intraday"]["timestamps"] = []
+
     logging.info(
-        "Local indicators: 5m sma99=%d vals, keltner=%d vals, OR=%s | %s sma99=%d vals, keltner=%d vals",
+        "Local indicators: 5m sma99=%d vals, keltner=%d vals, OR=%s | %s sma99=%d vals, keltner=%d vals%s",
         len(result["5m"]["sma99"]),
         len(result["5m"]["keltner"].get("middle", [])),
         result["5m"]["opening_range"]["position"],
         long_interval,
         len(result[long_interval]["sma99"]),
         len(result[long_interval]["keltner"].get("middle", [])),
+        f" | chart_15m candles={len(result['chart_intraday']['price_candles'].get('time', []))}, "
+        f"keltner={len(result['chart_intraday']['keltner'].get('middle', []))}"
+        if 'chart_intraday' in result else '',
     )
 
     return result

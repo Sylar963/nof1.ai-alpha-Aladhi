@@ -9,10 +9,15 @@ import plotly.graph_objects as go
 from nicegui import ui
 from src.gui.services.bot_service import BotService
 from src.gui.services.state_manager import StateManager
-from src.gui.services.ui_utils import is_ui_alive
+from src.gui.services.ui_utils import RenderGate, is_ui_alive
 
 
 logger = logging.getLogger(__name__)
+
+# Defensive cap on the main OHLC chart so cached/legacy state with more
+# than ~200 5m bars doesn't blow up the candlestick payload. The Open
+# Range & Keltner chart reads 15m bars from a separate frame.
+MAX_PRICE_CHART_BARS = 200
 
 
 def _ms_to_dt(ms_values: list) -> list:
@@ -24,6 +29,82 @@ def _ms_to_dt(ms_values: list) -> list:
         except (TypeError, ValueError, OSError):
             out.append(None)
     return out
+
+
+def _market_render_signature(state, market_data: dict | None,
+                              selected_asset: str, selected_interval: str) -> tuple:
+    """Cheap signature of everything the market page renders.
+
+    Used by the per-timer ``RenderGate`` to skip identical re-renders.
+    Captures dropdown selection, the per-asset payload, and the global
+    hedge/bot status fields the page mirrors.
+    """
+    hs = getattr(state, 'hedge_status', None) or {}
+    deg = hs.get('degraded_underlyings') or {}
+    hedge_metrics = getattr(state, 'hedge_metrics', None) or []
+    hedge = next(
+        (m for m in hedge_metrics if m.get('underlying') == selected_asset),
+        None,
+    ) or {}
+    common = (
+        selected_asset, selected_interval,
+        getattr(state, 'is_running', False),
+        bool(getattr(state, 'is_paused', False)),
+        bool(getattr(state, 'error', None)),
+        hs.get('enabled'), hs.get('available'),
+        tuple(sorted(deg.items())) if deg else (),
+        hs.get('state_error'),
+        hedge.get('status'), hedge.get('degraded'),
+        hedge.get('target_perp_delta'), hedge.get('current_perp_delta'),
+        hedge.get('residual_delta'), hedge.get('last_rebalance_side'),
+        hedge.get('last_rebalance_size'),
+    )
+    if not market_data:
+        return ('empty',) + common
+
+    intraday = market_data.get('intraday') or {}
+    long_term = market_data.get('long_term') or {}
+    long_term_interval = str(long_term.get('interval') or '4h')
+    if selected_interval in {'1m', '5m', '15m'}:
+        frame = intraday
+    elif selected_interval == long_term_interval or selected_interval in {'1h', '4h', '1d'}:
+        frame = long_term or intraday
+    else:
+        frame = intraday
+
+    series = frame.get('series') or {}
+    candles = series.get('price_candles') or {}
+    times = candles.get('time') or []
+    closes = candles.get('close') or []
+    or_b = frame.get('opening_range') or intraday.get('opening_range') or {}
+    keltner = frame.get('keltner') or {}
+
+    # The Open Range & Keltner chart reads from chart_intraday (15m).
+    # Capture enough of that frame so the gate re-renders when a new 15m
+    # bar arrives, independent of the dropdown's selected_frame.
+    chart = market_data.get('chart_intraday') or {}
+    chart_series = chart.get('series') or {}
+    chart_candles = chart_series.get('price_candles') or {}
+    chart_times = chart_candles.get('time') or []
+    chart_or = chart.get('opening_range') or {}
+
+    return ('data',) + common + (
+        market_data.get('price'),
+        market_data.get('prev_day_price'),
+        market_data.get('volume_24h'),
+        market_data.get('open_interest'),
+        market_data.get('funding_rate'),
+        times[-1] if times else None,
+        len(times),
+        closes[-1] if closes else None,
+        or_b.get('high'), or_b.get('low'), or_b.get('mid'),
+        or_b.get('or_start_ms'), or_b.get('or_end_ms'), or_b.get('position'),
+        frame.get('avwap'), frame.get('sma99'),
+        keltner.get('middle'), keltner.get('position'),
+        chart_times[-1] if chart_times else None,
+        len(chart_times),
+        chart_or.get('high'), chart_or.get('low'), chart_or.get('or_start_ms'),
+    )
 
 
 def create_market(bot_service: BotService, state_manager: StateManager):
@@ -203,6 +284,7 @@ def create_market(bot_service: BotService, state_manager: StateManager):
     # ===== INDICATOR CHART =====
     with ui.card().classes('w-full p-4 mb-6'):
         ui.label('Open Range & Keltner').classes('text-xl font-bold text-white mb-2')
+        ui.label('15m candles, up to 2000 bars (~21 days) with Keltner(130,4). Dashed lines = most recent 20:00–20:15 Tijuana opening range.').classes('text-xs text-gray-400 mb-3')
 
         indicator_chart = ui.plotly(go.Figure(
             data=[
@@ -211,12 +293,13 @@ def create_market(bot_service: BotService, state_manager: StateManager):
                 go.Scatter(x=[], y=[], mode='lines', name='Keltner Lower', line=dict(color='#10b981', width=2)),
                 go.Scatter(x=[], y=[], mode='lines', name='Open Range High', line=dict(color='#f59e0b', width=2, dash='dash')),
                 go.Scatter(x=[], y=[], mode='lines', name='Open Range Low', line=dict(color='#fbbf24', width=2, dash='dot')),
+                go.Scatter(x=[], y=[], mode='lines', name='Price', line=dict(color='#e5e7eb', width=2)),
             ],
             layout=go.Layout(
                 template='plotly_dark',
-                height=300,
+                height=340,
                 margin=dict(l=50, r=20, t=20, b=40),
-                xaxis=dict(title='Recent Points', showgrid=True, gridcolor='#374151'),
+                xaxis=dict(title='Time', showgrid=True, gridcolor='#374151', type='date'),
                 yaxis=dict(title='Price ($)', showgrid=True, gridcolor='#374151'),
                 paper_bgcolor='#1f2937',
                 plot_bgcolor='#1f2937',
@@ -263,6 +346,7 @@ def create_market(bot_service: BotService, state_manager: StateManager):
                 hedge_last_label = ui.label('Last rebalance: --').classes('text-gray-400 text-sm')
 
     refresh_in_flight = False
+    render_gate = RenderGate()
 
     def _lookup_market_data(state):
         market_data = None
@@ -278,7 +362,8 @@ def create_market(bot_service: BotService, state_manager: StateManager):
             return False
         intraday = market_data.get('intraday') or {}
         long_term = market_data.get('long_term') or {}
-        for frame in (intraday, long_term):
+        chart_intraday = market_data.get('chart_intraday') or {}
+        for frame in (intraday, long_term, chart_intraday):
             series = frame.get('series') or {}
             if frame.get('avwap') is not None:
                 return True
@@ -326,6 +411,13 @@ def create_market(bot_service: BotService, state_manager: StateManager):
         if n == 0:
             _clear_price_chart()
             return
+
+        # Cap how much OHLC we ship over the websocket. price_candles can
+        # hold up to 600 bars so the indicator chart has 12h-before-OR
+        # context, but the main candlestick view stays at ~16.7h to keep
+        # candles legible and the per-update payload small.
+        if n > MAX_PRICE_CHART_BARS:
+            n = MAX_PRICE_CHART_BARS
 
         # Convert epoch-ms to ISO strings for proper Plotly datetime axis
         raw_times = time_values[-n:]
@@ -403,69 +495,65 @@ def create_market(bot_service: BotService, state_manager: StateManager):
         price_chart.update()
 
     def _set_indicator_chart(series: dict, opening_range: dict, market_snapshot: dict):
-        """Render Keltner bands with the current opening range."""
+        """Render the Open Range & Keltner chart on the 15m chart_intraday
+        frame.
+
+        Shows every available 15m bar where the Keltner(130, 4) bands are
+        valid (up to 2000), with the underlying close on top and the most
+        recent OR high/low as horizontal levels. We clip the visible
+        window to the Keltner-valid range so the bands always span the
+        entire chart instead of leaving a 130-bar warmup gap on the left.
+        """
+        price_candles = series.get('price_candles') or {}
+        candle_times = list(price_candles.get('time') or [])
+        candle_closes = list(price_candles.get('close') or [])
+
         keltner_upper = list(series.get('keltner_upper') or [])
         keltner_middle = list(series.get('keltner_middle') or [])
         keltner_lower = list(series.get('keltner_lower') or [])
-        timestamps = list(series.get('timestamps') or [])
 
-        # Fallback: derive timestamps from price candle times
-        if not timestamps:
-            price_candles = series.get('price_candles') or {}
-            timestamps = list(price_candles.get('time') or [])
-        if not timestamps:
-            timestamps = list(market_snapshot.get('recent_timestamps') or [])
-
-        point_count = max(
-            len(keltner_upper),
-            len(keltner_middle),
-            len(keltner_lower),
-            0,
-        )
-
-        if point_count == 0:
+        n_price = min(len(candle_times), len(candle_closes))
+        if n_price == 0:
             for trace in indicator_chart.figure.data:
                 trace.x = []
                 trace.y = []
             indicator_chart.update()
             return
 
-        needs_convert = timestamps and isinstance(timestamps[0], (int, float))
+        # Use the shortest Keltner band to cap the chart length: this is the
+        # number of bars where all three bands are valid. When the upstream
+        # returns enough warmup (we fetch 130 extra bars), this equals
+        # n_price and we display everything; otherwise we trim the oldest
+        # bars so Keltner never has a gap.
+        n_keltner = min(len(keltner_upper), len(keltner_middle), len(keltner_lower))
+        n_visible = min(n_price, n_keltner) if n_keltner > 0 else n_price
 
-        if len(timestamps) >= point_count:
-            raw_x = timestamps[-point_count:]
-        elif timestamps:
-            raw_x = timestamps
-            point_count = len(timestamps)
-        else:
-            for trace in indicator_chart.figure.data:
-                trace.x = []
-                trace.y = []
-            indicator_chart.update()
-            return
+        candle_times = candle_times[-n_visible:]
+        candle_closes = candle_closes[-n_visible:]
+        keltner_upper = keltner_upper[-n_visible:] if n_keltner else [None] * n_visible
+        keltner_middle = keltner_middle[-n_visible:] if n_keltner else [None] * n_visible
+        keltner_lower = keltner_lower[-n_visible:] if n_keltner else [None] * n_visible
 
-        x_values = _ms_to_dt(raw_x) if needs_convert else raw_x
-
-        def _align(values: list) -> list:
-            if len(values) >= point_count:
-                return values[-point_count:]
-            return [None] * (point_count - len(values)) + values
+        needs_convert = isinstance(candle_times[0], (int, float))
+        x_values = _ms_to_dt(candle_times) if needs_convert else candle_times
 
         or_high = opening_range.get('high')
         or_low = opening_range.get('low')
-        or_high_series = [or_high] * point_count if or_high is not None else [None] * point_count
-        or_low_series = [or_low] * point_count if or_low is not None else [None] * point_count
+        or_high_series = [or_high] * n_visible if or_high is not None else [None] * n_visible
+        or_low_series = [or_low] * n_visible if or_low is not None else [None] * n_visible
 
         indicator_chart.figure.data[0].x = x_values
-        indicator_chart.figure.data[0].y = _align(keltner_upper)
+        indicator_chart.figure.data[0].y = keltner_upper
         indicator_chart.figure.data[1].x = x_values
-        indicator_chart.figure.data[1].y = _align(keltner_middle)
+        indicator_chart.figure.data[1].y = keltner_middle
         indicator_chart.figure.data[2].x = x_values
-        indicator_chart.figure.data[2].y = _align(keltner_lower)
+        indicator_chart.figure.data[2].y = keltner_lower
         indicator_chart.figure.data[3].x = x_values
         indicator_chart.figure.data[3].y = or_high_series
         indicator_chart.figure.data[4].x = x_values
         indicator_chart.figure.data[4].y = or_low_series
+        indicator_chart.figure.data[5].x = x_values
+        indicator_chart.figure.data[5].y = candle_closes
         indicator_chart.update()
 
     async def _bootstrap_market_snapshot():
@@ -519,6 +607,14 @@ def create_market(bot_service: BotService, state_manager: StateManager):
                 return
             state = state_manager.get_state()
             market_data = _lookup_market_data(state)
+
+        # Skip the whole render if nothing the page displays has changed
+        # since the previous tick. Bot data only refreshes every 5min but
+        # this timer fires every 5s, so this avoids ~55 wasteful renders
+        # per real update.
+        sig = _market_render_signature(state, market_data, selected_asset, selected_interval)
+        if not render_gate.changed(sig):
+            return
 
         if not market_data:
             # No data available yet
@@ -615,7 +711,15 @@ def create_market(bot_service: BotService, state_manager: StateManager):
         or_low = opening_range.get('low')
         opening_range_high_label.set_text(f'${or_high:,.2f}' if or_high is not None else '--')
         opening_range_low_label.set_text(f'${or_low:,.2f}' if or_low is not None else '--')
-        _set_indicator_chart(selected_series, opening_range, market_data)
+
+        # The Open Range & Keltner chart always renders the 15m chart frame
+        # (independent of the dropdown). Falls back to the 5m intraday
+        # frame when the bot is using the TAAPI fallback which doesn't
+        # build chart_intraday.
+        chart_frame = market_data.get('chart_intraday') or intraday
+        chart_series = chart_frame.get('series') or {}
+        chart_or = chart_frame.get('opening_range') or opening_range
+        _set_indicator_chart(chart_series, chart_or, market_data)
         
         # Update sentiment based on indicators
         opening_range_position = opening_range.get('position')
