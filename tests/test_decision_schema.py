@@ -328,3 +328,32 @@ def test_action_must_be_buy_sell_or_hold():
 def test_hold_decision_is_always_valid():
     decision = parse_decision({"asset": "BTC", "action": "hold", "rationale": "wait"})
     assert decision.action == "hold"
+
+
+from src.backend.agent.decision_schema import VALID_STRATEGIES
+
+
+def test_valid_strategies_includes_phase1_additions():
+    assert "debit_put_spread" in VALID_STRATEGIES
+    assert "debit_call_spread" in VALID_STRATEGIES
+    assert "iron_butterfly" in VALID_STRATEGIES
+    assert "long_straddle" in VALID_STRATEGIES
+
+
+def test_parse_decision_accepts_debit_put_spread():
+    payload = {
+        "venue": "thalex",
+        "asset": "BTC",
+        "action": "buy",
+        "strategy": "debit_put_spread",
+        "underlying": "BTC",
+        "tenor_days": 14,
+        "entry_kind": "vertical",
+        "rationale": "buy 95k put, sell 90k put",
+        "legs": [
+            {"kind": "put", "side": "buy", "contracts": 0.1, "target_strike": 95000},
+            {"kind": "put", "side": "sell", "contracts": 0.1, "target_strike": 90000},
+        ],
+    }
+    result = parse_decision(payload)
+    assert result.strategy == "debit_put_spread"
