@@ -330,3 +330,62 @@ def test_classify_naked_short_is_unknown():
     s = classify(legs)
     assert s.kind == StructureKind.UNKNOWN
     assert s.confidence == 0.0
+
+
+def test_credit_put_spread_max_loss_and_breakeven():
+    legs = [
+        _put_leg_full(100000, "short", mark="300", delta="-0.30"),
+        _put_leg_full(90000, "long", mark="100", delta="-0.10"),
+    ]
+    s = classify(legs)
+    assert s.max_loss == Decimal("980")
+    assert s.max_profit == Decimal("20")
+    assert s.breakevens == (Decimal("99800"),)
+    assert s.short_leg_delta == Decimal("-0.30")
+    assert s.breach_state == BreachState.WARNING
+
+
+def test_long_call_max_profit_unbounded_max_loss_premium():
+    legs = [_call_leg(100000, "long", mark="500", delta="0.40")]
+    s = classify(legs)
+    assert s.max_loss == Decimal("50")
+    assert s.max_profit is None
+    assert s.breakevens == (Decimal("100500"),)
+
+
+def test_pnl_baseline_uses_current_when_no_prior():
+    legs = [
+        _put_leg_full(100000, "short", mark="300", delta="-0.30"),
+        _put_leg_full(90000, "long", mark="100", delta="-0.10"),
+    ]
+    s = classify(legs)
+    assert s.pnl_abs == Decimal("0")
+    assert s.pnl_pct == Decimal("0")
+
+
+def test_pnl_with_explicit_entry_baseline():
+    legs = [
+        _put_leg_full(100000, "short", mark="200", delta="-0.20"),
+        _put_leg_full(90000, "long", mark="50", delta="-0.05"),
+    ]
+    s = classify(legs, entry_net_premium=Decimal("20"))
+    assert s.pnl_abs == Decimal("5")
+    assert s.pnl_pct == Decimal("0.25")
+
+
+def test_breach_state_breached_when_dte_lt_2():
+    legs = [
+        _put_leg_full(100000, "short", mark="300", delta="-0.20", dte=1),
+        _put_leg_full(90000, "long", mark="100", delta="-0.05", dte=1),
+    ]
+    s = classify(legs)
+    assert s.breach_state == BreachState.BREACHED
+
+
+def test_breach_state_nominal_when_delta_low_dte_high():
+    legs = [
+        _put_leg_full(100000, "short", mark="300", delta="-0.15", dte=20),
+        _put_leg_full(90000, "long", mark="100", delta="-0.05", dte=20),
+    ]
+    s = classify(legs)
+    assert s.breach_state == BreachState.NOMINAL

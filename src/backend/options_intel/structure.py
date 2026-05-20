@@ -193,14 +193,177 @@ def _match_template(legs: Sequence[OptionLeg]) -> tuple[StructureKind, float]:
     return StructureKind.UNKNOWN, 0.0
 
 
-def classify(legs: Sequence[OptionLeg]) -> OptionStructure:
+def _short_leg(legs: Sequence[OptionLeg]) -> Optional[OptionLeg]:
+    shorts = [leg for leg in legs if leg.side == "short"]
+    if not shorts:
+        return None
+    shorts_with_delta = [leg for leg in shorts if leg.delta is not None]
+    if shorts_with_delta:
+        return max(shorts_with_delta, key=lambda leg: abs(leg.delta))
+    return shorts[0]
+
+
+def _short_leg_delta(legs: Sequence[OptionLeg]) -> Optional[Decimal]:
+    short = _short_leg(legs)
+    if short is None or short.delta is None:
+        return None
+    return short.delta
+
+
+def _max_loss_max_profit(
+    kind: StructureKind, legs: Sequence[OptionLeg], net_premium: Decimal
+) -> tuple[Optional[Decimal], Optional[Decimal]]:
+    contracts = legs[0].contracts if legs else Decimal("0")
+
+    if kind in (StructureKind.CREDIT_PUT_SPREAD, StructureKind.CREDIT_CALL_SPREAD):
+        strikes = sorted({leg.strike for leg in legs})
+        width = strikes[1] - strikes[0]
+        return (width * contracts - net_premium, net_premium)
+
+    if kind in (StructureKind.DEBIT_PUT_SPREAD, StructureKind.DEBIT_CALL_SPREAD):
+        strikes = sorted({leg.strike for leg in legs})
+        width = strikes[1] - strikes[0]
+        debit_paid = -net_premium
+        return (debit_paid, width * contracts - debit_paid)
+
+    if kind in (StructureKind.IRON_CONDOR, StructureKind.IRON_BUTTERFLY):
+        calls = sorted([leg.strike for leg in legs if leg.kind == "call"])
+        puts = sorted([leg.strike for leg in legs if leg.kind == "put"])
+        call_width = calls[1] - calls[0] if len(calls) == 2 else Decimal("0")
+        put_width = puts[1] - puts[0] if len(puts) == 2 else Decimal("0")
+        max_width = max(call_width, put_width)
+        return (max_width * contracts - net_premium, net_premium)
+
+    if kind in (
+        StructureKind.LONG_CALL,
+        StructureKind.LONG_PUT,
+        StructureKind.LONG_STRADDLE,
+        StructureKind.LONG_STRANGLE,
+    ):
+        return (-net_premium, None)
+
+    return (None, None)
+
+
+def _breakevens(
+    kind: StructureKind, legs: Sequence[OptionLeg], net_premium: Decimal
+) -> tuple[Decimal, ...]:
+    contracts = legs[0].contracts if legs else Decimal("0")
+    if contracts == 0:
+        return ()
+    prem_per_contract = net_premium / contracts
+
+    if kind == StructureKind.CREDIT_PUT_SPREAD:
+        short_strike = max(leg.strike for leg in legs if leg.side == "short")
+        return (short_strike - prem_per_contract,)
+    if kind == StructureKind.CREDIT_CALL_SPREAD:
+        short_strike = min(leg.strike for leg in legs if leg.side == "short")
+        return (short_strike + prem_per_contract,)
+    if kind == StructureKind.DEBIT_PUT_SPREAD:
+        long_strike = max(leg.strike for leg in legs if leg.side == "long")
+        return (long_strike - abs(prem_per_contract),)
+    if kind == StructureKind.DEBIT_CALL_SPREAD:
+        long_strike = min(leg.strike for leg in legs if leg.side == "long")
+        return (long_strike + abs(prem_per_contract),)
+    if kind == StructureKind.LONG_CALL:
+        return (legs[0].strike + abs(prem_per_contract),)
+    if kind == StructureKind.LONG_PUT:
+        return (legs[0].strike - abs(prem_per_contract),)
+    if kind in (StructureKind.IRON_CONDOR, StructureKind.IRON_BUTTERFLY):
+        short_put = max(
+            (leg.strike for leg in legs if leg.kind == "put" and leg.side == "short"),
+            default=None,
+        )
+        short_call = min(
+            (leg.strike for leg in legs if leg.kind == "call" and leg.side == "short"),
+            default=None,
+        )
+        if short_put is None or short_call is None:
+            return ()
+        return (short_put - prem_per_contract, short_call + prem_per_contract)
+    return ()
+
+
+def _delta_metric_for_breach(
+    kind: StructureKind, legs: Sequence[OptionLeg]
+) -> Optional[Decimal]:
+    if kind in (
+        StructureKind.LONG_CALL,
+        StructureKind.LONG_PUT,
+        StructureKind.LONG_STRADDLE,
+        StructureKind.LONG_STRANGLE,
+    ):
+        aggregate = _aggregate_greeks(legs).get("delta", Decimal("0"))
+        return abs(aggregate)
+    if kind in (
+        StructureKind.CALENDAR_PUT,
+        StructureKind.CALENDAR_CALL,
+        StructureKind.DIAGONAL_PUT,
+        StructureKind.DIAGONAL_CALL,
+    ):
+        min_dte = min(leg.days_to_expiry for leg in legs)
+        near_legs = [leg for leg in legs if leg.days_to_expiry == min_dte]
+        if near_legs and near_legs[0].delta is not None:
+            return abs(near_legs[0].delta)
+        return None
+    short_d = _short_leg_delta(legs)
+    return abs(short_d) if short_d is not None else None
+
+
+def _breach_state(kind: StructureKind, legs: Sequence[OptionLeg]) -> BreachState:
+    if not legs:
+        return BreachState.NOMINAL
+    dte_min = min(leg.days_to_expiry for leg in legs)
+    delta_metric = _delta_metric_for_breach(kind, legs)
+
+    breached_delta = delta_metric is not None and delta_metric >= Decimal("0.40")
+    breached_dte = dte_min < 2
+    if breached_delta or breached_dte:
+        return BreachState.BREACHED
+
+    warning_delta = delta_metric is not None and delta_metric >= Decimal("0.25")
+    warning_dte = dte_min < 5
+    if warning_delta or warning_dte:
+        return BreachState.WARNING
+
+    return BreachState.NOMINAL
+
+
+def _pnl(
+    net_premium: Decimal,
+    entry_net_premium: Optional[Decimal],
+    is_credit: bool,
+) -> tuple[Decimal, Decimal]:
+    if entry_net_premium is None or entry_net_premium == 0:
+        return Decimal("0"), Decimal("0")
+    if is_credit:
+        pnl_abs = entry_net_premium - net_premium
+    else:
+        pnl_abs = net_premium - entry_net_premium
+    pnl_pct = pnl_abs / abs(entry_net_premium)
+    return pnl_abs, pnl_pct
+
+
+def classify(
+    legs: Sequence[OptionLeg],
+    *,
+    entry_net_premium: Optional[Decimal] = None,
+) -> OptionStructure:
     legs_tuple = tuple(legs)
     underlying = _underlying_from_legs(legs_tuple)
     structure_id = compute_structure_id(legs_tuple)
     tenor_min, tenor_max = _tenor_minmax(legs_tuple) if legs_tuple else (0, 0)
     net_premium = _net_premium(legs_tuple)
     aggregate_greeks = _aggregate_greeks(legs_tuple)
+
     kind, confidence = _match_template(legs_tuple)
+    is_credit = net_premium > 0
+
+    max_loss, max_profit = _max_loss_max_profit(kind, legs_tuple, net_premium)
+    breakevens = _breakevens(kind, legs_tuple, net_premium)
+    short_leg_delta = _short_leg_delta(legs_tuple)
+    breach_state = _breach_state(kind, legs_tuple)
+    pnl_abs, pnl_pct = _pnl(net_premium, entry_net_premium, is_credit)
 
     return OptionStructure(
         structure_id=structure_id,
@@ -210,14 +373,14 @@ def classify(legs: Sequence[OptionLeg]) -> OptionStructure:
         tenor_days_min=tenor_min,
         tenor_days_max=tenor_max,
         net_premium=net_premium,
-        is_credit=net_premium > 0,
-        max_loss=None,
-        max_profit=None,
-        breakevens=(),
-        short_leg_delta=None,
-        breach_state=BreachState.NOMINAL,
-        pnl_abs=Decimal("0"),
-        pnl_pct=Decimal("0"),
+        is_credit=is_credit,
+        max_loss=max_loss,
+        max_profit=max_profit,
+        breakevens=breakevens,
+        short_leg_delta=short_leg_delta,
+        breach_state=breach_state,
+        pnl_abs=pnl_abs,
+        pnl_pct=pnl_pct,
         aggregate_greeks=aggregate_greeks,
         confidence=confidence,
     )
