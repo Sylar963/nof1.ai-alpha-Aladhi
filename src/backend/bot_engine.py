@@ -97,6 +97,7 @@ class BotState:
     peak_account_value: float = 0.0
     drawdown_pct: float = 0.0
     execution_failure_streak: int = 0
+    structures: List[Dict] = field(default_factory=list)
 
 
 class TradingBotEngine:
@@ -1100,6 +1101,7 @@ class TradingBotEngine:
                     persist_options_structures(_get_db_manager(), structures)
                 except Exception as exc:
                     self.logger.warning("options structure persistence failed: %s", exc)
+                self.state.structures = structures
 
             agent = OptionsAgent(llm=self._options_llm_adapter())
             decisions = await agent.decide(self._latest_options_context)

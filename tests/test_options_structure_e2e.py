@@ -132,3 +132,39 @@ def test_persist_structures_upserts_open_marks_closed():
     persist_options_structures(db, [])
     open_ids = {row["structure_id"] for row in db.get_open_structures()}
     assert open_ids == set()
+
+
+def test_bot_service_exposes_structures_when_flag_on(monkeypatch):
+    from src.gui.services.bot_service import build_positions_view
+
+    monkeypatch.setenv("OPTIONS_STRUCTURE_LAYER", "1")
+    state_payload = {
+        "thalex_positions": [
+            {"instrument_name": "BTC-27JUN26-100000-P", "size": 0.1, "side": "short", "kind": "put", "strike": 100000, "days_to_expiry": 14, "delta": -0.30},
+            {"instrument_name": "BTC-27JUN26-90000-P", "size": 0.1, "side": "long", "kind": "put", "strike": 90000, "days_to_expiry": 14, "delta": -0.10},
+        ],
+        "structures": [
+            {"structure_id": "abc123", "kind": "credit_put_spread", "underlying": "BTC",
+             "tenor_days_min": 14, "tenor_days_max": 14, "net_premium": 20.0, "is_credit": True,
+             "max_loss": 980.0, "max_profit": 20.0, "breakevens": [99800.0],
+             "short_leg_delta": -0.30, "breach_state": "warning",
+             "pnl_abs": 0.0, "pnl_pct": 0.0, "aggregate_greeks": {"delta": -0.20},
+             "confidence": 1.0, "legs": ["BTC-27JUN26-100000-P", "BTC-27JUN26-90000-P"]},
+        ],
+    }
+    view = build_positions_view(state_payload)
+    assert "thalex_structures" in view
+    assert len(view["thalex_structures"]) == 1
+    assert view["thalex_structures"][0]["kind"] == "credit_put_spread"
+
+
+def test_bot_service_omits_structures_when_flag_off(monkeypatch):
+    from src.gui.services.bot_service import build_positions_view
+
+    monkeypatch.delenv("OPTIONS_STRUCTURE_LAYER", raising=False)
+    state_payload = {
+        "thalex_positions": [],
+        "structures": [{"structure_id": "x", "kind": "credit_put_spread"}],
+    }
+    view = build_positions_view(state_payload)
+    assert view.get("thalex_structures", []) == []
