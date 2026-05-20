@@ -12,7 +12,6 @@ The LLM's job is to reason about regime + greeks + mispricings, not to scan
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -120,7 +119,8 @@ class OptionsContext:
             "recent_options_skips": self.recent_options_skips[:5],
             "vol_data_coverage": self.vol_data_coverage,
         }
-        if os.environ.get("OPTIONS_STRUCTURE_PROMPT") == "1":
+        from src.backend.config_loader import CONFIG
+        if CONFIG.get("options_structure_prompt"):
             if self.structure_views:
                 payload["structures"] = [v.to_dict() for v in self.structure_views]
             if self.triggered_by_events:

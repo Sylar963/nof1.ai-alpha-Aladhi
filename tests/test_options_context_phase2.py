@@ -1,5 +1,6 @@
 import pytest
 
+from src.backend.config_loader import CONFIG
 from src.backend.options_intel.snapshot import (
     EventSummary,
     OptionsContext,
@@ -37,7 +38,7 @@ def _view():
 
 
 def test_to_dict_excludes_structures_when_flag_off(monkeypatch):
-    monkeypatch.delenv("OPTIONS_STRUCTURE_PROMPT", raising=False)
+    monkeypatch.setitem(CONFIG, "options_structure_prompt", False)
     ctx = _empty_context()
     object.__setattr__(ctx, "structure_views", [_view()])
     object.__setattr__(ctx, "triggered_by_events", [
@@ -50,7 +51,7 @@ def test_to_dict_excludes_structures_when_flag_off(monkeypatch):
 
 
 def test_to_dict_includes_structures_when_flag_on(monkeypatch):
-    monkeypatch.setenv("OPTIONS_STRUCTURE_PROMPT", "1")
+    monkeypatch.setitem(CONFIG, "options_structure_prompt", True)
     ctx = _empty_context()
     object.__setattr__(ctx, "structure_views", [_view()])
     object.__setattr__(ctx, "triggered_by_events", [
@@ -67,7 +68,7 @@ def test_to_dict_includes_structures_when_flag_on(monkeypatch):
 
 
 def test_to_dict_omits_keys_when_views_empty_even_with_flag_on(monkeypatch):
-    monkeypatch.setenv("OPTIONS_STRUCTURE_PROMPT", "1")
+    monkeypatch.setitem(CONFIG, "options_structure_prompt", True)
     ctx = _empty_context()
     payload = ctx.to_dict()
     assert "structures" not in payload

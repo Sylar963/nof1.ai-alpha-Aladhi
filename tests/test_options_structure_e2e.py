@@ -2,6 +2,7 @@ from datetime import date
 
 import pytest
 
+from src.backend.config_loader import CONFIG
 from src.backend.options_intel.portfolio import aggregate_portfolio_greeks
 
 
@@ -181,7 +182,7 @@ async def test_structure_view_emitted_through_full_pipeline(monkeypatch):
     from src.backend.options_intel.snapshot import OptionsContext, StructureView
 
     monkeypatch.setenv("OPTIONS_STRUCTURE_LAYER", "1")
-    monkeypatch.setenv("OPTIONS_STRUCTURE_PROMPT", "1")
+    monkeypatch.setitem(CONFIG, "options_structure_prompt", True)
 
     ctx = OptionsContext(
         timestamp_utc="2026-05-20T00:00:00Z", spot=100000.0, spot_24h_change_pct=0.0,
