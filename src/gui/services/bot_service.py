@@ -60,6 +60,9 @@ class BotService:
         self.delta_hedge_enabled = bool(CONFIG.get('delta_hedge_enabled', True))
         self._reset_session_trackers()
 
+        # Load persisted GUI config — overrides .env defaults
+        self._load_config_file()
+
         # Configuration
         self.config = {
             'assets': self._parse_assets(CONFIG.get('assets')) or ['BTC', 'ETH'],

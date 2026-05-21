@@ -52,7 +52,7 @@ class AsyncOpenRouterClient:
     ) -> None:
         self.api_key = api_key or CONFIG.get("openrouter_api_key")
         self.base_url = base_url or CONFIG.get("openrouter_base_url") or _DEFAULT_BASE_URL
-        self.model = model or CONFIG.get("llm_model") or "z-ai/glm-5.1"
+        self.model = model or CONFIG.get("llm_model") or "x-ai/grok-4"
         self.referer = referer or CONFIG.get("openrouter_referer")
         self.app_title = app_title or CONFIG.get("openrouter_app_title")
         self.timeout_seconds = timeout_seconds

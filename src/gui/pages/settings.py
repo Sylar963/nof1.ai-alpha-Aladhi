@@ -31,16 +31,17 @@ def create_settings(bot_service: BotService, state_manager: StateManager):
 
     # Load configuration from file or use defaults
     def load_config():
-        """Load configuration from file"""
+        """Load configuration from file, merging with defaults for any missing keys."""
+        loaded = None
         if config_file.exists():
             try:
                 with open(config_file, 'r') as f:
-                    return json.load(f)
+                    loaded = json.load(f)
             except Exception as e:
                 ui.notify(f'Failed to load config: {e}', type='warning')
 
-        # Return defaults from environment
-        return {
+        # Start with defaults from environment
+        defaults = {
             'strategy': {
                 'assets': _assets_to_text(bot_service._parse_assets(CONFIG.get('assets')) or ['BTC', 'ETH']),
                 'interval': CONFIG.get('interval') or '5m',
@@ -72,6 +73,20 @@ def create_settings(bot_service: BotService, state_manager: StateManager):
                 'telegram_chat_id': ''
             }
         }
+
+        # Merge loaded config into defaults — preserves saved values while
+        # filling in any keys (e.g. ``reasoning_enabled``) that were added
+        # after the file was originally written.
+        if loaded is not None:
+            for section, section_defaults in defaults.items():
+                saved_section = loaded.get(section, {})
+                if isinstance(section_defaults, dict):
+                    for key, default_val in section_defaults.items():
+                        saved_section.setdefault(key, default_val)
+                    loaded[section] = saved_section
+            return loaded
+
+        return defaults
 
     def save_config(config_data):
         """Save configuration to file"""
@@ -158,9 +173,19 @@ def create_settings(bot_service: BotService, state_manager: StateManager):
                     ui.label('LLM Model').classes('text-lg font-semibold text-white')
                     _llm_options = [
                         'x-ai/grok-4',
-                        'openai/gpt-4',
-                        'anthropic/claude-3.5-sonnet',
-                        'deepseek/deepseek-chat-v3.1',
+                        'openai/gpt-5',
+                        'openai/o3-mini',
+                        'anthropic/claude-sonnet-4-20250514',
+                        'anthropic/claude-3.5-haiku-20241022',
+                        'google/gemini-2.5-flash',
+                        'google/gemini-2.5-pro',
+                        'deepseek/deepseek-v4-flash',
+                        'deepseek/deepseek-v4-pro',
+                        'deepseek/deepseek-r1',
+                        'qwen/qwen3.6-plus',
+                        'qwen/qwen2.5-72b-instruct',
+                        'qwen/qwq-32b-preview',
+                        'z-ai/glm-5.1',
                     ]
                     _current_llm = config_data['strategy']['llm_model']
                     if _current_llm not in _llm_options:

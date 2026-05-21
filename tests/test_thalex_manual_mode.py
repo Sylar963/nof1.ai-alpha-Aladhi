@@ -11,6 +11,14 @@ from src.backend.trading.options_strategies import ExecutionResult
 from src.gui.services.bot_service import BotService
 
 
+@pytest.fixture(autouse=True)
+def _noop_load_config_file(monkeypatch):
+    """Prevent BotService._load_config_file from reading data/config.json
+    during tests — that file holds persistent state from real GUI runs and
+    would override monkeypatched CONFIG values, affecting test isolation."""
+    monkeypatch.setattr(BotService, "_load_config_file", lambda self: None)
+
+
 @pytest.mark.asyncio
 async def test_execute_proposal_routes_thalex_proposals_through_thalex_executor():
     proposal = TradeProposal(

@@ -1961,13 +1961,30 @@ class TradingBotEngine:
                         for pos in hyperliquid_only_positions
                     ]
 
+                    # Strip raw series arrays from market data before sending
+                    # to the LLM — they balloon the prompt to ~160K tokens while
+                    # the LLM only needs the summary metrics (latest SMA, Keltner
+                    # snapshot, AVWAP, etc.). The full series is kept in state for
+                    # the GUI chart display.
+                    _llm_sections = []
+                    for _s in market_sections:
+                        _s_copy = dict(_s)
+                        _s_copy.pop("series", None)
+                        _s_copy.pop("recent_mid_prices", None)
+                        _s_copy.pop("recent_timestamps", None)
+                        if "chart_intraday" in _s_copy:
+                            _chart = dict(_s_copy["chart_intraday"])
+                            _chart.pop("series", None)
+                            _s_copy["chart_intraday"] = _chart
+                        _llm_sections.append(_s_copy)
+
                     context_payload = OrderedDict([
                         ("invocation", {
                             "count": self.invocation_count,
                             "current_time": datetime.now(UTC).isoformat()
                         }),
                         ("account", perps_account),
-                        ("market_data", market_sections),
+                        ("market_data", _llm_sections),
                         ("instructions", {
                             "assets": self.assets,
                             "note": "Follow the system prompt guidelines strictly"
