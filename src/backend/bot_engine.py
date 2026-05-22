@@ -1097,9 +1097,10 @@ class TradingBotEngine:
             self.logger.warning("Deribit mark price history fetch failed: %s", exc)
 
         # Fallbacks: bot's intraday history, then a flat placeholder.
+        # price_history stores {'t': ts, 'mid': price} dicts — extract the float.
         intraday = list(self.price_history.get("BTC", []))
         if intraday:
-            return intraday[-days:]
+            return [p['mid'] if isinstance(p, dict) else p for p in intraday[-days:]]
         return [60000.0] * days
 
     async def _fetch_btc_first_hour_minutes(self, deribit) -> list:

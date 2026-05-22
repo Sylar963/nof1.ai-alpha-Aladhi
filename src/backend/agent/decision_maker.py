@@ -1,6 +1,8 @@
 """Decision-making agent that orchestrates LLM prompts and indicator lookups."""
 
+import re
 import requests
+from typing import Optional
 from src.backend.config_loader import CONFIG
 from src.backend.indicators.taapi_client import TAAPIClient
 import json
@@ -26,6 +28,88 @@ _PERPS_DECISION_FIELDS = (
 def _perps_only(decision: dict) -> dict:
     """Return a copy of ``decision`` with only the allowed perps fields."""
     return {k: decision[k] for k in _PERPS_DECISION_FIELDS if k in decision}
+
+
+def _extract_json(text: str) -> Optional[dict]:
+    """Try multiple strategies to extract a valid JSON dict from *text*.
+
+    Attempts in order:
+    1. Direct ``json.loads`` on the whole text.
+    2. Extract from a markdown JSON code block (`````json...`````).
+    3. Extract from any markdown code block (`````...`````).
+    4. Find the outermost ``{…}`` or ``{…}`` block and try to parse it.
+    5. Try fixing common issues (trailing commas, single quotes, etc.).
+    """
+    if not text:
+        return None
+
+    # Strategy 1: direct parse
+    text = text.strip()
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    # Strategy 2: markdown JSON code block
+    m = re.search(r'```json\s*\n?(.*?)\n?```', text, re.DOTALL)
+    if m:
+        try:
+            parsed = json.loads(m.group(1).strip())
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+    # Strategy 3: any markdown code block
+    m = re.search(r'```\s*\n?(.*?)\n?```', text, re.DOTALL)
+    if m:
+        try:
+            parsed = json.loads(m.group(1).strip())
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+    # Strategy 4: find the outermost {...} or {...} block
+    brace_stack = []
+    start = -1
+    for i, ch in enumerate(text):
+        if ch == '{':
+            if not brace_stack:
+                start = i
+            brace_stack.append(ch)
+        elif ch == '}':
+            if brace_stack:
+                brace_stack.pop()
+                if not brace_stack and start >= 0:
+                    candidate = text[start:i+1]
+                    try:
+                        parsed = json.loads(candidate)
+                        if isinstance(parsed, dict):
+                            return parsed
+                    except json.JSONDecodeError:
+                        pass
+
+    # Strategy 5: attempt common fixes
+    for fix in (
+        lambda s: re.sub(r',\s*}', '}', s),                       # trailing commas
+        lambda s: s.replace("'", '"'),                              # single → double quotes
+        lambda s: re.sub(r'(?<!")\b(true|false|null)\b(?!")', r'"\1"', s),  # unquoted true/false/null
+    ):
+        try:
+            candidate = fix(text)
+            # Try to also find a JSON block within the fixed text
+            m = re.search(r'\{.*\}', candidate, re.DOTALL)
+            if m:
+                parsed = json.loads(m.group(0))
+                if isinstance(parsed, dict):
+                    return parsed
+        except (json.JSONDecodeError, re.error):
+            continue
+
+    return None
 
 
 def _enforce_perps_only(payload: dict) -> dict:
@@ -130,13 +214,16 @@ class TradingAgent:
             "Reasoning recipe (first principles)\n"
             "- Structure (price vs SMA99, anchored AVWAP, Keltner location, opening-range acceptance/rejection), Liquidity/volatility (Keltner width), Positioning tilt (funding, OI).\n"
             "- Favor alignment across 4h and 5m. Counter-trend scalps require stronger intraday confirmation and tighter risk.\n\n"
-            "Output contract\n"
-            "- Output a STRICT JSON object with exactly two properties in this order:\n"
-            "  • reasoning: long-form string capturing detailed, step-by-step analysis (be verbose).\n"
-            "  • trade_decisions: array ordered to match the provided assets list.\n"
+            "Output contract — STRICT JSON ONLY, no exceptions\n"
+            "- BEGIN your response with the EXACT JSON object shape below — NO text, NO markdown, NO backticks, NO explanation before or after:\n"
+            '{\n'
+            '  "reasoning": "long-form analysis string here",\n'
+            '  "trade_decisions": [\n'
+            '    {"asset": "BTC", "action": "hold", "allocation_usd": 0.0, "tp_price": null, "sl_price": null, "exit_plan": "...", "rationale": "..."}\n'
+            '  ]\n'
+            '}\n'
             "- Each item REQUIRES: asset, action, allocation_usd, tp_price, sl_price, exit_plan, rationale.\n"
             "- Do NOT emit a 'venue' field, 'strategy', 'legs', 'contracts', or any other options-related field. This agent only produces Hyperliquid perp decisions; downstream routing assumes that.\n"
-            "- Do not emit Markdown or any extra properties.\n"
         )
         user_prompt = context
         messages = [
@@ -398,12 +485,39 @@ class TradingAgent:
                     return {"reasoning": reasoning_text, "trade_decisions": normalized}
 
                 logging.error("trade_decisions missing or invalid; attempting sanitize")
-                sanitized = _sanitize_output(content if 'content' in locals() else json.dumps(parsed), assets)
+                raw = content if 'content' in locals() else json.dumps(parsed)
+                extracted = _extract_json(raw)
+                if extracted and isinstance(extracted.get("trade_decisions"), list):
+                    normalized = []
+                    for item in extracted["trade_decisions"]:
+                        if isinstance(item, dict):
+                            item.setdefault("allocation_usd", 0.0)
+                            item.setdefault("tp_price", None)
+                            item.setdefault("sl_price", None)
+                            item.setdefault("exit_plan", "")
+                            item.setdefault("rationale", "")
+                            normalized.append(item)
+                    normalized = [_perps_only(d) for d in normalized]
+                    return {"reasoning": extracted.get("reasoning", reasoning_text), "trade_decisions": normalized}
+                sanitized = _sanitize_output(raw, assets)
                 if sanitized.get("trade_decisions"):
                     return sanitized
                 return {"reasoning": reasoning_text, "trade_decisions": []}
             except (json.JSONDecodeError, KeyError, ValueError, TypeError) as e:
                 logging.error("JSON parse error: %s, content: %s", e, content[:200])
+                extracted = _extract_json(content)
+                if extracted and isinstance(extracted.get("trade_decisions"), list):
+                    normalized = []
+                    for item in extracted["trade_decisions"]:
+                        if isinstance(item, dict):
+                            item.setdefault("allocation_usd", 0.0)
+                            item.setdefault("tp_price", None)
+                            item.setdefault("sl_price", None)
+                            item.setdefault("exit_plan", "")
+                            item.setdefault("rationale", "")
+                            normalized.append(item)
+                    normalized = [_perps_only(d) for d in normalized]
+                    return {"reasoning": extracted.get("reasoning", ""), "trade_decisions": normalized}
                 # Try sanitizer as last resort
                 sanitized = _sanitize_output(content, assets)
                 if sanitized.get("trade_decisions"):

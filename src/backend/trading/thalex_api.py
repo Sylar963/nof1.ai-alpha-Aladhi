@@ -607,12 +607,28 @@ class ThalexAPI(ExchangeAdapter):
     # ExchangeAdapter implementation
     # ------------------------------------------------------------------
 
+    def _get_tick_size(self, instrument_name: str) -> float:
+        """Return the tick size for *instrument_name* from the cache, or 1.0 as fallback."""
+        cache = getattr(self, "_instruments_cache", None) or []
+        for rec in cache:
+            if rec.get("instrument_name") == instrument_name:
+                return float(rec.get("tick_size") or rec.get("tickSize") or 1.0)
+        return 1.0
+
+    @staticmethod
+    def _align_price(price: float, tick_size: float) -> float:
+        """Round *price* down to the nearest multiple of *tick_size*."""
+        if tick_size <= 0:
+            return price
+        return round(price / tick_size) * tick_size
+
     async def _entry_limit_price(self, instrument_name: str, side: str, slippage: float) -> float:
         ticker = await self._request_with_retry(
             self._client.ticker,
             instrument_name=instrument_name,
             description=f"Thalex ticker {instrument_name}",
         )
+        tick_size = self._get_tick_size(instrument_name)
         if side == "buy":
             reference = _quote_field(
                 ticker,
@@ -624,7 +640,7 @@ class ThalexAPI(ExchangeAdapter):
             )
             if reference is None or reference <= 0:
                 raise RuntimeError(f"No ask/mark quote available for {instrument_name}")
-            return reference * (1.0 + max(float(slippage or 0.0), 0.0))
+            return self._align_price(reference * (1.0 + max(float(slippage or 0.0), 0.0)), tick_size)
 
         reference = _quote_field(
             ticker,
@@ -636,7 +652,7 @@ class ThalexAPI(ExchangeAdapter):
         )
         if reference is None or reference <= 0:
             raise RuntimeError(f"No bid/mark quote available for {instrument_name}")
-        return max(reference * (1.0 - max(float(slippage or 0.0), 0.0)), 0.0)
+        return self._align_price(max(reference * (1.0 - max(float(slippage or 0.0), 0.0)), 0.0), tick_size)
 
     async def _submit_limit_order(
         self,
@@ -650,6 +666,9 @@ class ThalexAPI(ExchangeAdapter):
         description: str,
     ) -> OrderResult:
         from thalex import Direction, OrderType, TimeInForce
+
+        # Align price to the instrument's tick size to avoid Thalex rejection.
+        limit_price = self._align_price(limit_price, self._get_tick_size(instrument_name))
 
         direction = Direction.BUY if side == "buy" else Direction.SELL
         tif = time_in_force if time_in_force is not None else TimeInForce.IOC
