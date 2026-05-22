@@ -446,7 +446,7 @@ class TradingAgent:
                     parsed = json.loads(content)
 
                 if not isinstance(parsed, dict):
-                    logging.error("Expected dict payload, got: %s; attempting sanitize", type(parsed))
+                    logging.warning("Expected dict payload, got: %s; attempting sanitize", type(parsed))
                     sanitized = _sanitize_output(content if 'content' in locals() else json.dumps(parsed), assets)
                     if sanitized.get("trade_decisions"):
                         return sanitized
@@ -484,7 +484,7 @@ class TradingAgent:
                     normalized = [_perps_only(d) for d in normalized]
                     return {"reasoning": reasoning_text, "trade_decisions": normalized}
 
-                logging.error("trade_decisions missing or invalid; attempting sanitize")
+                logging.warning("trade_decisions missing or invalid; attempting sanitize")
                 raw = content if 'content' in locals() else json.dumps(parsed)
                 extracted = _extract_json(raw)
                 if extracted and isinstance(extracted.get("trade_decisions"), list):
@@ -504,7 +504,7 @@ class TradingAgent:
                     return sanitized
                 return {"reasoning": reasoning_text, "trade_decisions": []}
             except (json.JSONDecodeError, KeyError, ValueError, TypeError) as e:
-                logging.error("JSON parse error: %s, content: %s", e, content[:200])
+                logging.warning("JSON parse error: %s, content: %s", e, content[:200])
                 extracted = _extract_json(content)
                 if extracted and isinstance(extracted.get("trade_decisions"), list):
                     normalized = []

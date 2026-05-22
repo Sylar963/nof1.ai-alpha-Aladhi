@@ -9,7 +9,7 @@ import plotly.graph_objects as go
 from nicegui import ui
 from src.gui.services.bot_service import BotService
 from src.gui.services.state_manager import StateManager
-from src.gui.services.ui_utils import RenderGate, is_ui_alive
+from src.gui.services.ui_utils import RenderGate, is_ui_alive, safe_notify
 
 
 def create_dashboard(bot_service: BotService, state_manager: StateManager):
@@ -207,6 +207,11 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
             status_indicator = ui.label('⚫ Stopped').classes('text-lg font-bold ml-4')
             pause_banner = ui.label('').classes('text-sm text-orange-300 ml-4')
 
+    dashboard_client = status_indicator.client
+
+    def _notify(message: object, **kwargs) -> None:
+        safe_notify(dashboard_client, message, **kwargs)
+
     # Kill switch confirmation dialog — mirrors the positions.py close pattern
     # so behavior is consistent (cancel on the left, destructive action red).
     kill_dialog = ui.dialog()
@@ -252,7 +257,7 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
             status_indicator.text = '🔴 Error'
             _set_status_indicator_tone('text-red-500')
             activity_log.push(f'❌ Error starting bot: {str(e)}')
-            ui.notify(f'Failed to start: {str(e)}', type='negative')
+            _notify(f'Failed to start: {str(e)}', type='negative')
             return
 
         if not _ui_ok():
@@ -262,7 +267,7 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
         start_btn.props('disable')
         stop_btn.props(remove='disable')
         activity_log.push('✅ Bot started successfully!')
-        ui.notify('Bot started!', type='positive')
+        _notify('Bot started!', type='positive')
 
     async def stop_bot():
         """Stop the trading bot"""
@@ -275,7 +280,7 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
         except Exception as e:
             if _ui_ok():
                 activity_log.push(f'❌ Error stopping bot: {str(e)}')
-                ui.notify(f'Failed to stop: {str(e)}', type='negative')
+                _notify(f'Failed to stop: {str(e)}', type='negative')
             return
 
         if not _ui_ok():
@@ -285,19 +290,19 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
         start_btn.props(remove='disable')
         stop_btn.props('disable')
         activity_log.push('✅ Bot stopped successfully!')
-        ui.notify('Bot stopped!', type='info')
+        _notify('Bot stopped!', type='info')
 
     async def kill_switch_confirmed():
         """User confirmed — flatten everything and pause."""
         if not _ui_ok():
             return
         kill_dialog.close()
-        ui.notify('🚨 Kill switch engaged — flattening...', type='warning', position='top')
+        _notify('🚨 Kill switch engaged — flattening...', type='warning', position='top')
         try:
             result = await bot_service.kill_switch_flatten()
         except Exception as e:
             if _ui_ok():
-                ui.notify(f'Kill switch failed: {e}', type='negative')
+                _notify(f'Kill switch failed: {e}', type='negative')
             return
         if not _ui_ok():
             return
@@ -305,7 +310,7 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
         errs = len(result.get('errors', []))
         remaining = len(result.get('thalex_positions_remaining', []))
         ntype = 'positive' if (errs == 0 and remaining == 0) else 'warning'
-        ui.notify(
+        _notify(
             f'Flattened {closed} position(s); {errs} error(s); '
             f'{remaining} Thalex position(s) still open',
             type=ntype, position='top',
@@ -322,21 +327,21 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
             ok = bot_service.resume_trading()
         except Exception as e:
             if _ui_ok():
-                ui.notify(f'Resume failed: {e}', type='negative')
+                _notify(f'Resume failed: {e}', type='negative')
             return
         if not _ui_ok():
             return
         if ok:
-            ui.notify('▶ Trading resumed', type='positive', position='top')
+            _notify('▶ Trading resumed', type='positive', position='top')
             activity_log.push('▶ Trading resumed')
         else:
-            ui.notify('Bot is not paused', type='info')
+            _notify('Bot is not paused', type='info')
 
     async def toggle_delta_hedge():
         """Enable or disable live delta hedging from the dashboard."""
         if not bot_service.supports_delta_hedge():
             if _ui_ok():
-                ui.notify('Delta hedge is unavailable until Thalex is configured', type='warning')
+                _notify('Delta hedge is unavailable until Thalex is configured', type='warning')
             return
 
         desired_state = not bot_service.is_delta_hedge_enabled()
@@ -346,16 +351,16 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
             if not _ui_ok():
                 return
             if success:
-                ui.notify(
+                _notify(
                     'Delta hedge enabled' if desired_state else 'Delta hedge disabled',
                     type='positive' if desired_state else 'info',
                 )
                 await update_dashboard()
             else:
-                ui.notify('Unable to change delta hedge state', type='negative')
+                _notify('Unable to change delta hedge state', type='negative')
         except Exception as e:
             if _ui_ok():
-                ui.notify(f'Failed to update delta hedge: {str(e)}', type='negative')
+                _notify(f'Failed to update delta hedge: {str(e)}', type='negative')
         finally:
             if _ui_ok():
                 hedge_toggle_btn.enabled = True
@@ -392,12 +397,12 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
                 last_refresh_time = time.time()
                 refresh_data_loading.text = '✅ Done'
                 activity_log.push('✅ Market data refreshed successfully!')
-                ui.notify('Market data refreshed!', type='positive')
+                _notify('Market data refreshed!', type='positive')
                 await update_dashboard()
             else:
                 refresh_data_loading.text = '❌ Failed'
                 activity_log.push('❌ Failed to refresh market data')
-                ui.notify('Failed to refresh market data', type='negative')
+                _notify('Failed to refresh market data', type='negative')
 
         except RuntimeError:
             return  # client navigated away
@@ -405,7 +410,7 @@ def create_dashboard(bot_service: BotService, state_manager: StateManager):
             if not _ui_ok():
                 return
             activity_log.push(f'❌ Refresh error: {str(e)}')
-            ui.notify(f'Error: {str(e)}', type='negative')
+            _notify(f'Error: {str(e)}', type='negative')
             refresh_data_loading.text = '❌ Error'
         finally:
             if _ui_ok():

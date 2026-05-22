@@ -16,7 +16,7 @@ from typing import Any
 
 import pytest
 
-from src.backend.agent.decision_schema import parse_decision
+from src.backend.agent.decision_schema import DecisionParseError, parse_decision
 from src.backend.trading.exchange_adapter import (
     AccountState,
     ExchangeAdapter,
@@ -624,6 +624,61 @@ async def test_credit_put_spread_executes_two_legs_in_correct_directions():
 
 
 @pytest.mark.asyncio
+async def test_multi_leg_uses_gtc_resting_submit_when_native_thalex_helper_exists():
+    from thalex import TimeInForce
+
+    thalex = FakeThalex()
+    hl = FakeHyperliquid()
+    executor = OptionsExecutor(thalex=thalex, hyperliquid=hl)
+    thalex.instruments_by_intent[("BTC", "put", 14, 55000.0)] = "BTC-25APR26-55000-P"
+    thalex.instruments_by_intent[("BTC", "put", 14, 50000.0)] = "BTC-25APR26-50000-P"
+
+    submit_calls: list[dict[str, object]] = []
+
+    async def _entry_limit_price(instrument_name, side, slippage):
+        assert slippage == pytest.approx(0.01)
+        return 1234.0 if side == "sell" else 4321.0
+
+    async def _submit_limit_order(**kwargs):
+        submit_calls.append(kwargs)
+        return OrderResult(
+            venue=thalex.venue,
+            order_id=f"{kwargs['side']}-{kwargs['instrument_name']}",
+            asset=kwargs["instrument_name"],
+            side=kwargs["side"],
+            amount=kwargs["amount"],
+            status="resting",
+            instrument_name=kwargs["instrument_name"],
+            price=kwargs["limit_price"],
+        )
+
+    thalex._entry_limit_price = _entry_limit_price
+    thalex._submit_limit_order = _submit_limit_order
+
+    decision = parse_decision({
+        "venue": "thalex",
+        "asset": "BTC",
+        "action": "sell",
+        "strategy": "credit_put_spread",
+        "underlying": "BTC",
+        "tenor_days": 14,
+        "legs": [
+            {"kind": "put", "side": "sell", "target_strike": 55000, "contracts": 0.05},
+            {"kind": "put", "side": "buy", "target_strike": 50000, "contracts": 0.05},
+        ],
+        "rationale": "rest the spread on the book",
+    })
+    result = await executor.execute(decision, open_positions_count=0)
+
+    assert result.ok is True
+    assert len(submit_calls) == 2
+    assert [call["side"] for call in submit_calls] == ["sell", "buy"]
+    assert all(call["time_in_force"] == TimeInForce.GTC for call in submit_calls)
+    assert thalex.calls == []
+    assert hl.calls == []
+
+
+@pytest.mark.asyncio
 async def test_multi_leg_unwinds_submitted_legs_when_later_leg_fails():
     thalex = FakeThalex()
     hl = FakeHyperliquid()
@@ -731,23 +786,17 @@ async def test_iron_condor_executes_four_legs_two_sides():
 
 @pytest.mark.asyncio
 async def test_iron_condor_requires_at_least_two_legs():
-    thalex = FakeThalex()
-    hl = FakeHyperliquid()
-    executor = OptionsExecutor(thalex=thalex, hyperliquid=hl)
-
-    decision = parse_decision({
-        "venue": "thalex",
-        "asset": "BTC",
-        "action": "sell",
-        "strategy": "iron_condor",
-        "underlying": "BTC",
-        "tenor_days": 14,
-        "legs": [],
-        "rationale": "x",
-    })
-    result = await executor.execute(decision, open_positions_count=0)
-    assert result.ok is False
-    assert "legs" in result.reason.lower()
+    with pytest.raises(DecisionParseError, match="requires a non-empty 'legs' array"):
+        parse_decision({
+            "venue": "thalex",
+            "asset": "BTC",
+            "action": "sell",
+            "strategy": "iron_condor",
+            "underlying": "BTC",
+            "tenor_days": 14,
+            "legs": [],
+            "rationale": "x",
+        })
 
 
 @pytest.mark.asyncio

@@ -2,9 +2,15 @@
 UI Utilities - Helpers for managing NiceGUI client state and context
 """
 
+from typing import Any
+
 from nicegui import ui
 
 _UNSET = object()
+_NOTIFY_ARG_MAP = {
+    'close_button': 'closeBtn',
+    'multi_line': 'multiLine',
+}
 
 
 def is_ui_alive(element: ui.element) -> bool:
@@ -13,10 +19,38 @@ def is_ui_alive(element: ui.element) -> bool:
     Returns False if the element or its parent has been deleted (common in SPAs).
     """
     try:
-        if element is None:
+        if element is None or getattr(element, 'is_deleted', False):
             return False
-        # Accessing .client will raise RuntimeError if the element is deleted
+        # Accessing .client / .parent_slot will raise once NiceGUI has torn
+        # down the page tree for this element.
         _ = element.client
+        _ = element.parent_slot
+        return True
+    except (RuntimeError, AttributeError):
+        return False
+
+
+def safe_notify(client: Any, message: object, **kwargs: Any) -> bool:
+    """Send a NiceGUI notification through a captured client.
+
+    Async callbacks can outlive the slot/context they were created in after the
+    user navigates away. ``ui.notify(...)`` resolves through that ambient slot
+    context and crashes in that situation. Sending through the captured client
+    avoids the dead-slot lookup while still no-oping safely once the client is
+    gone.
+    """
+    if client is None:
+        return False
+    try:
+        if getattr(client, '_deleted', False) or not getattr(client, 'has_socket_connection', False):
+            return False
+        options = {
+            _NOTIFY_ARG_MAP.get(key, key): value
+            for key, value in kwargs.items()
+            if value is not None
+        }
+        options['message'] = str(message)
+        client.outbox.enqueue_message('notify', options, client.id)
         return True
     except (RuntimeError, AttributeError):
         return False

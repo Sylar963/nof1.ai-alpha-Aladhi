@@ -80,6 +80,19 @@ def test_parse_thalex_credit_put_spread():
     assert decision.legs[1].side == "buy"
 
 
+def test_parse_rejects_multi_leg_strategy_without_legs():
+    with pytest.raises(DecisionParseError, match="requires a non-empty 'legs' array"):
+        parse_decision({
+            "venue": "thalex",
+            "asset": "BTC",
+            "action": "sell",
+            "strategy": "credit_put_spread",
+            "underlying": "BTC",
+            "tenor_days": 14,
+            "rationale": "missing structure legs",
+        })
+
+
 def test_parse_thalex_credit_call_spread():
     """Defined-risk short call: sell near-money call + buy further OTM call."""
     payload = {

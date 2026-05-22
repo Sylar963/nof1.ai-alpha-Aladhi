@@ -194,6 +194,38 @@ class OptionsExecutor:
     def is_delta_hedge_enabled(self) -> bool:
         return self._delta_hedge_enabled
 
+    async def _submit_multi_leg_entry_order(
+        self,
+        instrument_name: str,
+        side: str,
+        contracts: float,
+    ):
+        """Submit a spread/condor leg in a way that can rest on the book.
+
+        Defined-risk entries often need a working limit rather than IOC. When
+        the Thalex adapter exposes its native limit-order helper, use GTC so a
+        spread leg can rest instead of coming back as an immediate IOC
+        cancellation. Test doubles and non-Thalex adapters fall back to the
+        generic adapter methods.
+        """
+        submit_limit = getattr(self.thalex, "_submit_limit_order", None)
+        entry_limit_price = getattr(self.thalex, "_entry_limit_price", None)
+        if callable(submit_limit) and callable(entry_limit_price):
+            from thalex import TimeInForce
+
+            limit_price = await entry_limit_price(instrument_name, side, 0.01)
+            return await submit_limit(
+                instrument_name=instrument_name,
+                amount=contracts,
+                side=side,
+                limit_price=limit_price,
+                time_in_force=TimeInForce.GTC,
+                description=f"Thalex {side} {instrument_name} (multi-leg)",
+            )
+        if side == "sell":
+            return await self.thalex.place_sell_order(instrument_name, contracts)
+        return await self.thalex.place_buy_order(instrument_name, contracts)
+
     async def execute(self, decision: TradeDecision, open_positions_count: int) -> ExecutionResult:
         if decision.venue != "thalex":
             return ExecutionResult(ok=False, reason=f"OptionsExecutor only handles thalex, got {decision.venue}")
@@ -703,10 +735,11 @@ class OptionsExecutor:
         submitted_legs: list[tuple[str, str, float]] = []
         for instrument_name, side, contracts in staged_legs:
             try:
-                if side == "sell":
-                    order = await self.thalex.place_sell_order(instrument_name, contracts)
-                else:
-                    order = await self.thalex.place_buy_order(instrument_name, contracts)
+                order = await self._submit_multi_leg_entry_order(
+                    instrument_name,
+                    side,
+                    contracts,
+                )
             except Exception as exc:  # pylint: disable=broad-except
                 await self._unwind_multi_leg_orders(submitted_legs)
                 return ExecutionResult(

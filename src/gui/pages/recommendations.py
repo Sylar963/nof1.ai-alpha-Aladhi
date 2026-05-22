@@ -5,7 +5,7 @@ Recommendations Page - AI trade proposals for manual approval
 from nicegui import ui
 from src.gui.services.bot_service import BotService
 from src.gui.services.state_manager import StateManager
-from src.gui.services.ui_utils import is_ui_alive
+from src.gui.services.ui_utils import is_ui_alive, safe_notify
 
 
 def create_recommendations(bot_service: BotService, state_manager: StateManager):
@@ -26,6 +26,10 @@ def create_recommendations(bot_service: BotService, state_manager: StateManager)
     
     # Container for proposals
     proposals_container = ui.column().classes('w-full gap-4')
+    recommendations_client = proposals_container.client
+
+    def _notify(message: object, **kwargs) -> None:
+        safe_notify(recommendations_client, message, **kwargs)
 
     # Stats row
     stats_row = ui.row().classes('w-full gap-4 mb-4')
@@ -259,13 +263,13 @@ def create_recommendations(bot_service: BotService, state_manager: StateManager)
         try:
             success = bot_service.approve_proposal(proposal_id)
             if success:
-                ui.notify('✅ Trade approved and executing!', type='positive', position='top')
+                _notify('✅ Trade approved and executing!', type='positive', position='top')
                 await update_proposals()
             else:
-                ui.notify('❌ Failed to approve trade', type='negative')
+                _notify('❌ Failed to approve trade', type='negative')
         except Exception as e:
             if _ui_ok():
-                ui.notify(f'Error: {str(e)}', type='negative')
+                _notify(f'Error: {str(e)}', type='negative')
     
     async def reject_proposal(proposal_id: str):
         """Reject a proposal"""
@@ -274,13 +278,13 @@ def create_recommendations(bot_service: BotService, state_manager: StateManager)
         try:
             success = bot_service.reject_proposal(proposal_id, reason="Rejected by user via GUI")
             if success:
-                ui.notify('❌ Proposal rejected', type='warning', position='top')
+                _notify('❌ Proposal rejected', type='warning', position='top')
                 await update_proposals()
             else:
-                ui.notify('Failed to reject proposal', type='negative')
+                _notify('Failed to reject proposal', type='negative')
         except Exception as e:
             if _ui_ok():
-                ui.notify(f'Error: {str(e)}', type='negative')
+                _notify(f'Error: {str(e)}', type='negative')
 
     async def retry_proposal(proposal_id: str):
         """Re-execute a previously failed proposal."""
@@ -289,13 +293,13 @@ def create_recommendations(bot_service: BotService, state_manager: StateManager)
         try:
             success = bot_service.retry_proposal(proposal_id)
             if success:
-                ui.notify('🔄 Retrying trade...', type='info', position='top')
+                _notify('🔄 Retrying trade...', type='info', position='top')
                 await update_proposals()
             else:
-                ui.notify('Retry already in progress or proposal not retryable', type='warning')
+                _notify('Retry already in progress or proposal not retryable', type='warning')
         except Exception as e:
             if _ui_ok():
-                ui.notify(f'Error: {str(e)}', type='negative')
+                _notify(f'Error: {str(e)}', type='negative')
 
     async def dismiss_proposal(proposal_id: str):
         """Remove a failed proposal from the list without retrying."""
@@ -304,13 +308,13 @@ def create_recommendations(bot_service: BotService, state_manager: StateManager)
         try:
             success = bot_service.dismiss_proposal(proposal_id)
             if success:
-                ui.notify('🗑 Failed proposal dismissed', type='warning', position='top')
+                _notify('🗑 Failed proposal dismissed', type='warning', position='top')
                 await update_proposals()
             else:
-                ui.notify('Failed to dismiss proposal', type='negative')
+                _notify('Failed to dismiss proposal', type='negative')
         except Exception as e:
             if _ui_ok():
-                ui.notify(f'Error: {str(e)}', type='negative')
+                _notify(f'Error: {str(e)}', type='negative')
     
     # Auto-refresh every 2 seconds
     ui.timer(3.0, update_proposals)

@@ -40,6 +40,15 @@ VALID_STRATEGIES = {
     "long_straddle",
     "vol_arb",
 }
+MULTI_LEG_STRATEGIES = {
+    "credit_put_spread",
+    "credit_call_spread",
+    "debit_put_spread",
+    "debit_call_spread",
+    "iron_condor",
+    "iron_butterfly",
+    "vol_arb",
+}
 VALID_KINDS = {"call", "put"}
 VALID_VOL_VIEWS = {"short_vol", "long_vol", "neutral"}
 VALID_ENTRY_KINDS = {
@@ -250,6 +259,10 @@ def parse_decision(payload: dict) -> TradeDecision:
             f"risk_flags must be a list of strings, got {type(raw_flags).__name__}"
         )
 
+    legs = _coerce_legs(payload.get("legs"))
+    if strategy in MULTI_LEG_STRATEGIES and not legs:
+        raise DecisionParseError(f"strategy {strategy!r} requires a non-empty 'legs' array")
+
     return TradeDecision(
         asset=asset,
         action=action,
@@ -266,7 +279,7 @@ def parse_decision(payload: dict) -> TradeDecision:
         target_strike=_optional_float(payload.get("target_strike")),
         target_delta=_optional_float(payload.get("target_delta")),
         contracts=_optional_float(payload.get("contracts")),
-        legs=_coerce_legs(payload.get("legs")),
+        legs=legs,
         entry_kind=entry_kind,
         vol_view=vol_view,
         target_gamma_btc=_optional_float(payload.get("target_gamma_btc")),
