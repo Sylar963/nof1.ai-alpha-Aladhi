@@ -1,13 +1,26 @@
 """Tests for the portfolio-driven DeltaHedgeManager."""
 
 from dataclasses import dataclass
+import json
 import logging
 
 import pytest
 
-from src.backend.trading.delta_hedge_manager import DeltaHedgeManager
+import src.backend.trading.delta_hedge_manager as dhm
+from src.backend.config_loader import CONFIG
+from src.backend.trading.delta_hedge_manager import DeltaHedgeManager, _executed_amount
 from src.backend.trading.exchange_adapter import AccountState, ExchangeAdapter, OrderResult, PositionSnapshot
 from src.backend.trading.options_strategies import DeltaHedger
+
+
+@pytest.fixture(autouse=True)
+def _hedge_env(monkeypatch, tmp_path):
+    monkeypatch.setattr(dhm, "_DEFAULT_LEDGER_PATH", tmp_path / "hedge_ledger.json")
+    monkeypatch.setitem(CONFIG, "hedge_cooldown_seconds", 0)
+
+
+def _seed_ledger(tmp_path, entries):
+    (tmp_path / "hedge_ledger.json").write_text(json.dumps(entries), encoding="utf-8")
 
 
 @dataclass
@@ -176,7 +189,8 @@ async def test_reconcile_subscribes_live_positions_and_hedges_net_delta():
 
 
 @pytest.mark.asyncio
-async def test_ticker_push_above_threshold_fires_perp_rebalance():
+async def test_ticker_push_above_threshold_fires_perp_rebalance(tmp_path):
+    _seed_ledger(tmp_path, {"BTC": -0.025})
     thalex = FakeThalexForHedge()
     thalex.positions = [_option_position(instrument_name="BTC-10MAY26-65000-C", delta=None)]
     thalex.greeks_by_instrument["BTC-10MAY26-65000-C"] = {"delta": 0.5}
@@ -193,7 +207,8 @@ async def test_ticker_push_above_threshold_fires_perp_rebalance():
 
 
 @pytest.mark.asyncio
-async def test_ticker_push_below_threshold_is_a_noop():
+async def test_ticker_push_below_threshold_is_a_noop(tmp_path):
+    _seed_ledger(tmp_path, {"BTC": -0.025})
     thalex = FakeThalexForHedge()
     thalex.positions = [_option_position(instrument_name="BTC-10MAY26-65000-C", delta=None)]
     thalex.greeks_by_instrument["BTC-10MAY26-65000-C"] = {"delta": 0.5}
@@ -208,7 +223,8 @@ async def test_ticker_push_below_threshold_is_a_noop():
 
 
 @pytest.mark.asyncio
-async def test_pullback_unwinds_excess_hedge():
+async def test_pullback_unwinds_excess_hedge(tmp_path):
+    _seed_ledger(tmp_path, {"BTC": -0.025})
     thalex = FakeThalexForHedge()
     thalex.positions = [_option_position(instrument_name="BTC-10MAY26-65000-C", delta=None)]
     thalex.greeks_by_instrument["BTC-10MAY26-65000-C"] = {"delta": 0.5}
@@ -423,3 +439,182 @@ async def test_callback_for_unknown_instrument_is_ignored():
     await manager._on_ticker("BTC-NONEXISTENT", {"greeks": {"delta": 0.5}})
 
     assert hl.calls == []
+
+
+class FakeRawHyperliquid(FakeHyperliquidForHedge):
+    """Fake that mimics HyperliquidAPI.get_user_state's raw coin/szi shape."""
+
+    def __init__(self, perp_size: float = 0.0):
+        super().__init__(perp_size)
+        self.fail_user_state = False
+
+    async def get_user_state(self):
+        if self.fail_user_state:
+            raise RuntimeError("hl outage")
+        positions = []
+        if self.perp_size != 0:
+            positions.append(
+                {
+                    "coin": "BTC",
+                    "szi": str(self.perp_size),
+                    "entryPx": "60000.0",
+                    "leverage": {"type": "cross", "value": 20},
+                    "unrealizedPnl": "0.0",
+                    "unrealized_pnl": 0.0,
+                    "pnl": 0.0,
+                    "notional_entry": abs(self.perp_size) * 60000.0,
+                }
+            )
+        return {"balance": 10000.0, "total_value": 10000.0, "positions": positions}
+
+
+class RejectingHyperliquid(FakeHyperliquidForHedge):
+    async def place_sell_order(self, asset, amount, slippage=0.01):
+        self.calls.append(_PerpOrder("sell", amount))
+        return OrderResult(
+            venue=self.venue, order_id="", asset=asset, side="sell",
+            amount=amount, status="rejected", error="Insufficient margin",
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("szi,expected", [(-0.05, -0.05), (0.03, 0.03)])
+async def test_current_perp_delta_parses_raw_hl_coin_szi_payload(szi, expected):
+    thalex = FakeThalexForHedge()
+    hl = FakeRawHyperliquid(perp_size=szi)
+    manager = DeltaHedgeManager(thalex=thalex, hyperliquid=hl, hedger=DeltaHedger())
+
+    assert await manager._current_perp_delta("BTC") == pytest.approx(expected)
+    assert await manager._current_perp_delta("ETH") == pytest.approx(0.0)
+
+
+@pytest.mark.asyncio
+async def test_perp_state_fetch_failure_skips_rebalance():
+    thalex = FakeThalexForHedge()
+    thalex.positions = [_option_position(instrument_name="BTC-10MAY26-65000-C", delta=0.5)]
+    hl = FakeRawHyperliquid()
+    hl.fail_user_state = True
+    manager = DeltaHedgeManager(thalex=thalex, hyperliquid=hl, hedger=DeltaHedger(threshold=0.02))
+
+    orders = await manager.reconcile()
+
+    assert orders == []
+    assert hl.calls == []
+    assert manager._hedge_ledger == {}
+    assert "BTC" in manager.degraded_underlyings
+
+
+@pytest.mark.asyncio
+async def test_ledger_residual_leaves_directional_perp_position_untouched():
+    thalex = FakeThalexForHedge()
+    thalex.positions = [_option_position(instrument_name="BTC-10MAY26-65000-C", delta=0.5)]
+    hl = FakeRawHyperliquid(perp_size=0.5)
+    manager = DeltaHedgeManager(thalex=thalex, hyperliquid=hl, hedger=DeltaHedger(threshold=0.02))
+
+    await manager.reconcile()
+
+    assert len(hl.calls) == 1
+    assert hl.calls[0].side == "sell"
+    assert hl.calls[0].amount == pytest.approx(0.025)
+    assert manager._hedge_ledger["BTC"] == pytest.approx(-0.025)
+    assert hl.perp_size == pytest.approx(0.475)
+
+    await manager.reconcile()
+
+    assert len(hl.calls) == 1
+    assert hl.perp_size == pytest.approx(0.475)
+
+
+@pytest.mark.asyncio
+async def test_failed_hedge_order_leaves_ledger_unchanged():
+    thalex = FakeThalexForHedge()
+    thalex.positions = [_option_position(instrument_name="BTC-10MAY26-65000-C", delta=0.5)]
+    hl = RejectingHyperliquid()
+    manager = DeltaHedgeManager(thalex=thalex, hyperliquid=hl, hedger=DeltaHedger(threshold=0.02))
+
+    orders = await manager.reconcile()
+
+    assert orders == []
+    assert len(hl.calls) == 1
+    assert manager._hedge_ledger.get("BTC", 0.0) == pytest.approx(0.0)
+    snapshot = manager.get_status_snapshot()
+    assert snapshot["metrics"][0]["status"] == "rejected"
+
+
+@pytest.mark.asyncio
+async def test_cooldown_suppresses_immediate_second_hedge(monkeypatch):
+    monkeypatch.setitem(CONFIG, "hedge_cooldown_seconds", 300)
+    thalex = FakeThalexForHedge()
+    thalex.positions = [_option_position(instrument_name="BTC-10MAY26-65000-C", delta=None)]
+    thalex.greeks_by_instrument["BTC-10MAY26-65000-C"] = {"delta": 0.5}
+    hl = FakeHyperliquidForHedge()
+    manager = DeltaHedgeManager(thalex=thalex, hyperliquid=hl, hedger=DeltaHedger(threshold=0.02))
+
+    await manager.reconcile()
+    assert len(hl.calls) == 1
+
+    thalex.greeks_by_instrument["BTC-10MAY26-65000-C"] = {"delta": 1.0}
+    await manager.reconcile()
+
+    assert len(hl.calls) == 1
+    assert manager._hedge_ledger["BTC"] == pytest.approx(-0.025)
+
+
+@pytest.mark.asyncio
+async def test_residual_below_min_notional_is_acceptable_drift():
+    thalex = FakeThalexForHedge()
+    thalex.positions = [_option_position(instrument_name="BTC-10MAY26-65000-C", delta=0.5)]
+    hl = FakeHyperliquidForHedge()
+    hl.btc_price = 100.0
+    manager = DeltaHedgeManager(thalex=thalex, hyperliquid=hl, hedger=DeltaHedger(threshold=0.02))
+
+    orders = await manager.reconcile()
+
+    assert orders == []
+    assert hl.calls == []
+    assert manager._hedge_ledger == {}
+
+
+@pytest.mark.asyncio
+async def test_hedge_order_notional_is_capped(monkeypatch):
+    monkeypatch.setitem(CONFIG, "hedge_max_order_notional_usd", 600.0)
+    thalex = FakeThalexForHedge()
+    thalex.positions = [_option_position(instrument_name="BTC-10MAY26-65000-C", delta=0.5)]
+    hl = FakeHyperliquidForHedge()
+    manager = DeltaHedgeManager(thalex=thalex, hyperliquid=hl, hedger=DeltaHedger(threshold=0.02))
+
+    await manager.reconcile()
+
+    assert len(hl.calls) == 1
+    assert hl.calls[0].amount == pytest.approx(0.01)
+    assert manager._hedge_ledger["BTC"] == pytest.approx(-0.01)
+
+
+@pytest.mark.asyncio
+async def test_hedge_ledger_persists_across_restart(tmp_path):
+    thalex = FakeThalexForHedge()
+    thalex.positions = [_option_position(instrument_name="BTC-10MAY26-65000-C", delta=0.5)]
+    hl = FakeHyperliquidForHedge()
+    manager = DeltaHedgeManager(thalex=thalex, hyperliquid=hl, hedger=DeltaHedger(threshold=0.02))
+
+    await manager.reconcile()
+    assert manager._hedge_ledger["BTC"] == pytest.approx(-0.025)
+    assert json.loads((tmp_path / "hedge_ledger.json").read_text())["BTC"] == pytest.approx(-0.025)
+
+    manager2 = DeltaHedgeManager(thalex=thalex, hyperliquid=hl, hedger=DeltaHedger(threshold=0.02))
+    assert manager2._hedge_ledger["BTC"] == pytest.approx(-0.025)
+
+    orders = await manager2.reconcile()
+    assert orders == []
+    assert len(hl.calls) == 1
+
+
+def test_executed_amount_prefers_filled_size_from_raw_response():
+    raw = {
+        "status": "ok",
+        "response": {"data": {"statuses": [{"filled": {"totalSz": "0.02", "avgPx": "60000", "oid": 1}}]}},
+    }
+    assert _executed_amount(raw, 0.025) == pytest.approx(0.02)
+    assert _executed_amount({"status": "ok"}, 0.025) == pytest.approx(0.025)
+    result = OrderResult(venue="hyperliquid", order_id="h", asset="BTC", side="sell", amount=0.02, status="ok")
+    assert _executed_amount(result, 0.025) == pytest.approx(0.02)

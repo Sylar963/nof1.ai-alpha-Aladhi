@@ -24,6 +24,7 @@ import asyncio
 import itertools
 import json
 import logging
+import math
 import os
 import time
 from pathlib import Path
@@ -255,6 +256,7 @@ class ThalexAPI(ExchangeAdapter):
 
         self._client = None  # constructed lazily in connect()
         self._id_counter = itertools.count(1)
+        self._client_order_id_counter = itertools.count(int(time.time() * 1000) * 100000)
         self._pending: dict[int, asyncio.Future] = {}
         self._receiver_task: Optional[asyncio.Task] = None
         self._instruments_cache: list[dict] = []
@@ -529,7 +531,11 @@ class ThalexAPI(ExchangeAdapter):
         except Exception:
             self._pending.pop(request_id, None)
             raise
-        return await asyncio.wait_for(fut, timeout=15.0)
+        try:
+            return await asyncio.wait_for(fut, timeout=15.0)
+        except asyncio.TimeoutError:
+            self._pending.pop(request_id, None)
+            raise
 
     async def _request_with_retry(
         self,
@@ -538,14 +544,31 @@ class ThalexAPI(ExchangeAdapter):
         max_attempts: int = _RETRY_MAX_ATTEMPTS,
         backoff_base: float = _RETRY_BACKOFF_BASE_SECONDS,
         description: str = "Thalex request",
+        landed_check=None,
         **kwargs,
     ):
+        """Retry wrapper for RPCs.
+
+        ``landed_check`` is an async zero-arg callable used by order inserts:
+        on a request timeout the order may have landed on the venue anyway, so
+        before retrying we ask the venue whether it did. A non-None return is
+        treated as the effective result and NO retry is sent (retrying blindly
+        would double-fill).
+        """
         last_exc: Optional[BaseException] = None
         for attempt in range(max_attempts):
             try:
                 return await self._request(sender, **kwargs)
             except Exception as exc:  # pylint: disable=broad-except
                 last_exc = exc
+                if landed_check is not None and isinstance(exc, asyncio.TimeoutError):
+                    landed = await landed_check()
+                    if landed is not None:
+                        logger.warning(
+                            "%s timed out but landed on venue — using venue state, not retrying",
+                            description,
+                        )
+                        return landed
                 if attempt < max_attempts - 1:
                     logger.warning(
                         "%s failed (attempt %d/%d): %s — retrying",
@@ -594,13 +617,20 @@ class ThalexAPI(ExchangeAdapter):
             await self._refresh_instruments_cache()
         return find_best_instrument(self._instruments_cache, intent)
 
-    def preflight(self, underlying: str, contracts: float, open_positions_count: int) -> tuple[bool, str]:
+    def preflight(
+        self,
+        underlying: str,
+        contracts: float,
+        open_positions_count: int,
+        reducing: bool = False,
+    ) -> tuple[bool, str]:
         """Apply hard risk caps before any order is sent to Thalex."""
         return validate_options_order(
             underlying=underlying,
             contracts=contracts,
             open_positions_count=open_positions_count,
             caps=self.risk_caps,
+            reducing=reducing,
         )
 
     # ------------------------------------------------------------------
@@ -616,43 +646,70 @@ class ThalexAPI(ExchangeAdapter):
         return 1.0
 
     @staticmethod
-    def _align_price(price: float, tick_size: float) -> float:
-        """Round *price* down to the nearest multiple of *tick_size*."""
+    def _align_price(price: float, tick_size: float, side: str = "buy") -> float:
+        """Align *price* to *tick_size*, rounding toward passive: down for buys, up for sells."""
         if tick_size <= 0:
             return price
-        return round(price / tick_size) * tick_size
+        ticks = price / tick_size
+        if side == "sell":
+            return math.ceil(ticks - 1e-9) * tick_size
+        return math.floor(ticks + 1e-9) * tick_size
 
-    async def _entry_limit_price(self, instrument_name: str, side: str, slippage: float) -> float:
+    async def _entry_limit_price(self, instrument_name: str, side: str, slippage: float = 0.0) -> float:
+        """Entry limit price at mid ± a fraction of the half-spread, never beyond the touch.
+
+        ``thalex_cross_fraction`` (CONFIG, default 0.25) controls how far
+        through mid toward the touch the order is priced. ``slippage`` is
+        accepted for signature compatibility but no longer widens the price
+        past the touch.
+        """
         ticker = await self._request_with_retry(
             self._client.ticker,
             instrument_name=instrument_name,
             description=f"Thalex ticker {instrument_name}",
         )
         tick_size = self._get_tick_size(instrument_name)
+        bid = _quote_field(ticker, ("best_bid",), ("bid_price",))
+        ask = _quote_field(ticker, ("best_ask",), ("ask_price",))
+        cross_fraction = max(float(CONFIG.get("thalex_cross_fraction", 0.25)), 0.0)
+
+        if bid is not None and bid > 0 and ask is not None and ask > 0 and ask >= bid:
+            mid = (bid + ask) / 2.0
+            half_spread = (ask - bid) / 2.0
+            if side == "buy":
+                price = min(mid + cross_fraction * half_spread, ask)
+            else:
+                price = max(mid - cross_fraction * half_spread, bid)
+            return self._align_price(price, tick_size, side)
+
         if side == "buy":
             reference = _quote_field(
                 ticker,
-                ("best_ask",),
-                ("ask_price",),
                 ("mark_price",),
                 ("last_price",),
+                ("best_ask",),
+                ("ask_price",),
                 ("best_bid",),
             )
             if reference is None or reference <= 0:
                 raise RuntimeError(f"No ask/mark quote available for {instrument_name}")
-            return self._align_price(reference * (1.0 + max(float(slippage or 0.0), 0.0)), tick_size)
+            if ask is not None and ask > 0:
+                reference = min(reference, ask)
+            return self._align_price(reference, tick_size, side)
 
         reference = _quote_field(
             ticker,
-            ("best_bid",),
-            ("bid_price",),
             ("mark_price",),
             ("last_price",),
+            ("best_bid",),
+            ("bid_price",),
             ("best_ask",),
         )
         if reference is None or reference <= 0:
             raise RuntimeError(f"No bid/mark quote available for {instrument_name}")
-        return self._align_price(max(reference * (1.0 - max(float(slippage or 0.0), 0.0)), 0.0), tick_size)
+        if bid is not None and bid > 0:
+            reference = max(reference, bid)
+        return self._align_price(reference, tick_size, side)
 
     async def _submit_limit_order(
         self,
@@ -668,10 +725,11 @@ class ThalexAPI(ExchangeAdapter):
         from thalex import Direction, OrderType, TimeInForce
 
         # Align price to the instrument's tick size to avoid Thalex rejection.
-        limit_price = self._align_price(limit_price, self._get_tick_size(instrument_name))
+        limit_price = self._align_price(limit_price, self._get_tick_size(instrument_name), side)
 
         direction = Direction.BUY if side == "buy" else Direction.SELL
         tif = time_in_force if time_in_force is not None else TimeInForce.IOC
+        client_order_id = self._next_client_order_id()
         result = await self._request_with_retry(
             self._client.insert,
             direction=direction,
@@ -681,9 +739,49 @@ class ThalexAPI(ExchangeAdapter):
             order_type=OrderType.LIMIT,
             time_in_force=tif,
             reduce_only=reduce_only,
+            client_order_id=client_order_id,
             description=description,
+            landed_check=lambda: self._find_order_by_client_id(client_order_id),
         )
         return self._make_order_result(instrument_name, side, amount, result, submitted_price=limit_price)
+
+    def _next_client_order_id(self) -> int:
+        counter = getattr(self, "_client_order_id_counter", None)
+        if counter is None:
+            counter = itertools.count(int(time.time() * 1000) * 100000)
+            self._client_order_id_counter = counter
+        return next(counter)
+
+    async def _find_order_by_client_id(self, client_order_id: int) -> Optional[dict]:
+        """Check whether an order insert that timed out actually landed.
+
+        Looks for *client_order_id* in open orders first, then in recent
+        trades. Returns the venue-side order/trade dict when found (so the
+        caller can build an OrderResult from real state) or ``None`` when the
+        order definitively did not land and a retry is safe.
+        """
+        try:
+            open_orders = await self._request(self._client.open_orders)
+            if isinstance(open_orders, list):
+                for order in open_orders:
+                    if isinstance(order, dict) and order.get("client_order_id") == client_order_id:
+                        return order
+            trades = await self._request(self._client.trade_history, limit=50)
+            if isinstance(trades, dict):
+                trades = trades.get("trades")
+            if isinstance(trades, list):
+                for trade in trades:
+                    if isinstance(trade, dict) and trade.get("client_order_id") == client_order_id:
+                        landed = dict(trade)
+                        landed.setdefault("status", "filled")
+                        return landed
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning(
+                "Thalex landed-check for client_order_id=%s failed: %s — treating as not landed",
+                client_order_id,
+                exc,
+            )
+        return None
 
     async def _submit_conditional_order(
         self,
@@ -1005,15 +1103,13 @@ class ThalexAPI(ExchangeAdapter):
         if isinstance(raw, dict):
             order_id = str(raw.get("order_id") or raw.get("id") or "")
             raw_status = str(raw.get("status") or "ok").lower()
-            # Normalize Thalex status strings to the ExchangeAdapter contract
-            # ("ok | filled | resting | rejected | error"). Thalex uses "open"
-            # for a live resting order and "partially_filled" for a partial
-            # fill — the adapter contract has no equivalents, so we fold them
-            # into the closest canonical values.
+            # Normalize Thalex status strings to the ExchangeAdapter contract.
+            # "open" folds into "resting"; "partially_filled" is preserved as
+            # its own status so callers never treat a partial as a full fill.
             _SUCCESS_RAW = {"open", "filled", "partially_filled", "ok", "resting"}
             _STATUS_MAP = {
                 "open": "resting",
-                "partially_filled": "filled",
+                "partially_filled": "partially_filled",
                 "filled": "filled",
                 "resting": "resting",
                 "ok": "ok",
@@ -1051,7 +1147,7 @@ class ThalexAPI(ExchangeAdapter):
                 ("fill_price",),
                 ("limit_price",),
             ) or price
-        return OrderResult(
+        result = OrderResult(
             venue=self.venue,
             order_id=order_id,
             asset=asset,
@@ -1063,6 +1159,20 @@ class ThalexAPI(ExchangeAdapter):
             raw=raw if isinstance(raw, dict) else None,
             error=error,
         )
+        filled_amount: Optional[float] = None
+        if isinstance(raw, dict):
+            filled_amount = _quote_field(
+                raw,
+                ("filled_amount",),
+                ("filled",),
+                ("fill_amount",),
+                ("cumulative_filled",),
+                ("total_filled",),
+            )
+        if filled_amount is None:
+            filled_amount = amount if status == "filled" else 0.0
+        result.filled_amount = max(min(float(filled_amount), float(amount)), 0.0)
+        return result
 
     async def margin_preflight(self, required_collateral_usd: float) -> tuple[bool, str]:
         """Cheap pre-trade margin check against Thalex account cash collateral.
@@ -1073,16 +1183,20 @@ class ThalexAPI(ExchangeAdapter):
         ``(True, "")`` when the venue has enough collateral, or
         ``(False, reason)`` otherwise.
 
-        Fails open on RPC errors — a flaky account_summary shouldn't block a
-        trade; the order submit itself will still catch a true rejection.
+        Fails CLOSED on RPC errors — if the venue cannot tell us what
+        collateral is available, the order is blocked rather than submitted
+        blind.
         """
         if required_collateral_usd <= 0:
             return True, ""
         try:
             state = await self.get_user_state()
         except Exception as exc:  # pylint: disable=broad-except
-            logger.warning("Thalex margin_preflight: get_user_state failed — allowing trade: %s", exc)
-            return True, ""
+            logger.error(
+                "Thalex margin_preflight: get_user_state failed — blocking order (fail closed): %s",
+                exc,
+            )
+            return False, f"margin preflight failed: account_summary unavailable ({exc})"
         # Prefer the venue's free/available cash fields — ``balance`` on
         # AccountState is portfolio equity (cash + unrealised PnL) and can
         # overstate what's actually unencumbered when positions are eating

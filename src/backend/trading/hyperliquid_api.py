@@ -8,7 +8,10 @@ the trading agent can depend on predictable, non-blocking IO.
 
 import asyncio
 import logging
+import math
+import time
 import aiohttp
+import requests
 from typing import TYPE_CHECKING
 from src.backend.config_loader import CONFIG
 from src.backend.trading.exchange_adapter import ExchangeAdapter
@@ -52,6 +55,7 @@ class HyperliquidAPI(ExchangeAdapter):
                 configuration.
         """
         self._meta_cache = None
+        self._meta_cache_ts = 0.0
         private_key = CONFIG.get("hyperliquid_private_key")
         mnemonic = CONFIG.get("mnemonic")
         
@@ -107,7 +111,7 @@ class HyperliquidAPI(ExchangeAdapter):
         except (ValueError, AttributeError, RuntimeError) as e:
             logging.error("Failed to reset Hyperliquid clients: %s", e)
 
-    async def _retry(self, fn, *args, max_attempts: int = 3, backoff_base: float = 0.5, reset_on_fail: bool = True, to_thread: bool = True, **kwargs):
+    async def _retry(self, fn, *args, max_attempts: int = 3, backoff_base: float = 0.5, reset_on_fail: bool = True, to_thread: bool = True, retry_read_timeout: bool = True, **kwargs):
         """Retry helper with exponential backoff and optional thread offloading.
 
         Args:
@@ -121,6 +125,10 @@ class HyperliquidAPI(ExchangeAdapter):
             reset_on_fail: Whether to rebuild Hyperliquid clients after a
                 failure.
             to_thread: If ``True`` the callable is executed in a worker thread.
+            retry_read_timeout: Pass ``False`` for order-placing calls: a read
+                timeout is ambiguous (the order may have been accepted), so
+                retrying could double-submit. Connection-level failures remain
+                retryable either way.
             **kwargs: Keyword arguments forwarded to ``fn``.
 
         Returns:
@@ -135,7 +143,9 @@ class HyperliquidAPI(ExchangeAdapter):
                 if to_thread:
                     return await asyncio.to_thread(fn, *args, **kwargs)
                 return await fn(*args, **kwargs)
-            except (WebSocketConnectionClosedException, aiohttp.ClientError, ConnectionError, TimeoutError, socket.timeout) as e:
+            except (WebSocketConnectionClosedException, aiohttp.ClientError, requests.exceptions.RequestException, ConnectionError, TimeoutError, socket.timeout) as e:
+                if not retry_read_timeout and isinstance(e, requests.exceptions.ReadTimeout):
+                    raise
                 last_err = e
                 logging.warning("HL call failed (attempt %s/%s): %s", attempt + 1, max_attempts, e)
                 if reset_on_fail:
@@ -153,52 +163,101 @@ class HyperliquidAPI(ExchangeAdapter):
                 break
         raise last_err if last_err else RuntimeError("Hyperliquid retry: unknown error")
 
-    def round_size(self, asset, amount):
-        """Round order size to the asset precision defined by market metadata.
+    async def _get_sz_decimals(self, asset) -> int:
+        """Return ``szDecimals`` for ``asset`` from (TTL-cached) metadata."""
+        data = await self.get_meta_and_ctxs()
+        meta = data[0] if isinstance(data, list) and data else (data or {})
+        universe = meta.get("universe", []) or []
+        asset_info = next((u for u in universe if u.get("name") == asset), None)
+        if asset_info is not None:
+            return int(asset_info.get("szDecimals", 8))
+        return 8
+
+    async def round_size(self, asset, amount):
+        """Floor order size to the asset precision defined by market metadata.
 
         Args:
             asset: Symbol of the market whose contract size we are rounding to.
             amount: Desired contract size before rounding.
 
         Returns:
-            The input ``amount`` rounded to the market's ``szDecimals`` precision.
+            ``amount`` floored to the market's ``szDecimals`` precision so the
+            size never rounds up past margin limits.
         """
-        meta = self._meta_cache[0] if hasattr(self, '_meta_cache') and self._meta_cache else None
-        if meta:
-            universe = meta.get("universe", [])
-            asset_info = next((u for u in universe if u.get("name") == asset), None)
-            if asset_info:
-                decimals = asset_info.get("szDecimals", 8)
-                return round(amount, decimals)
-        return round(amount, 8)
+        decimals = await self._get_sz_decimals(asset)
+        factor = 10 ** decimals
+        return math.floor(round(float(amount) * factor, 9)) / factor
 
-    async def place_buy_order(self, asset, amount, slippage=0.01):
+    async def round_price(self, asset, price):
+        """Align ``price`` to Hyperliquid's perp tick rule.
+
+        Non-integer prices are capped at 5 significant figures and at most
+        ``6 - szDecimals`` decimal places; integer prices are always allowed.
+        """
+        price = float(price)
+        if price <= 0 or price.is_integer():
+            return price
+        sz_decimals = await self._get_sz_decimals(asset)
+        max_decimals = max(6 - sz_decimals, 0)
+        return round(float(f"{price:.5g}"), max_decimals)
+
+    def _resolve_slippage(self, slippage):
+        if slippage is None:
+            return float(CONFIG.get("hl_max_slippage", 0.005))
+        return slippage
+
+    async def place_buy_order(self, asset, amount, slippage=None):
         """Submit a market buy order with exchange-side rounding and retry logic.
 
         Args:
             asset: Market symbol to open.
             amount: Contract size to open before rounding.
-            slippage: Maximum acceptable slippage expressed as a decimal.
+            slippage: Maximum acceptable slippage expressed as a decimal;
+                defaults to ``CONFIG["hl_max_slippage"]`` (0.005).
 
         Returns:
             Raw SDK response from :meth:`Exchange.market_open`.
         """
-        amount = self.round_size(asset, amount)
-        return await self._retry(lambda: self.exchange.market_open(asset, True, amount, None, slippage))
+        slippage = self._resolve_slippage(slippage)
+        amount = await self.round_size(asset, amount)
+        return await self._retry(lambda: self.exchange.market_open(asset, True, amount, None, slippage), retry_read_timeout=False)
 
-    async def place_sell_order(self, asset, amount, slippage=0.01):
+    async def place_sell_order(self, asset, amount, slippage=None):
         """Submit a market sell order with exchange-side rounding and retry logic.
 
         Args:
             asset: Market symbol to open.
             amount: Contract size to open before rounding.
-            slippage: Maximum acceptable slippage expressed as a decimal.
+            slippage: Maximum acceptable slippage expressed as a decimal;
+                defaults to ``CONFIG["hl_max_slippage"]`` (0.005).
 
         Returns:
             Raw SDK response from :meth:`Exchange.market_open`.
         """
-        amount = self.round_size(asset, amount)
-        return await self._retry(lambda: self.exchange.market_open(asset, False, amount, None, slippage))
+        slippage = self._resolve_slippage(slippage)
+        amount = await self.round_size(asset, amount)
+        return await self._retry(lambda: self.exchange.market_open(asset, False, amount, None, slippage), retry_read_timeout=False)
+
+    async def market_close_position(self, coin, size=None):
+        """Close an open position with a reduce-only market order.
+
+        Args:
+            coin: Market symbol whose position should be closed.
+            size: Contract size to close; ``None`` closes the full position
+                using live state sizing inside the SDK.
+
+        Returns:
+            Dict ``{"ok": bool, "error": str, "response": raw_sdk_response}``
+            where ``ok`` reflects :meth:`parse_order_response` validation.
+        """
+        if size is not None:
+            size = await self.round_size(coin, size)
+        slippage = self._resolve_slippage(None)
+        resp = await self._retry(lambda: self.exchange.market_close(coin, size, None, slippage), retry_read_timeout=False)
+        if resp is None:
+            return {"ok": False, "error": f"no open position for {coin}", "response": None}
+        ok, err = self.parse_order_response(resp)
+        return {"ok": ok, "error": err, "response": resp}
 
     async def place_take_profit(self, asset, is_buy, amount, tp_price):
         """Create a reduce-only trigger order that executes a take-profit exit.
@@ -213,9 +272,10 @@ class HyperliquidAPI(ExchangeAdapter):
         Returns:
             Raw SDK response from `Exchange.order`.
         """
-        amount = self.round_size(asset, amount)
+        amount = await self.round_size(asset, amount)
+        tp_price = await self.round_price(asset, tp_price)
         order_type = {"trigger": {"triggerPx": tp_price, "isMarket": True, "tpsl": "tp"}}
-        return await self._retry(lambda: self.exchange.order(asset, not is_buy, amount, tp_price, order_type, True))
+        return await self._retry(lambda: self.exchange.order(asset, not is_buy, amount, tp_price, order_type, True), retry_read_timeout=False)
 
     async def place_stop_loss(self, asset, is_buy, amount, sl_price):
         """Create a reduce-only trigger order that executes a stop-loss exit.
@@ -230,9 +290,10 @@ class HyperliquidAPI(ExchangeAdapter):
         Returns:
             Raw SDK response from `Exchange.order`.
         """
-        amount = self.round_size(asset, amount)
+        amount = await self.round_size(asset, amount)
+        sl_price = await self.round_price(asset, sl_price)
         order_type = {"trigger": {"triggerPx": sl_price, "isMarket": True, "tpsl": "sl"}}
-        return await self._retry(lambda: self.exchange.order(asset, not is_buy, amount, sl_price, order_type, True))
+        return await self._retry(lambda: self.exchange.order(asset, not is_buy, amount, sl_price, order_type, True), retry_read_timeout=False)
 
     async def cancel_order(self, asset, oid):
         """Cancel a single order by identifier for a given asset.
@@ -301,7 +362,12 @@ class HyperliquidAPI(ExchangeAdapter):
             else:
                 return []
             if isinstance(fills, list):
-                return fills[-limit:]
+                ordered = sorted(
+                    fills,
+                    key=lambda f: f.get("time", 0) if isinstance(f, dict) else 0,
+                    reverse=True,
+                )
+                return ordered[:limit]
             return []
         except (RuntimeError, ValueError, KeyError, ConnectionError, AttributeError) as e:
             logging.error("Get recent fills error: %s", e)
@@ -398,11 +464,23 @@ class HyperliquidAPI(ExchangeAdapter):
         """
         state = await self._retry(lambda: self.info.user_state(self.wallet.address))
         if not isinstance(state, dict):
-            return {"withdrawable": 0.0, "account_value": 0.0, "total_margin_used": 0.0, "free_margin": 0.0}
+            raise RuntimeError(f"Hyperliquid user_state returned non-dict payload: {state!r}")
         margin_summary = state.get("marginSummary") if isinstance(state.get("marginSummary"), dict) else {}
+        cross_margin_summary = (
+            state.get("crossMarginSummary") if isinstance(state.get("crossMarginSummary"), dict) else {}
+        )
         withdrawable = float(state.get("withdrawable") or 0.0)
-        account_value = float(margin_summary.get("accountValue") or state.get("accountValue") or 0.0)
-        total_margin_used = float(margin_summary.get("totalMarginUsed") or 0.0)
+        account_value = float(
+            margin_summary.get("accountValue")
+            or cross_margin_summary.get("accountValue")
+            or state.get("accountValue")
+            or 0.0
+        )
+        total_margin_used = float(
+            margin_summary.get("totalMarginUsed")
+            or cross_margin_summary.get("totalMarginUsed")
+            or 0.0
+        )
         return {
             "withdrawable": withdrawable,
             "account_value": account_value,
@@ -500,15 +578,29 @@ class HyperliquidAPI(ExchangeAdapter):
         return candles
 
     async def get_meta_and_ctxs(self):
-        """Return cached meta/context information, fetching once per lifecycle.
+        """Return meta/context information with a TTL-managed cache.
+
+        The cache is refreshed when older than
+        ``CONFIG["hl_meta_cache_ttl_seconds"]`` (default 60). If a refresh
+        fails the stale copy keeps being served (logged); the initial fetch
+        propagates errors.
 
         Returns:
-            Cached metadata response as returned by
-            :meth:`Info.meta_and_asset_ctxs`.
+            Metadata response as returned by :meth:`Info.meta_and_asset_ctxs`.
         """
-        if not self._meta_cache:
+        ttl = float(CONFIG.get("hl_meta_cache_ttl_seconds", 60))
+        now = time.monotonic()
+        if self._meta_cache and (now - self._meta_cache_ts) < ttl:
+            return self._meta_cache
+        try:
             response = await self._retry(self.info.meta_and_asset_ctxs)
-            self._meta_cache = response
+        except Exception as e:
+            if not self._meta_cache:
+                raise
+            logging.warning("meta_and_asset_ctxs refresh failed; serving stale cache: %s", e)
+            return self._meta_cache
+        self._meta_cache = response
+        self._meta_cache_ts = now
         return self._meta_cache
 
     async def _get_asset_ctx(self, asset: str) -> dict | None:

@@ -306,6 +306,12 @@ class TradingBotEngine:
         self.pause_reason: Optional[str] = None
         self.peak_account_value: float = 0.0
         self._execution_failure_streak: int = 0
+        # Drawdown state persisted across restarts so the high-water mark and
+        # daily loss limit can't be reset by bouncing the process.
+        self._risk_state_path = Path("data/risk_state.json")
+        self._risk_day: Optional[str] = None
+        self._day_start_value: float = 0.0
+        self._load_risk_state()
 
         # Manual trading mode
         self.trading_mode = CONFIG.get("trading_mode", "auto").lower()
@@ -372,6 +378,31 @@ class TradingBotEngine:
         except Exception as exc:  # pylint: disable=broad-except
             self.logger.warning("Failed to save active_trades.json: %s", exc)
 
+    def _load_risk_state(self) -> None:
+        try:
+            if self._risk_state_path.exists():
+                with open(self._risk_state_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    self.peak_account_value = float(data.get("peak_account_value") or 0.0)
+                    self._risk_day = data.get("day")
+                    self._day_start_value = float(data.get("day_start_value") or 0.0)
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.warning("Failed to load risk_state.json: %s", exc)
+
+    def _save_risk_state(self) -> None:
+        try:
+            path = self._risk_state_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "peak_account_value": self.peak_account_value,
+                    "day": self._risk_day,
+                    "day_start_value": self._day_start_value,
+                }, f)
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.warning("Failed to save risk_state.json: %s", exc)
+
     async def _get_max_leverage_cached(self, asset: str) -> int:
         """Return cached max leverage for ``asset``. Falls back to 1 on failure."""
         if asset in self._max_leverage_cache:
@@ -395,10 +426,12 @@ class TradingBotEngine:
         """
         if not self.hyperliquid:
             return {}
+        lookup_failed = False
         try:
             info = await self.hyperliquid.get_free_margin_info()
         except Exception as exc:  # pylint: disable=broad-except
-            self.logger.warning("buying_power snapshot: get_free_margin_info failed: %s", exc)
+            self.logger.error("buying_power snapshot: get_free_margin_info failed: %s", exc)
+            lookup_failed = True
             info = {"withdrawable": 0.0, "free_margin": 0.0, "account_value": 0.0, "total_margin_used": 0.0}
 
         withdrawable = float(info.get("withdrawable") or 0.0)
@@ -406,6 +439,15 @@ class TradingBotEngine:
         # Mirror preflight: pick the conservative positive value as "what we can open with".
         candidates = [v for v in (withdrawable, free_margin) if v and v > 0]
         available = min(candidates) if candidates else 0.0
+
+        account_value = float(info.get("account_value") or 0.0)
+        state_balance = float(getattr(getattr(self, "state", None), "balance", 0.0) or 0.0)
+        if not lookup_failed and available <= 0 and (account_value > 0 or state_balance > 0):
+            self.logger.error(
+                "buying_power snapshot: zero available margin with nonzero account "
+                "value (%.2f) — possible margin-parse gap, trading will stall",
+                account_value or state_balance,
+            )
 
         max_leverage_by_asset: Dict[str, int] = {}
         max_new_notional_by_asset: Dict[str, float] = {}
@@ -417,14 +459,169 @@ class TradingBotEngine:
             # the LLM picks at-or-below this will pass the guard.
             max_new_notional_by_asset[asset] = round((available * lev) / 1.05, 2) if available > 0 else 0.0
 
-        return {
+        snapshot = {
             "withdrawable": round(withdrawable, 2),
             "free_margin": round(free_margin, 2),
-            "account_value": round(float(info.get("account_value") or 0.0), 2),
+            "account_value": round(account_value, 2),
             "total_margin_used": round(float(info.get("total_margin_used") or 0.0), 2),
             "max_leverage_by_asset": max_leverage_by_asset,
             "max_new_notional_by_asset": max_new_notional_by_asset,
         }
+        if lookup_failed:
+            snapshot["error"] = "buying_power_lookup_failed"
+        return snapshot
+
+    @staticmethod
+    def _validate_risk_levels(
+        action: str,
+        current_price: float,
+        tp_price: Optional[float],
+        sl_price: Optional[float],
+    ) -> Optional[str]:
+        """Return a rejection reason when TP/SL levels are missing or inverted."""
+        if sl_price is None:
+            return "missing sl_price (a stop is mandatory for any new exposure)"
+        sl = float(sl_price)
+        tp = float(tp_price) if tp_price is not None else None
+        if action == 'buy':
+            if sl >= current_price:
+                return f"sl_price {sl} must be below entry {current_price} for a buy"
+            if tp is not None and tp <= current_price:
+                return f"tp_price {tp} must be above entry {current_price} for a buy"
+        else:
+            if sl <= current_price:
+                return f"sl_price {sl} must be above entry {current_price} for a sell"
+            if tp is not None and tp >= current_price:
+                return f"tp_price {tp} must be below entry {current_price} for a sell"
+        return None
+
+    def _clamp_allocation(
+        self,
+        asset: str,
+        action: str,
+        allocation: float,
+        current_price: float,
+        sl_price: float,
+        existing_pos: float,
+    ) -> tuple[float, List[str]]:
+        """Enforce per-trade risk and gross-leverage caps in code.
+
+        Risk cap: the loss at sl_price may not exceed MAX_RISK_PER_TRADE_PCT
+        of account value. Gross cap: total HL notional (other assets, plus
+        this asset's kept notional on same-direction adds) plus the new
+        allocation may not exceed account value × MAX_GROSS_LEVERAGE.
+        """
+        notes: List[str] = []
+        equity = float(self.state.total_value or 0.0)
+        if allocation <= 0 or equity <= 0 or current_price <= 0:
+            return allocation, notes
+
+        risk_pct_cfg = CONFIG.get("max_risk_per_trade_pct")
+        risk_pct = float(risk_pct_cfg) if risk_pct_cfg is not None else 1.0
+        stop_distance = abs(current_price - float(sl_price)) / current_price
+        if risk_pct > 0 and stop_distance > 0:
+            risk_cap = equity * (risk_pct / 100.0) / stop_distance
+            if allocation > risk_cap:
+                notes.append(
+                    f"allocation clamped ${allocation:,.0f} -> ${risk_cap:,.0f} "
+                    f"({risk_pct}% risk cap at {stop_distance*100:.2f}% stop distance)"
+                )
+                allocation = risk_cap
+
+        max_gross_cfg = CONFIG.get("max_gross_leverage")
+        max_gross = float(max_gross_cfg) if max_gross_cfg is not None else 3.0
+        if max_gross > 0:
+            gross_other = 0.0
+            for pos in self.state.positions:
+                if (pos.get("venue") or "hyperliquid") != "hyperliquid":
+                    continue
+                qty = abs(float(pos.get("quantity") or 0.0))
+                px = float(pos.get("current_price") or 0.0)
+                if qty <= 0 or px <= 0:
+                    continue
+                if pos.get("symbol") == asset:
+                    is_add = (action == 'buy' and existing_pos > 0) or (
+                        action == 'sell' and existing_pos < 0
+                    )
+                    if is_add:
+                        gross_other += qty * px
+                    continue
+                gross_other += qty * px
+            gross_cap = equity * max_gross - gross_other
+            if gross_cap <= 0:
+                notes.append(
+                    f"gross exposure ${gross_other:,.0f} already at/above "
+                    f"{max_gross}x equity cap; allocation -> 0"
+                )
+                return 0.0, notes
+            if allocation > gross_cap:
+                notes.append(
+                    f"allocation clamped ${allocation:,.0f} -> ${gross_cap:,.0f} "
+                    f"({max_gross}x gross leverage cap)"
+                )
+                allocation = gross_cap
+
+        return allocation, notes
+
+    async def _enforce_stop_coverage(
+        self,
+        hl_positions: List[Dict],
+        open_orders: List[Dict],
+    ) -> None:
+        """Ensure every bot-opened HL position keeps a full-size stop on-exchange."""
+        for pos in hl_positions:
+            asset = pos.get("symbol")
+            qty = float(pos.get("quantity") or 0.0)
+            mark = float(pos.get("current_price") or 0.0)
+            if not asset or abs(qty) < 1e-12 or mark <= 0:
+                continue
+            trade = next(
+                (
+                    t for t in self.active_trades
+                    if t.get("asset") == asset
+                    and (t.get("venue") or "hyperliquid") == "hyperliquid"
+                ),
+                None,
+            )
+            if trade is None:
+                continue
+            is_long = qty > 0
+            stop_size = 0.0
+            for order in open_orders:
+                if order.get("coin") != asset or order.get("order_type") != "trigger":
+                    continue
+                if order.get("is_buy") != (not is_long):
+                    continue
+                trigger = order.get("trigger_price")
+                if trigger is None:
+                    continue
+                if (is_long and trigger < mark) or (not is_long and trigger > mark):
+                    stop_size += float(order.get("size") or 0.0)
+            if stop_size >= abs(qty) * 0.99:
+                continue
+            missing = abs(qty) - stop_size
+            sl_price = trade.get("sl_price")
+            if sl_price:
+                try:
+                    await self.hyperliquid.place_stop_loss(asset, is_long, missing, sl_price)
+                    self.logger.warning(
+                        "Stop-coverage: re-placed missing SL for %s (%.6f @ %s)",
+                        asset, missing, sl_price,
+                    )
+                    continue
+                except Exception as exc:  # pylint: disable=broad-except
+                    self.logger.error(
+                        "Stop-coverage: failed to re-place SL for %s: %s", asset, exc,
+                    )
+            self._write_diary_entry({
+                'timestamp': datetime.now(UTC).isoformat(),
+                'asset': asset,
+                'action': 'position_without_stop',
+                'quantity': qty,
+                'stop_size_on_exchange': stop_size,
+                'sl_price': sl_price,
+                'note': 'live position not fully covered by a stop order',
+            })
 
     async def _hl_margin_preflight(self, asset: str, notional_usd: float) -> None:
         """Raise :class:`RuntimeError` if Hyperliquid can't cover the notional.
@@ -559,6 +756,10 @@ class TradingBotEngine:
         resolution, leg orders, and the perp delta hedge.
         """
         self._last_thalex_execution = {}
+        if getattr(self, "is_paused", False):
+            message = f"trading is paused ({getattr(self, 'pause_reason', None) or 'circuit breaker'})"
+            self.logger.warning("Thalex decision refused: %s", message)
+            return False, message
         if self.options_executor is None or self.thalex is None:
             message = f"Thalex venue is not configured: {decision_payload}"
             self.logger.warning(message)
@@ -1096,11 +1297,10 @@ class TradingBotEngine:
         except Exception as exc:  # pylint: disable=broad-except
             self.logger.warning("Deribit mark price history fetch failed: %s", exc)
 
-        # Fallbacks: bot's intraday history, then a flat placeholder.
-        # price_history stores {'t': ts, 'mid': price} dicts — extract the float.
-        intraday = list(self.price_history.get("BTC", []))
-        if intraday:
-            return [p['mid'] if isinstance(p, dict) else p for p in intraday[-days:]]
+        # Fallback: flat placeholder — RV computes to 0 and the regime
+        # classifier reports 'unknown'. Intraday mids are NOT substituted
+        # here: 5-minute samples fed into a daily-annualized RV formula
+        # understate vol ~17x and would bias the regime toward 'rich'.
         return [60000.0] * days
 
     async def _fetch_btc_first_hour_minutes(self, deribit) -> list:
@@ -1164,6 +1364,12 @@ class TradingBotEngine:
         """
         if self._latest_options_context is None:
             self.logger.info("OptionsContext not yet available; skipping decision cycle")
+            return
+        if getattr(self, "is_paused", False):
+            self.logger.info(
+                "[PAUSED] Skipping options decision cycle — %s",
+                getattr(self, "pause_reason", None) or "no reason set",
+            )
             return
         if events:
             try:
@@ -1547,18 +1753,19 @@ class TradingBotEngine:
             now = datetime.now(timezone.utc)
             now_ms = int(now.timestamp() * 1000)
 
-            # 5m powers the LLM intraday context. 200 bars = ~16.7h is
-            # plenty for Keltner(130,4) warmup + recent history.
-            candles_needed_5m = 200
+            # 800 bars ≈ 66.7h: enough for full EMA(130) convergence
+            # (5×period past the SMA seed) and guarantees the opening-range
+            # window (up to 24h15m old) is always inside the fetched range.
+            candles_needed_5m = 800
             start_5m_ms = now_ms - candles_needed_5m * 5 * 60 * 1000
 
             # Daily candles from the AVWAP anchor (2026-01-01)
             start_daily_ms = AVWAP_ANCHOR_MS
 
-            # Long-term candles: need ~131 bars at the configured interval
+            # Long-term candles: 800 bars for full EMA(130) convergence.
             interval_minutes = {"1m": 1, "5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440}
             lt_bar_mins = interval_minutes.get(interval, 240)
-            start_long_ms = now_ms - 200 * lt_bar_mins * 60 * 1000
+            start_long_ms = now_ms - 800 * lt_bar_mins * 60 * 1000
 
             # 15m candles power the Open Range & Keltner chart. 2130 bars
             # ≈ 533h: 2000 displayed plus 130 for Keltner warmup so the
@@ -1573,6 +1780,17 @@ class TradingBotEngine:
                 self.hyperliquid.get_candles(asset, interval, start_long_ms, now_ms),
                 self.hyperliquid.get_candles(asset, "15m", start_15m_ms, now_ms),
             )
+
+            # Drop the still-forming bar so indicators never repaint on a
+            # partial candle. Spot is supplied separately via current_spot.
+            def _closed_only(candles, bar_minutes):
+                bar_ms = bar_minutes * 60 * 1000
+                closed = [c for c in (candles or []) if (c.get("t") or 0) + bar_ms <= now_ms]
+                return closed or list(candles or [])
+
+            candles_5m = _closed_only(candles_5m, 5)
+            candles_long = _closed_only(candles_long, lt_bar_mins)
+            candles_15m = _closed_only(candles_15m, 15)
 
             if not candles_5m:
                 raise ValueError(f"Hyperliquid returned no 5m candles for {asset}")
@@ -1697,7 +1915,12 @@ class TradingBotEngine:
                             self.logger.error(f"Error enriching position for {symbol}: {e}")
 
                     # ===== PHASE 3: Load Recent Diary =====
-                    recent_diary = self._load_recent_diary(limit=10)
+                    # Split the LLM's memory into "recent chatter" (last few
+                    # entries, mostly holds) and "trade events" (entries,
+                    # closes with realized PnL, failures) so outcomes don't
+                    # scroll out of a hold-flooded window within minutes.
+                    recent_diary = self._load_recent_diary(limit=6)
+                    recent_trade_events = self._load_recent_trade_events(limit=12)
 
                     # ===== PHASE 4: Fetch Open Orders =====
                     open_orders_raw = await self.hyperliquid.get_open_orders()
@@ -1745,10 +1968,15 @@ class TradingBotEngine:
                     self.state.positions = combined_positions
                     self.state.active_trades = list(self.active_trades)
 
+                    try:
+                        await self._enforce_stop_coverage(hyperliquid_only_positions, open_orders)
+                    except Exception as exc:  # pylint: disable=broad-except
+                        self.logger.error("Stop-coverage check failed: %s", exc)
+
                     # ===== PHASE 6: Fetch Recent Fills =====
                     fills_raw = await self.hyperliquid.get_recent_fills(limit=50)
                     recent_fills = []
-                    for fill in fills_raw[-20:]:
+                    for fill in fills_raw[:20]:
                         ts = fill.get('time')
                         if ts and ts > 1_000_000_000_000:
                             ts = ts / 1000
@@ -1759,7 +1987,10 @@ class TradingBotEngine:
                             'coin': fill.get('coin'),
                             'is_buy': fill.get('side') == 'B',
                             'size': float(fill.get('sz', 0)),
-                            'price': float(fill.get('px', 0))
+                            'price': float(fill.get('px', 0)),
+                            'closed_pnl': float(fill.get('closedPnl', 0) or 0),
+                            'fee': float(fill.get('fee', 0) or 0),
+                            'dir': fill.get('dir'),
                         })
 
                     self.state.recent_fills = recent_fills
@@ -1785,6 +2016,7 @@ class TradingBotEngine:
                         'active_trades': self.active_trades,
                         'open_orders': open_orders,
                         'recent_diary': recent_diary,
+                        'recent_trade_events': recent_trade_events,
                         'recent_fills': recent_fills
                     }
 
@@ -1794,6 +2026,8 @@ class TradingBotEngine:
                         try:
                             # Current price
                             current_price = await self.hyperliquid.get_current_price(asset)
+                            if not current_price or float(current_price) <= 0:
+                                raise ValueError(f"invalid current price {current_price!r}")
 
                             # Store price history
                             self.price_history[asset].append({
@@ -1808,7 +2042,7 @@ class TradingBotEngine:
                             volume_24h = await self.hyperliquid.get_daily_notional_volume(asset)
 
                             # --- Hyperliquid-first indicator fetch ---
-                            interval = CONFIG.get("interval", "4h")
+                            interval = CONFIG.get("analysis_interval") or "4h"
                             indicators = await self._fetch_indicators_hl_first(
                                 asset, interval, current_price,
                             )
@@ -1926,7 +2160,7 @@ class TradingBotEngine:
                                 "prev_day_price": prev_day_price,
                                 "volume_24h": volume_24h,
                                 "funding_rate": funding,
-                                "funding_annualized_pct": funding * 24 * 365 * 100 if funding else None,
+                                "funding_annualized_pct": funding * 24 * 365 * 100 if funding is not None else None,
                                 "recent_mid_prices": [p['mid'] for p in recent_price_points],
                                 "recent_timestamps": recent_timestamps,
                             }
@@ -1956,6 +2190,38 @@ class TradingBotEngine:
                         except Exception as e:
                             self.logger.error(f"Error gathering market data for {asset}: {e}")
 
+                    # Snapshot validation: never ask the LLM to decide on an
+                    # asset whose market data failed to build — a decision on
+                    # nulls is noise with real fees.
+                    def _section_valid(s: Dict) -> bool:
+                        price = s.get("current_price")
+                        if not price or float(price) <= 0:
+                            return False
+                        intraday = s.get("intraday") or {}
+                        keltner = intraday.get("keltner") or {}
+                        return intraday.get("sma99") is not None and keltner.get("middle") is not None
+
+                    valid_sections = {s["asset"] for s in market_sections if _section_valid(s)}
+                    decidable_assets = [a for a in self.assets if a in valid_sections]
+                    excluded_assets = [a for a in self.assets if a not in valid_sections]
+                    if excluded_assets:
+                        self.logger.warning(
+                            "Assets excluded from this decision cycle (invalid/missing market data): %s",
+                            excluded_assets,
+                        )
+                    if not decidable_assets:
+                        self.logger.error("No asset has a valid market snapshot; skipping LLM cycle")
+                        self._write_diary_entry({
+                            'timestamp': datetime.now(UTC).isoformat(),
+                            'action': 'cycle_skipped_no_data',
+                            'excluded_assets': excluded_assets,
+                        })
+                        self.state.market_data = market_sections
+                        self.state.last_update = datetime.now(UTC).isoformat()
+                        self._notify_state_update()
+                        await asyncio.sleep(self._get_interval_seconds())
+                        continue
+
                     perps_account = dict(dashboard)
                     perps_account["positions"] = [
                         {k: v for k, v in pos.items() if k not in ("closable", "row_id")}
@@ -1969,14 +2235,16 @@ class TradingBotEngine:
                     # the GUI chart display.
                     _llm_sections = []
                     for _s in market_sections:
+                        if _s["asset"] not in decidable_assets:
+                            continue
                         _s_copy = dict(_s)
-                        _s_copy.pop("series", None)
                         _s_copy.pop("recent_mid_prices", None)
                         _s_copy.pop("recent_timestamps", None)
-                        if "chart_intraday" in _s_copy:
-                            _chart = dict(_s_copy["chart_intraday"])
-                            _chart.pop("series", None)
-                            _s_copy["chart_intraday"] = _chart
+                        for _frame_key in ("intraday", "long_term", "chart_intraday"):
+                            if _frame_key in _s_copy:
+                                _frame = dict(_s_copy[_frame_key])
+                                _frame.pop("series", None)
+                                _s_copy[_frame_key] = _frame
                         _llm_sections.append(_s_copy)
 
                     context_payload = OrderedDict([
@@ -1987,8 +2255,12 @@ class TradingBotEngine:
                         ("account", perps_account),
                         ("market_data", _llm_sections),
                         ("instructions", {
-                            "assets": self.assets,
-                            "note": "Follow the system prompt guidelines strictly"
+                            "assets": decidable_assets,
+                            "note": "Follow the system prompt guidelines strictly",
+                            **(
+                                {"data_unavailable_assets": excluded_assets}
+                                if excluded_assets else {}
+                            ),
                         })
                     ])
 
@@ -2003,7 +2275,7 @@ class TradingBotEngine:
 
                     # ===== PHASE 10: Get LLM Decision =====
                     decisions = await asyncio.to_thread(
-                        self.agent.decide_trade, self.assets, context
+                        self.agent.decide_trade, decidable_assets, context
                     )
 
                     # Validate and retry if needed
@@ -2014,7 +2286,7 @@ class TradingBotEngine:
                             "No markdown, no explanation.\n\n" + context
                         )
                         decisions = await asyncio.to_thread(
-                            self.agent.decide_trade, self.assets, strict_context
+                            self.agent.decide_trade, decidable_assets, strict_context
                         )
 
                     # Check for all-hold with parse errors
@@ -2025,7 +2297,7 @@ class TradingBotEngine:
                     ):
                         self.logger.warning("All holds with parse errors, retrying...")
                         decisions = await asyncio.to_thread(
-                            self.agent.decide_trade, self.assets, context
+                            self.agent.decide_trade, decidable_assets, context
                         )
                         trade_decisions = decisions.get('trade_decisions', [])
 
@@ -2041,7 +2313,7 @@ class TradingBotEngine:
                     # ===== PHASE 11: Execute Trades or Create Proposals =====
                     for decision in trade_decisions:
                         asset = decision.get('asset')
-                        if asset not in self.assets:
+                        if asset not in decidable_assets:
                             continue
 
                         if (decision.get('venue') or 'hyperliquid').lower() == 'thalex':
@@ -2136,12 +2408,6 @@ class TradingBotEngine:
                                 if not current_price or current_price <= 0:
                                     self.logger.error(f"Skipping {action} {asset}: invalid price {current_price}")
                                     continue
-                                desired_size = allocation / current_price
-
-                                # --- Cancel stale orders for this asset ---
-                                cancel_result = await self.hyperliquid.cancel_all_orders(asset)
-                                if cancel_result.get('cancelled_count', 0) > 0:
-                                    self.logger.info(f"Cancelled {cancel_result['cancelled_count']} stale order(s) for {asset}")
 
                                 # --- Position-aware sizing ---
                                 # Look up existing position so we account for
@@ -2151,6 +2417,36 @@ class TradingBotEngine:
                                     if pos.get('symbol') == asset:
                                         existing_pos = float(pos.get('quantity', 0) or 0)
                                         break
+
+                                # --- Risk gate: mandatory stop, sane levels,
+                                # code-enforced sizing caps ---
+                                clamp_notes: List[str] = []
+                                if allocation > 0:
+                                    reject_reason = self._validate_risk_levels(
+                                        action, current_price, tp_price, sl_price
+                                    )
+                                    if reject_reason:
+                                        self.logger.warning(
+                                            f"[RISK-REJECT] {action.upper()} {asset}: {reject_reason}"
+                                        )
+                                        self._write_diary_entry({
+                                            'timestamp': datetime.now(UTC).isoformat(),
+                                            'asset': asset,
+                                            'action': 'decision_rejected',
+                                            'proposed_action': action,
+                                            'proposed_allocation_usd': allocation,
+                                            'reason': reject_reason,
+                                            'rationale': rationale,
+                                        })
+                                        continue
+                                    allocation, clamp_notes = self._clamp_allocation(
+                                        asset, action, allocation, current_price,
+                                        float(sl_price), existing_pos,
+                                    )
+                                    for note in clamp_notes:
+                                        self.logger.warning(f"[RISK-CLAMP] {asset}: {note}")
+
+                                desired_size = allocation / current_price
 
                                 # Determine required order size.
                                 # BUY with existing short (-0.165): must buy
@@ -2173,10 +2469,19 @@ class TradingBotEngine:
                                 else:
                                     amount = desired_size
 
-                                # The resulting position size is the new
-                                # directional exposure (after closing the old
-                                # position).  TP/SL should protect only this.
+                                if amount <= 0:
+                                    self.logger.info(
+                                        f"{asset}: {action} resolves to zero order size — "
+                                        f"no-op; existing position, orders, and trade "
+                                        f"record left untouched"
+                                    )
+                                    continue
+
                                 net_new_amount = desired_size
+                                resulting_size = (
+                                    existing_pos + amount if action == 'buy'
+                                    else existing_pos - amount
+                                )
                                 order_result = None
                                 filled = False
 
@@ -2199,6 +2504,8 @@ class TradingBotEngine:
                                         asset, net_new_amount * current_price
                                     )
 
+                                    order_time_ms = int(datetime.now(UTC).timestamp() * 1000)
+
                                     # Place market order
                                     if action == 'buy':
                                         order_result = await self.hyperliquid.place_buy_order(asset, amount)
@@ -2219,24 +2526,41 @@ class TradingBotEngine:
                                     self.logger.info(f"Executed {action} {asset}: {amount:.6f} @ {current_price}")
                                     self._record_execution_success()
 
+                                    # Cancel stale TP/SL only AFTER the new
+                                    # order is accepted — cancelling first
+                                    # left the old position naked whenever
+                                    # preflight or the order itself failed.
+                                    try:
+                                        cancel_result = await self.hyperliquid.cancel_all_orders(asset)
+                                        if cancel_result.get('cancelled_count', 0) > 0:
+                                            self.logger.info(
+                                                f"Cancelled {cancel_result['cancelled_count']} stale order(s) for {asset}"
+                                            )
+                                    except Exception as exc:  # pylint: disable=broad-except
+                                        self.logger.error(f"Failed to cancel stale orders for {asset}: {exc}")
+
                                     # Wait and check fills
                                     await asyncio.sleep(1)
-                                    recent_fills_check = await self.hyperliquid.get_recent_fills(limit=5)
-                                    filled = any(
-                                        f.get('coin') == asset and
-                                        abs(float(f.get('sz', 0)) - amount) < 0.0001
+                                    recent_fills_check = await self.hyperliquid.get_recent_fills(limit=10)
+                                    filled_size = sum(
+                                        float(f.get('sz', 0) or 0)
                                         for f in recent_fills_check
+                                        if f.get('coin') == asset
+                                        and float(f.get('time') or 0) >= order_time_ms - 2000
                                     )
+                                    filled = filled_size >= amount * 0.99
 
-                                # Place TP/SL orders on the NEW position only
+                                # Protect the FULL resulting position, not just
+                                # the newly-added tranche.
+                                protect_size = abs(resulting_size)
+                                is_long_result = resulting_size > 0
                                 tp_oid = None
                                 sl_oid = None
 
-                                if tp_price and net_new_amount > 0:
+                                if tp_price and protect_size > 1e-12:
                                     try:
-                                        is_buy = (action == 'buy')
                                         tp_order = await self.hyperliquid.place_take_profit(
-                                            asset, is_buy, net_new_amount, tp_price
+                                            asset, is_long_result, protect_size, tp_price
                                         )
                                         oids = self.hyperliquid.extract_oids(tp_order)
                                         tp_oid = oids[0] if oids else None
@@ -2244,30 +2568,37 @@ class TradingBotEngine:
                                     except Exception as e:
                                         self.logger.error(f"Failed to place TP: {e}")
 
-                                if sl_price and net_new_amount > 0:
+                                if sl_price and protect_size > 1e-12:
                                     try:
-                                        is_buy = (action == 'buy')
                                         sl_order = await self.hyperliquid.place_stop_loss(
-                                            asset, is_buy, net_new_amount, sl_price
+                                            asset, is_long_result, protect_size, sl_price
                                         )
                                         oids = self.hyperliquid.extract_oids(sl_order)
                                         sl_oid = oids[0] if oids else None
                                         self.logger.info(f"Placed SL order for {asset} @ {sl_price}")
                                     except Exception as e:
                                         self.logger.error(f"Failed to place SL: {e}")
+                                        self._write_diary_entry({
+                                            'timestamp': datetime.now(UTC).isoformat(),
+                                            'asset': asset,
+                                            'action': 'stop_placement_failed',
+                                            'sl_price': sl_price,
+                                            'size': protect_size,
+                                            'reason': str(e),
+                                        })
 
                                 # Update active trades
                                 self.active_trades = [
                                     t for t in self.active_trades if t['asset'] != asset
                                 ]
-                                if net_new_amount > 0:
+                                if protect_size > 1e-12:
                                     self.active_trades.append({
                                         'venue': 'hyperliquid',
                                         'asset': asset,
                                         'instrument_name': asset,
                                         'instrument_names': [asset],
-                                        'is_long': (action == 'buy'),
-                                        'amount': net_new_amount,
+                                        'is_long': is_long_result,
+                                        'amount': protect_size,
                                         'entry_price': current_price,
                                         'tp_oid': tp_oid,
                                         'sl_oid': sl_oid,
@@ -2293,6 +2624,8 @@ class TradingBotEngine:
                                     'amount': amount,
                                     'existing_position': existing_pos,
                                     'net_new_amount': net_new_amount,
+                                    'resulting_position': resulting_size,
+                                    'risk_clamps': clamp_notes or None,
                                     'entry_price': current_price,
                                     'tp_price': tp_price,
                                     'tp_oid': tp_oid,
@@ -2418,6 +2751,7 @@ class TradingBotEngine:
         }
 
         removed = []
+        removed_trades = []
         for trade in self.active_trades[:]:
             venue = (trade.get('venue') or 'hyperliquid').lower()
             if venue == 'thalex':
@@ -2438,16 +2772,129 @@ class TradingBotEngine:
             if not is_live:
                 self.active_trades.remove(trade)
                 removed.append(trade.get('instrument_name') or trade['asset'])
+                removed_trades.append(trade)
 
         if removed:
             self.logger.info(f"Reconciled: removed stale trades for {removed}")
             self._save_active_trades()
+            for trade in removed_trades:
+                try:
+                    await self._book_closed_trade(trade)
+                except Exception as exc:  # pylint: disable=broad-except
+                    self.logger.error(
+                        "Failed to book closed trade for %s: %s",
+                        trade.get('asset'), exc,
+                    )
+
+    async def _book_closed_trade(self, trade: Dict) -> None:
+        """Book the realized outcome of a trade the exchange has closed.
+
+        Joins the removed trade record against exchange fills to compute
+        realized PnL net of fees, writes a ``trade_closed`` diary entry (the
+        LLM's outcome feedback), and persists a closed Trade row.
+        """
+        asset = trade.get('asset')
+        venue = (trade.get('venue') or 'hyperliquid').lower()
+        now_iso = datetime.now(UTC).isoformat()
+
+        if venue != 'hyperliquid':
             self._write_diary_entry({
-                'timestamp': datetime.now(UTC).isoformat(),
-                'action': 'reconcile',
-                'removed_assets': removed,
-                'note': 'Position no longer exists on exchange'
+                'timestamp': now_iso,
+                'venue': venue,
+                'asset': asset,
+                'action': 'trade_closed',
+                'instrument_names': trade.get('instrument_names'),
+                'strategy': trade.get('strategy'),
+                'opened_at': trade.get('opened_at'),
+                'note': 'closed/expired on venue; realized PnL not tracked for options yet',
             })
+            return
+
+        opened_at_ms = 0
+        opened_at_raw = trade.get('opened_at')
+        if opened_at_raw:
+            try:
+                opened_at_ms = int(datetime.fromisoformat(str(opened_at_raw)).timestamp() * 1000)
+            except (ValueError, TypeError):
+                pass
+
+        fills = []
+        try:
+            fills = await self.hyperliquid.get_recent_fills(limit=200)
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.warning("trade_closed booking: fills fetch failed: %s", exc)
+
+        relevant = [
+            f for f in (fills or [])
+            if f.get('coin') == asset and float(f.get('time') or 0) >= opened_at_ms
+        ]
+        realized_gross = sum(float(f.get('closedPnl', 0) or 0) for f in relevant)
+        fees = sum(float(f.get('fee', 0) or 0) for f in relevant)
+        realized_net = realized_gross - fees
+
+        exit_price = 0.0
+        closing_fills = [f for f in relevant if float(f.get('closedPnl', 0) or 0) != 0]
+        source = closing_fills or relevant
+        if source:
+            newest = max(source, key=lambda f: float(f.get('time') or 0))
+            exit_price = float(newest.get('px', 0) or 0)
+
+        entry_price = float(trade.get('entry_price') or 0.0)
+        amount = float(trade.get('amount') or 0.0)
+        entry_value = entry_price * amount
+        pnl_pct = (realized_net / entry_value * 100.0) if entry_value > 0 else 0.0
+
+        tp_price = trade.get('tp_price')
+        sl_price = trade.get('sl_price')
+        exit_reason = 'closed'
+        if tp_price and exit_price and abs(exit_price - float(tp_price)) / float(tp_price) < 0.003:
+            exit_reason = 'tp_hit'
+        elif sl_price and exit_price and abs(exit_price - float(sl_price)) / float(sl_price) < 0.003:
+            exit_reason = 'sl_hit'
+
+        self._write_diary_entry({
+            'timestamp': now_iso,
+            'venue': 'hyperliquid',
+            'asset': asset,
+            'action': 'trade_closed',
+            'side': 'long' if trade.get('is_long') else 'short',
+            'amount': amount,
+            'entry_price': entry_price,
+            'exit_price': exit_price or None,
+            'realized_pnl_usd': round(realized_net, 4),
+            'fees_usd': round(fees, 4),
+            'realized_pnl_pct': round(pnl_pct, 4),
+            'exit_reason': exit_reason,
+            'opened_at': opened_at_raw,
+            'rationale': trade.get('rationale'),
+        })
+
+        if entry_price > 0 and amount > 0:
+            opened_dt = None
+            if opened_at_raw:
+                try:
+                    opened_dt = datetime.fromisoformat(str(opened_at_raw)).replace(tzinfo=None)
+                except (ValueError, TypeError):
+                    pass
+            try:
+                await asyncio.to_thread(
+                    get_db_manager().record_closed_trade,
+                    asset=asset,
+                    action='buy' if trade.get('is_long') else 'sell',
+                    venue='hyperliquid',
+                    instrument_name=trade.get('instrument_name') or asset,
+                    entry_timestamp=opened_dt,
+                    entry_price=entry_price,
+                    entry_size=amount,
+                    exit_price=exit_price or entry_price,
+                    realized_pnl=realized_net,
+                    realized_pnl_pct=pnl_pct,
+                    stop_loss=float(sl_price) if sl_price else None,
+                    take_profit=float(tp_price) if tp_price else None,
+                    rationale=trade.get('rationale'),
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                self.logger.error("trade_closed booking: DB persist failed: %s", exc)
 
     def _calculate_sharpe(self, returns: List[float]) -> float:
         """Calculate naive Sharpe ratio from returns list"""
@@ -2650,6 +3097,24 @@ class TradingBotEngine:
             self.logger.error(f"Failed to load diary: {e}")
             return []
 
+    _TRADE_EVENT_ACTIONS = {
+        'buy', 'sell', 'trade_closed', 'manual_close', 'execution_failed',
+        'execution_skipped_insufficient_margin', 'proposal_skipped_insufficient_margin',
+        'decision_rejected', 'stop_placement_failed', 'position_without_stop',
+        'kill_switch_flatten', 'circuit_breaker_tripped',
+    }
+
+    def _load_recent_trade_events(self, limit: int = 12) -> List[Dict]:
+        """Trade lifecycle events (entries, realized outcomes, failures) for
+        the LLM context — holds are excluded so outcomes survive the window."""
+        entries = self._load_recent_diary(limit=400)
+        events = [
+            {k: v for k, v in e.items() if k != 'order_result'}
+            for e in entries
+            if isinstance(e, dict) and e.get('action') in self._TRADE_EVENT_ACTIONS
+        ]
+        return events[-limit:]
+
     def _read_recent_options_skips(self, limit: int = 5) -> List[Dict]:
         """Extract the most-recent options skip entries from the diary.
 
@@ -2696,36 +3161,59 @@ class TradingBotEngine:
             # Cancel all orders for this asset
             await self.hyperliquid.cancel_all_orders(asset)
 
-            # Find position
-            for pos in self.state.positions:
-                if pos['symbol'] == asset:
-                    quantity = abs(pos['quantity'])
-                    if quantity > 0:
-                        # Close position (reverse direction)
-                        if pos['quantity'] > 0:  # Long position
-                            await self.hyperliquid.place_sell_order(asset, quantity)
-                        else:  # Short position
-                            await self.hyperliquid.place_buy_order(asset, quantity)
+            # Reduce-only close sized from LIVE exchange state, with the
+            # response validated. The previous implementation reversed a
+            # snapshot-sized market order: a rejection returned True, and a
+            # stale snapshot could open a fresh reverse position.
+            close = getattr(self.hyperliquid, "market_close_position", None)
+            if callable(close):
+                result = await close(asset)
+                if not result.get("ok"):
+                    err = str(result.get("error") or "unknown")
+                    if "no open position" in err.lower():
+                        self.logger.warning(f"No position found to close: {asset}")
+                        return False
+                    raise RuntimeError(f"close {asset} rejected: {err}")
+                quantity = None
+            else:
+                quantity = None
+                for pos in self.state.positions:
+                    if pos['symbol'] == asset:
+                        quantity = float(pos['quantity'])
+                        break
+                if not quantity:
+                    self.logger.warning(f"No position found to close: {asset}")
+                    return False
+                if quantity > 0:
+                    order_result = await self.hyperliquid.place_sell_order(asset, abs(quantity))
+                else:
+                    order_result = await self.hyperliquid.place_buy_order(asset, abs(quantity))
+                self._hl_validate_response(order_result, context=f"close {asset}")
 
-                        # Remove from active trades
-                        self.active_trades = [
-                            t for t in self.active_trades if t['asset'] != asset
-                        ]
-                        self._save_active_trades()
+            # Remove from active trades
+            closed_trade = next(
+                (t for t in self.active_trades if t.get('asset') == asset), None,
+            )
+            self.active_trades = [
+                t for t in self.active_trades if t['asset'] != asset
+            ]
+            self._save_active_trades()
 
-                        self._write_diary_entry({
-                            'timestamp': datetime.now(UTC).isoformat(),
-                            'asset': asset,
-                            'action': 'manual_close',
-                            'quantity': quantity,
-                            'note': 'Position closed manually via GUI'
-                        })
+            self._write_diary_entry({
+                'timestamp': datetime.now(UTC).isoformat(),
+                'asset': asset,
+                'action': 'manual_close',
+                'quantity': quantity,
+                'note': 'Position closed manually via GUI'
+            })
+            if closed_trade is not None:
+                self._spawn_tracked_task(
+                    self._book_closed_trade(closed_trade),
+                    label=f"book_closed_trade[{asset}]",
+                )
 
-                        self.logger.info(f"Manually closed position: {asset}")
-                        return True
-
-            self.logger.warning(f"No position found to close: {asset}")
-            return False
+            self.logger.info(f"Manually closed position: {asset}")
+            return True
 
         except Exception as e:
             self.logger.error(f"Failed to close position {asset}: {e}")
@@ -2747,8 +3235,25 @@ class TradingBotEngine:
             "orders_cancelled": {"hyperliquid": {}, "thalex": False},
             "positions_closed": [],
             "thalex_positions_remaining": [],
+            "hedge_disabled": False,
             "errors": [],
         }
+
+        # Disable the delta hedger FIRST — otherwise the 15s hedge audit
+        # re-opens perp positions this kill switch is about to close.
+        hedge_manager = getattr(self, "hedge_manager", None)
+        if hedge_manager is not None:
+            try:
+                await hedge_manager.set_enabled(False)
+                self._delta_hedge_enabled = False
+                options_executor = getattr(self, "options_executor", None)
+                if options_executor is not None:
+                    options_executor.set_delta_hedge_enabled(False)
+                result["hedge_disabled"] = True
+                self.logger.warning("flatten_all: delta hedging disabled")
+            except Exception as exc:  # pylint: disable=broad-except
+                self.logger.error(f"flatten_all: failed to disable hedge manager: {exc}")
+                result["errors"].append(f"hedge_disable: {exc}")
 
         # Cancel HL orders per asset
         for asset in self.assets:
@@ -2826,6 +3331,20 @@ class TradingBotEngine:
         Only acts on status=='failed'; in-flight pending proposals and
         retries-in-flight (also status=='pending') are never pruned here.
         """
+        pending_ttl = int(CONFIG.get("proposal_ttl_seconds") or 0)
+        if pending_ttl > 0:
+            pending_cutoff = datetime.now(UTC) - timedelta(seconds=pending_ttl)
+            for p in self.pending_proposals:
+                if p.status == "pending" and p.timestamp < pending_cutoff:
+                    p.reject("expired: market context is stale")
+                    self.logger.info(
+                        f"[EXPIRED] Proposal {p.id[:8]} ({p.action} {p.asset}) "
+                        f"older than {pending_ttl}s"
+                    )
+            self.pending_proposals = [
+                p for p in self.pending_proposals if p.status != "rejected"
+            ]
+
         if FAILED_PROPOSAL_TTL_SECONDS <= 0:
             return
         cutoff = datetime.now(UTC) - timedelta(seconds=FAILED_PROPOSAL_TTL_SECONDS)
@@ -2924,6 +3443,7 @@ class TradingBotEngine:
             self.peak_account_value = current_value
             self.state.peak_account_value = current_value
             self.state.drawdown_pct = 0.0
+            self._save_risk_state()
         try:
             self._write_diary_entry({
                 'timestamp': datetime.now(UTC).isoformat(),
@@ -2935,18 +3455,29 @@ class TradingBotEngine:
         return True
 
     def _update_peak_and_check_drawdown(self, total_value: float) -> None:
-        """Track session peak and trip the CB on drawdown. Safe to call every cycle."""
+        """Track persistent peak + daily loss and trip the CB on breach."""
         if total_value <= 0:
             return
+
+        today = datetime.now(UTC).date().isoformat()
+        if getattr(self, "_risk_day", None) != today:
+            self._risk_day = today
+            self._day_start_value = total_value
+            self._save_risk_state()
+
         if self.peak_account_value <= 0:
-            # First valid reading after start — seed the peak.
+            # First valid reading ever — seed the persistent peak.
             self.peak_account_value = total_value
             self.state.peak_account_value = total_value
             self.state.drawdown_pct = 0.0
+            self._save_risk_state()
             return
         if total_value > self.peak_account_value:
             self.peak_account_value = total_value
             self.state.peak_account_value = total_value
+            self._save_risk_state()
+        else:
+            self.state.peak_account_value = self.peak_account_value
         drawdown = ((total_value - self.peak_account_value) / self.peak_account_value) * 100.0
         self.state.drawdown_pct = drawdown
         if (
@@ -2959,6 +3490,17 @@ class TradingBotEngine:
                 f"{CIRCUIT_BREAKER_DRAWDOWN_PCT:.2f}% (peak ${self.peak_account_value:,.2f}, "
                 f"now ${total_value:,.2f})"
             )
+            return
+
+        max_daily = float(CONFIG.get("max_daily_loss_pct") or 0.0)
+        day_start = float(getattr(self, "_day_start_value", 0.0) or 0.0)
+        if not self.is_paused and max_daily > 0 and day_start > 0:
+            daily_pct = ((total_value - day_start) / day_start) * 100.0
+            if daily_pct <= -max_daily:
+                self._trip_circuit_breaker(
+                    f"daily loss {daily_pct:.2f}% exceeds limit {max_daily:.2f}% "
+                    f"(day start ${day_start:,.2f}, now ${total_value:,.2f})"
+                )
 
     def retry_proposal(self, proposal_id: str) -> bool:
         """Re-execute a previously failed proposal.
@@ -3006,12 +3548,19 @@ class TradingBotEngine:
         Returns:
             True if proposal found and approved, False otherwise
         """
+        if getattr(self, "is_paused", False):
+            self.logger.warning(
+                "Proposal %s not approved: trading is paused (%s)",
+                proposal_id[:8], getattr(self, "pause_reason", None) or "circuit breaker",
+            )
+            return False
+
         proposal = next((p for p in self.pending_proposals if p.id == proposal_id), None)
-        
+
         if not proposal or not proposal.is_pending:
             self.logger.warning(f"Proposal {proposal_id} not found or not pending")
             return False
-        
+
         # Mark as approved
         proposal.approve()
         self.logger.info(f"[APPROVED] Proposal: {proposal.action.upper()} {proposal.asset} (ID: {proposal_id[:8]})")
@@ -3075,6 +3624,10 @@ class TradingBotEngine:
             proposal: The approved proposal to execute
         """
         try:
+            if getattr(self, "is_paused", False):
+                raise RuntimeError(
+                    f"trading is paused ({getattr(self, 'pause_reason', None) or 'circuit breaker'})"
+                )
             self.logger.info(f"Executing proposal: {proposal.action.upper()} {proposal.asset}")
             market_conditions = proposal.market_conditions or {}
 
@@ -3121,15 +3674,39 @@ class TradingBotEngine:
 
             # Get fresh price
             current_price = await self.hyperliquid.get_current_price(proposal.asset)
-            amount = proposal.size
-            
+            if not current_price or current_price <= 0:
+                raise ValueError(f"Invalid live price for {proposal.asset}: {current_price!r}")
+
+            # Staleness guard: the proposal was sized and TP/SL'd at
+            # proposal-time price. If the market has drifted past the
+            # threshold, executing it no longer expresses the LLM's intent.
+            max_drift = float(CONFIG.get("proposal_max_price_drift_pct") or 0.0)
+            if max_drift > 0 and proposal.entry_price and proposal.entry_price > 0:
+                drift_pct = abs(current_price - proposal.entry_price) / proposal.entry_price * 100.0
+                if drift_pct > max_drift:
+                    raise RuntimeError(
+                        f"proposal stale: price drifted {drift_pct:.2f}% "
+                        f"(${proposal.entry_price:,.2f} -> ${current_price:,.2f}, "
+                        f"limit {max_drift:.2f}%) — re-run the cycle for a fresh proposal"
+                    )
+
+            # Re-derive size from the dollar allocation at the LIVE price so
+            # the executed notional matches the approved allocation.
+            amount = (
+                proposal.allocation / current_price
+                if proposal.allocation and proposal.allocation > 0
+                else proposal.size
+            )
+
             if amount <= 0:
                 raise ValueError(f"Invalid amount: {amount}")
-            
+
             # Pre-trade margin check before submitting — same rationale as
             # the auto-execute path: don't silently record a trade the
             # venue would reject for insufficient collateral.
             await self._hl_margin_preflight(proposal.asset, amount * (current_price or 0.0))
+
+            order_time_ms = int(datetime.now(UTC).timestamp() * 1000)
 
             # Place market order
             if proposal.action == 'buy':
@@ -3146,15 +3723,26 @@ class TradingBotEngine:
             )
 
             self.logger.info(f"Order placed: {proposal.action} {proposal.asset}: {amount:.6f} @ {current_price}")
-            
+
+            # Cancel stale orders (previous TP/SL triggers at obsolete
+            # levels) now that the new order is accepted.
+            try:
+                await self.hyperliquid.cancel_all_orders(proposal.asset)
+            except Exception as exc:  # pylint: disable=broad-except
+                self.logger.error(
+                    f"Failed to cancel stale orders for {proposal.asset}: {exc}"
+                )
+
             # Wait and check fills
             await asyncio.sleep(1)
-            recent_fills = await self.hyperliquid.get_recent_fills(limit=5)
-            filled = any(
-                f.get('coin') == proposal.asset and
-                abs(float(f.get('sz', 0)) - amount) < 0.0001
+            recent_fills = await self.hyperliquid.get_recent_fills(limit=10)
+            filled_size = sum(
+                float(f.get('sz', 0) or 0)
                 for f in recent_fills
+                if f.get('coin') == proposal.asset
+                and float(f.get('time') or 0) >= order_time_ms - 2000
             )
+            filled = filled_size >= amount * 0.99
             
             # Place TP/SL if specified
             tp_oid = None

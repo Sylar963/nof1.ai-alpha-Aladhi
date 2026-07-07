@@ -351,7 +351,7 @@ async def test_bot_service_refresh_market_data_normalizes_state(monkeypatch):
                     "timestamps": [],
                     "price_candles": {},
                 },
-                "interval": "15m",
+                "interval": "4h",
             },
         }
     ]
@@ -408,7 +408,7 @@ async def test_bot_service_refresh_market_data_can_include_indicators(monkeypatc
     service.config["assets"] = ["BTC"]
     service.state_manager = SimpleNamespace(update=lambda state: captured_states.append(state))
     monkeypatch.setattr(hyperliquid_api_module, "HyperliquidAPI", FakeHyperliquidAPI)
-    monkeypatch.setitem(bot_service_module.CONFIG, "interval", "4h")
+    monkeypatch.setitem(bot_service_module.CONFIG, "analysis_interval", "4h")
     monkeypatch.setitem(bot_service_module.CONFIG, "thalex_key_id", "")
     monkeypatch.setitem(bot_service_module.CONFIG, "thalex_private_key_path", "")
 
@@ -469,6 +469,9 @@ async def test_bot_service_refresh_market_data_includes_thalex_portfolio_positio
             return {"BTC": 432100000.0}[asset]
 
     class FakeThalexAPI:
+        async def connect(self):
+            return None
+
         async def get_user_state(self):
             return SimpleNamespace(
                 balance=250000.0,

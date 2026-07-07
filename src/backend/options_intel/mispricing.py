@@ -66,18 +66,46 @@ def _kind_of(record: dict) -> Optional[str]:
 
 def _strike_of(record: dict) -> Optional[float]:
     raw = record.get("strike")
+    if raw is None:
+        raw = record.get("strike_price")
     try:
         return float(raw) if raw is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _normalize_iv(raw) -> Optional[float]:
+    try:
+        value = float(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+    if value is None or value <= 0:
+        return None
+    if value > 2.0:
+        value = value / 100.0
+    return value
 
 
 def _iv_of(record: dict) -> Optional[float]:
-    raw = record.get("mark_iv")
+    raw = record.get("iv")
+    if raw is None:
+        raw = record.get("mark_iv")
+    return _normalize_iv(raw)
+
+
+def _executable_iv(record: dict, side: str) -> Optional[float]:
+    return _normalize_iv(record.get("bid_iv" if side == "sell" else "ask_iv"))
+
+
+def _quote_is_dead(record: dict, side: str) -> bool:
+    key = "best_bid" if side == "sell" else "best_ask"
+    if key not in record:
+        return False
     try:
-        return float(raw) if raw is not None else None
+        value = float(record.get(key) or 0.0)
     except (TypeError, ValueError):
-        return None
+        return True
+    return value <= 0
 
 
 def _index_deribit(deribit_chain: list[dict]) -> dict[tuple, dict]:
@@ -101,11 +129,14 @@ def scan_mispricings(
     top_n: int = 5,
     min_edge_bps: float = 0.0,
     use_interpolation: bool = False,
+    cost_haircut_bps: Optional[float] = None,
 ) -> MispricingScanReport:
     """Compute the largest Thalex - Deribit IV gaps after alignment.
 
     Args:
-        thalex_chain: Thalex option instruments with ``mark_iv`` populated.
+        thalex_chain: Thalex option instruments with ``iv`` (enricher shape)
+            or ``mark_iv`` populated. IVs above 2.0 are treated as percent
+            and divided by 100 so both venues compare in decimal units.
         deribit_chain: Deribit option instruments (book summary shape works).
         top_n: how many of the largest |IV diff| entries to return.
         min_edge_bps: drop entries whose absolute edge is below this threshold.
@@ -113,11 +144,21 @@ def scan_mispricings(
             Thalex tenor Deribit doesn't list directly, by linear-in-variance
             interpolation between the two bracketing Deribit expiries. PR C
             default is False — match exactly to keep the surface conservative.
+        cost_haircut_bps: subtracted from the absolute edge when no
+            executable bid/ask IV is available on the Thalex record.
+            Defaults to ``CONFIG["mispricing_cost_haircut_bps"]`` (25.0).
 
     Returns:
         :class:`MispricingScanReport` with the ranked top list, plus
         match/skip counters for visibility.
     """
+    if cost_haircut_bps is None:
+        from src.backend.config_loader import CONFIG
+        try:
+            cost_haircut_bps = float(CONFIG.get("mispricing_cost_haircut_bps", 25.0))
+        except (TypeError, ValueError):
+            cost_haircut_bps = 25.0
+
     deribit_index = _index_deribit(deribit_chain)
 
     if use_interpolation:
@@ -154,7 +195,18 @@ def scan_mispricings(
             skipped += 1
             continue
 
-        edge_bps = (thalex_iv - deribit_iv) * 10_000
+        raw_edge_bps = (thalex_iv - deribit_iv) * 10_000
+        side = "sell" if raw_edge_bps >= 0 else "buy"
+        if _quote_is_dead(record, side):
+            skipped += 1
+            continue
+        executable_iv = _executable_iv(record, side)
+        if executable_iv is not None:
+            edge_bps = (executable_iv - deribit_iv) * 10_000
+        else:
+            edge_bps = math.copysign(
+                max(abs(raw_edge_bps) - cost_haircut_bps, 0.0), raw_edge_bps,
+            )
         if abs(edge_bps) < min_edge_bps:
             matched += 1
             continue

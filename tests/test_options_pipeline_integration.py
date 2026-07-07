@@ -101,8 +101,9 @@ async def test_full_pipeline_builds_context_runs_agent_executes_decision(
 
     assert result.ok is True
     assert len(thalex_exec.calls) == 2
+    # Protective long leg is submitted before the short leg.
     methods = [c.method for c in thalex_exec.calls]
-    assert methods == ["sell", "buy"]
+    assert methods == ["buy", "sell"]
     assert hl_exec.calls == []
 
 

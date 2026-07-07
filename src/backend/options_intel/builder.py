@@ -37,6 +37,9 @@ from src.backend.options_intel.vol_surface import (
 
 logger = logging.getLogger(__name__)
 
+_ANCHOR_EM_MIN = 0.005
+_ANCHOR_EM_MAX = 0.30
+
 
 def _describe_event_for_builder(event_type: str, payload: dict) -> str:
     if event_type == "regime_flip":
@@ -140,17 +143,24 @@ async def build_options_context(
     if persist_anchor and surface.atm_straddle_30d:
         try:
             anchor = surface.atm_straddle_30d
-            iv_history.write(
-                IVHistoryRow(
-                    ts=datetime.now(timezone.utc),
-                    tenor_days=int(anchor["tenor_days"]),
-                    atm_iv=float(anchor["atm_iv"]),
-                    atm_straddle_em=float(anchor["straddle_premium"]) / spot if spot else 0.0,
-                    spot_at_init=float(anchor["spot_at_init"]),
-                    lower_strike=float(anchor["lower_strike"]),
-                    upper_strike=float(anchor["upper_strike"]),
+            straddle_em = float(anchor["straddle_premium"]) / spot if spot else 0.0
+            if _ANCHOR_EM_MIN <= straddle_em <= _ANCHOR_EM_MAX:
+                iv_history.write(
+                    IVHistoryRow(
+                        ts=datetime.now(timezone.utc),
+                        tenor_days=int(anchor["tenor_days"]),
+                        atm_iv=float(anchor["atm_iv"]),
+                        atm_straddle_em=straddle_em,
+                        spot_at_init=float(anchor["spot_at_init"]),
+                        lower_strike=float(anchor["lower_strike"]),
+                        upper_strike=float(anchor["upper_strike"]),
+                    )
                 )
-            )
+            else:
+                logger.warning(
+                    "skipping iv_history anchor write: straddle/spot %.6f outside [%s, %s]",
+                    straddle_em, _ANCHOR_EM_MIN, _ANCHOR_EM_MAX,
+                )
         except Exception as exc:  # pylint: disable=broad-except
             logger.warning("iv_history write failed: %s", exc)
 

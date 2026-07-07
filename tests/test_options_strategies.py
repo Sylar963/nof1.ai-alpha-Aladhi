@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 
 from src.backend.agent.decision_schema import DecisionParseError, parse_decision
+from src.backend.config_loader import CONFIG
 from src.backend.trading.exchange_adapter import (
     AccountState,
     ExchangeAdapter,
@@ -66,9 +67,9 @@ class FakeThalex(ExchangeAdapter):
         key = (intent.underlying, intent.kind, intent.tenor_days, intent.target_strike)
         return self.instruments_by_intent.get(key, "BTC-10MAY26-65000-C")
 
-    def preflight(self, underlying, contracts, open_positions_count):
+    def preflight(self, underlying, contracts, open_positions_count, reducing=False):
         from src.backend.trading.options import validate_options_order
-        return validate_options_order(underlying, contracts, open_positions_count, self.risk_caps)
+        return validate_options_order(underlying, contracts, open_positions_count, self.risk_caps, reducing=reducing)
 
     async def place_buy_order(self, asset, amount, slippage=0.01):
         self.calls.append(_FakeOrder(self.venue, "buy", asset, amount))
@@ -80,7 +81,11 @@ class FakeThalex(ExchangeAdapter):
 
     async def place_take_profit(self, asset, is_buy, amount, tp_price): return OrderResult(venue=self.venue, order_id="", asset=asset, side="tp", amount=amount, status="not_supported")
     async def place_stop_loss(self, asset, is_buy, amount, sl_price): return OrderResult(venue=self.venue, order_id="", asset=asset, side="sl", amount=amount, status="not_supported")
-    async def cancel_order(self, asset, order_id): return {"status": "ok"}
+
+    async def cancel_order(self, asset, order_id):
+        self.calls.append(_FakeOrder(self.venue, "cancel", asset, 0.0, extra={"order_id": order_id}))
+        return {"status": "ok"}
+
     async def cancel_all_orders(self, asset): return {"status": "ok"}
     async def get_open_orders(self): return []
     async def get_recent_fills(self, limit=50): return []
@@ -618,8 +623,9 @@ async def test_credit_put_spread_executes_two_legs_in_correct_directions():
     result = await executor.execute(decision, open_positions_count=0)
 
     assert result.ok is True
+    # Protective long leg must go in before the short leg.
     methods = [c.method for c in thalex.calls]
-    assert methods == ["sell", "buy"]
+    assert methods == ["buy", "sell"]
     assert hl.calls == []  # no perp hedge for credit spreads
 
 
@@ -636,8 +642,8 @@ async def test_multi_leg_uses_gtc_resting_submit_when_native_thalex_helper_exist
     submit_calls: list[dict[str, object]] = []
 
     async def _entry_limit_price(instrument_name, side, slippage):
-        assert slippage == pytest.approx(0.01)
-        return 1234.0 if side == "sell" else 4321.0
+        # Short 55000 put quotes richer than the long 50000 wing → net credit.
+        return 1234.0 if instrument_name == "BTC-25APR26-55000-P" else 321.0
 
     async def _submit_limit_order(**kwargs):
         submit_calls.append(kwargs)
@@ -672,7 +678,7 @@ async def test_multi_leg_uses_gtc_resting_submit_when_native_thalex_helper_exist
 
     assert result.ok is True
     assert len(submit_calls) == 2
-    assert [call["side"] for call in submit_calls] == ["sell", "buy"]
+    assert [call["side"] for call in submit_calls] == ["buy", "sell"]
     assert all(call["time_in_force"] == TimeInForce.GTC for call in submit_calls)
     assert thalex.calls == []
     assert hl.calls == []
@@ -686,14 +692,14 @@ async def test_multi_leg_unwinds_submitted_legs_when_later_leg_fails():
     thalex.instruments_by_intent[("BTC", "put", 14, 55000.0)] = "BTC-25APR26-55000-P"
     thalex.instruments_by_intent[("BTC", "put", 14, 50000.0)] = "BTC-25APR26-50000-P"
 
-    real_buy = thalex.place_buy_order
+    real_sell = thalex.place_sell_order
 
-    async def _failing_buy(asset, amount, slippage=0.01):
-        if asset == "BTC-25APR26-50000-P":
-            raise RuntimeError("second leg failed")
-        return await real_buy(asset, amount, slippage)
+    async def _failing_sell(asset, amount, slippage=0.01):
+        if asset == "BTC-25APR26-55000-P":
+            raise RuntimeError("short leg failed")
+        return await real_sell(asset, amount, slippage)
 
-    thalex.place_buy_order = _failing_buy
+    thalex.place_sell_order = _failing_sell
 
     decision = parse_decision({
         "venue": "thalex",
@@ -711,9 +717,11 @@ async def test_multi_leg_unwinds_submitted_legs_when_later_leg_fails():
     result = await executor.execute(decision, open_positions_count=0)
 
     assert result.ok is False
+    # Protective buy leg filled first, short leg failed → the filled buy is
+    # reversed with a sell of the filled quantity.
     methods = [c.method for c in thalex.calls]
-    assert methods == ["sell", "buy"]
-    assert thalex.calls[1].asset == "BTC-25APR26-55000-P"
+    assert methods == ["buy", "sell"]
+    assert thalex.calls[1].asset == "BTC-25APR26-50000-P"
     assert hl.calls == []
 
 
@@ -743,7 +751,7 @@ async def test_credit_call_spread_executes_two_call_legs():
 
     assert result.ok is True
     methods = [c.method for c in thalex.calls]
-    assert methods == ["sell", "buy"]
+    assert methods == ["buy", "sell"]
 
 
 @pytest.mark.asyncio
@@ -878,6 +886,206 @@ async def test_executor_rejects_when_max_open_positions_reached():
     result = await executor.execute(decision, open_positions_count=3)
     assert result.ok is False
     assert "max_open_positions" in result.reason
+
+
+# ---------------------------------------------------------------------------
+# Cancel-based rollback, partial fills, net-credit gate, fill watchdog,
+# reducing-order cap exemption
+# ---------------------------------------------------------------------------
+
+
+def _delta_hedged_decision(contracts=0.05):
+    return parse_decision({
+        "venue": "thalex",
+        "asset": "BTC",
+        "action": "buy",
+        "strategy": "long_call_delta_hedged",
+        "underlying": "BTC",
+        "kind": "call",
+        "tenor_days": 30,
+        "target_strike": 65000,
+        "contracts": contracts,
+        "rationale": "x",
+    })
+
+
+@pytest.mark.asyncio
+async def test_delta_hedged_resting_leg_is_cancelled_not_reverse_traded():
+    """An accepted-but-unfilled leg must be CANCELLED by order id. Placing an
+    opposite-side order would self-match the resting GTC or leave a naked
+    short if both fill."""
+    thalex = FakeThalex()
+    hl = FakeHyperliquid()
+    executor = OptionsExecutor(thalex=thalex, hyperliquid=hl)
+    thalex.delta_per_position["BTC-10MAY26-65000-C"] = 0.5
+
+    async def _resting_buy(asset, amount, slippage=0.01):
+        thalex.calls.append(_FakeOrder(thalex.venue, "buy", asset, amount))
+        return OrderResult(venue=thalex.venue, order_id="rest-1", asset=asset, side="buy", amount=amount, status="resting")
+
+    thalex.place_buy_order = _resting_buy
+
+    result = await executor.execute(_delta_hedged_decision(), open_positions_count=0)
+
+    assert result.ok is False
+    assert "not filled" in result.reason
+    methods = [c.method for c in thalex.calls]
+    assert methods == ["buy", "cancel"]
+    cancel = thalex.calls[1]
+    assert cancel.extra["order_id"] == "rest-1"
+    assert hl.calls == []
+
+
+@pytest.mark.asyncio
+async def test_delta_hedged_partial_fill_hedges_filled_amount_and_cancels_rest():
+    thalex = FakeThalex()
+    hl = FakeHyperliquid()
+    executor = OptionsExecutor(thalex=thalex, hyperliquid=hl)
+    thalex.delta_per_position["BTC-10MAY26-65000-C"] = 0.5
+
+    async def _partial_buy(asset, amount, slippage=0.01):
+        thalex.calls.append(_FakeOrder(thalex.venue, "buy", asset, amount))
+        order = OrderResult(venue=thalex.venue, order_id="part-1", asset=asset, side="buy", amount=amount, status="partially_filled")
+        order.filled_amount = 0.03
+        return order
+
+    thalex.place_buy_order = _partial_buy
+
+    result = await executor.execute(_delta_hedged_decision(contracts=0.05), open_positions_count=0)
+
+    assert result.ok is True
+    methods = [c.method for c in thalex.calls]
+    assert methods == ["buy", "cancel"]
+    assert thalex.calls[1].extra["order_id"] == "part-1"
+    # Hedge sized from the FILLED amount: 0.03 × 0.5 = 0.015, not 0.025.
+    assert len(hl.calls) == 1 and hl.calls[0].method == "sell"
+    assert hl.calls[0].amount == pytest.approx(0.015)
+
+
+@pytest.mark.asyncio
+async def test_multi_leg_rejects_structure_that_is_a_debit_when_credit_intended():
+    thalex = FakeThalex()
+    hl = FakeHyperliquid()
+    executor = OptionsExecutor(thalex=thalex, hyperliquid=hl)
+    thalex.instruments_by_intent[("BTC", "put", 14, 55000.0)] = "BTC-25APR26-55000-P"
+    thalex.instruments_by_intent[("BTC", "put", 14, 50000.0)] = "BTC-25APR26-50000-P"
+
+    submit_calls: list[dict[str, object]] = []
+
+    async def _entry_limit_price(instrument_name, side, slippage):
+        # Long wing costs MORE than the short leg collects → net debit.
+        return 100.0 if instrument_name == "BTC-25APR26-55000-P" else 500.0
+
+    async def _submit_limit_order(**kwargs):
+        submit_calls.append(kwargs)
+        return OrderResult(
+            venue=thalex.venue,
+            order_id="x",
+            asset=kwargs["instrument_name"],
+            side=kwargs["side"],
+            amount=kwargs["amount"],
+            status="filled",
+        )
+
+    thalex._entry_limit_price = _entry_limit_price
+    thalex._submit_limit_order = _submit_limit_order
+
+    decision = parse_decision({
+        "venue": "thalex",
+        "asset": "BTC",
+        "action": "sell",
+        "strategy": "credit_put_spread",
+        "underlying": "BTC",
+        "tenor_days": 14,
+        "legs": [
+            {"kind": "put", "side": "sell", "target_strike": 55000, "contracts": 0.05},
+            {"kind": "put", "side": "buy", "target_strike": 50000, "contracts": 0.05},
+        ],
+        "rationale": "should be a credit",
+    })
+    result = await executor.execute(decision, open_positions_count=0)
+
+    assert result.ok is False
+    assert "net credit" in result.reason
+    assert submit_calls == []
+    assert thalex.calls == []
+    assert hl.calls == []
+
+
+@pytest.mark.asyncio
+async def test_multi_leg_fill_timeout_cancels_unfilled_leg_and_unwinds_filled_sibling(monkeypatch):
+    monkeypatch.setitem(CONFIG, "options_fill_timeout_seconds", 0)
+
+    thalex = FakeThalex()
+    hl = FakeHyperliquid()
+    executor = OptionsExecutor(thalex=thalex, hyperliquid=hl)
+    thalex.instruments_by_intent[("BTC", "put", 14, 55000.0)] = "BTC-25APR26-55000-P"
+    thalex.instruments_by_intent[("BTC", "put", 14, 50000.0)] = "BTC-25APR26-50000-P"
+
+    submit_calls: list[dict[str, object]] = []
+
+    async def _entry_limit_price(instrument_name, side, slippage):
+        return 1000.0 if instrument_name == "BTC-25APR26-55000-P" else 200.0
+
+    async def _submit_limit_order(**kwargs):
+        submit_calls.append(kwargs)
+        status = "filled" if kwargs["side"] == "buy" and not kwargs.get("reduce_only") else "resting"
+        if kwargs.get("reduce_only"):
+            status = "filled"
+        return OrderResult(
+            venue=thalex.venue,
+            order_id=f"{kwargs['side']}-{kwargs['instrument_name']}",
+            asset=kwargs["instrument_name"],
+            side=kwargs["side"],
+            amount=kwargs["amount"],
+            status=status,
+        )
+
+    async def _open_orders():
+        return [{"order_id": "sell-BTC-25APR26-55000-P"}]
+
+    thalex._entry_limit_price = _entry_limit_price
+    thalex._submit_limit_order = _submit_limit_order
+    thalex.get_open_orders = _open_orders
+
+    decision = parse_decision({
+        "venue": "thalex",
+        "asset": "BTC",
+        "action": "sell",
+        "strategy": "credit_put_spread",
+        "underlying": "BTC",
+        "tenor_days": 14,
+        "legs": [
+            {"kind": "put", "side": "sell", "target_strike": 55000, "contracts": 0.05},
+            {"kind": "put", "side": "buy", "target_strike": 50000, "contracts": 0.05},
+        ],
+        "rationale": "watchdog",
+    })
+    result = await executor.execute(decision, open_positions_count=0)
+
+    assert result.ok is False
+    assert "fill timeout" in result.reason
+    # The resting short leg was cancelled by id, never reverse-traded.
+    cancels = [c for c in thalex.calls if c.method == "cancel"]
+    assert len(cancels) == 1
+    assert cancels[0].extra["order_id"] == "sell-BTC-25APR26-55000-P"
+    # The filled protective leg was unwound with a reduce-only close.
+    closes = [c for c in submit_calls if c.get("reduce_only")]
+    assert len(closes) == 1
+    assert closes[0]["instrument_name"] == "BTC-25APR26-50000-P"
+    assert closes[0]["side"] == "sell"
+    assert closes[0]["amount"] == pytest.approx(0.05)
+
+
+def test_reducing_orders_are_exempt_from_position_cap():
+    from src.backend.trading.options import validate_options_order
+
+    caps = RiskCaps(max_contracts_per_trade=0.1, max_open_positions=3, allowed_underlyings=["BTC"])
+    ok, reason = validate_options_order("BTC", 0.05, open_positions_count=3, caps=caps)
+    assert ok is False
+    assert "max_open_positions" in reason
+    ok, reason = validate_options_order("BTC", 0.05, open_positions_count=3, caps=caps, reducing=True)
+    assert ok is True
 
 
 # ---------------------------------------------------------------------------

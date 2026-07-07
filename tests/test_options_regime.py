@@ -119,8 +119,8 @@ def test_classify_cheap_when_realized_vol_outran_implied(tmp_path):
 def test_classify_rich_when_realized_vol_below_implied(tmp_path):
     """RV/IV < 0.8 → market priced more move than happened → 'rich'."""
     store = IVHistoryStore(db_path=str(tmp_path / "iv.db"))
-    # Flat price history → RV ≈ 0 → ratio ≈ 0 → 'rich'
-    spot_history = [60000.0] * 16
+    # Small ±0.1% daily moves → RV ≈ 0.02 → ratio ≈ 0.013 → 'rich'
+    spot_history = [60000 * (1.001 if i % 2 == 0 else 0.999) for i in range(16)]
 
     reading = classify_regime(
         store=store,
@@ -129,6 +129,49 @@ def test_classify_rich_when_realized_vol_below_implied(tmp_path):
         spot_history=spot_history,
     )
     assert reading.signal_2_label == "rich"
+
+
+def test_signal_2_unknown_for_flat_close_series(tmp_path):
+    """RV of 0 carries no information — must NOT classify 'rich' (that would
+    bias toward selling vol on every data outage)."""
+    store = IVHistoryStore(db_path=str(tmp_path / "iv.db"))
+    now = datetime.now(timezone.utc)
+    store.write(_row(spot=60000, lower=58000, upper=62000, age_days=30, now=now))
+
+    reading = classify_regime(
+        store=store,
+        current_spot=60500.0,
+        current_atm_iv_30d=0.65,
+        spot_history=[60000.0] * 16,
+        now=now,
+    )
+    assert reading.signal_2_label == "unknown"
+    assert reading.vol_regime == "unknown"
+    assert reading.confidence == "unknown"
+
+
+def test_signal_2_unknown_for_too_short_series(tmp_path):
+    store = IVHistoryStore(db_path=str(tmp_path / "iv.db"))
+    reading = classify_regime(
+        store=store,
+        current_spot=60000.0,
+        current_atm_iv_30d=0.65,
+        spot_history=[60000.0],
+    )
+    assert reading.signal_2_label == "unknown"
+    assert reading.vol_regime == "unknown"
+
+
+def test_signal_2_unknown_for_garbage_close_series(tmp_path):
+    store = IVHistoryStore(db_path=str(tmp_path / "iv.db"))
+    reading = classify_regime(
+        store=store,
+        current_spot=60000.0,
+        current_atm_iv_30d=0.65,
+        spot_history=[0.0, -1.0, 0.0, 0.0],
+    )
+    assert reading.signal_2_label == "unknown"
+    assert reading.vol_regime == "unknown"
 
 
 # ---------------------------------------------------------------------------

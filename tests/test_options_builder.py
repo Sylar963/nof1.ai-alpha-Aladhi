@@ -146,6 +146,60 @@ async def test_build_persists_straddle_anchor_to_iv_history(thalex_chain, deribi
 
 
 @pytest.mark.asyncio
+async def test_build_skips_anchor_persist_when_straddle_em_too_small(deribit_chain, tmp_path):
+    """A straddle/spot below 0.5% is garbage (e.g. BTC-denominated marks
+    leaking into USD math) and must not be persisted for 30 days."""
+    expiry_30 = _utc_ts(2026, 5, 10)
+    chain = [
+        {"instrument_name": "BTC-10MAY26-60000-C", "type": "option", "underlying": "BTCUSD",
+         "option_type": "call", "strike": 60000, "mark_iv": 0.70, "mark_price": 0.04,
+         "expiry_timestamp": expiry_30, "delta": 0.52},
+        {"instrument_name": "BTC-10MAY26-60000-P", "type": "option", "underlying": "BTCUSD",
+         "option_type": "put", "strike": 60000, "mark_iv": 0.71, "mark_price": 0.03,
+         "expiry_timestamp": expiry_30, "delta": -0.48},
+    ]
+    thalex = FakeThalexAdapter(instruments_cache=chain, tickers={})
+    deribit = FakeDeribitClient(summaries=deribit_chain)
+    store = IVHistoryStore(db_path=str(tmp_path / "iv.db"))
+
+    await build_options_context(
+        thalex=thalex,
+        deribit=deribit,
+        iv_history=store,
+        spot_history=[60000.0] * 16,
+        today=_TEST_TODAY,
+    )
+
+    assert store.read_recent(tenor_days=30, limit=5) == []
+
+
+@pytest.mark.asyncio
+async def test_build_skips_anchor_persist_when_straddle_em_too_large(deribit_chain, tmp_path):
+    expiry_30 = _utc_ts(2026, 5, 10)
+    chain = [
+        {"instrument_name": "BTC-10MAY26-60000-C", "type": "option", "underlying": "BTCUSD",
+         "option_type": "call", "strike": 60000, "mark_iv": 0.70, "mark_price": 12000,
+         "expiry_timestamp": expiry_30, "delta": 0.52},
+        {"instrument_name": "BTC-10MAY26-60000-P", "type": "option", "underlying": "BTCUSD",
+         "option_type": "put", "strike": 60000, "mark_iv": 0.71, "mark_price": 11000,
+         "expiry_timestamp": expiry_30, "delta": -0.48},
+    ]
+    thalex = FakeThalexAdapter(instruments_cache=chain, tickers={})
+    deribit = FakeDeribitClient(summaries=deribit_chain)
+    store = IVHistoryStore(db_path=str(tmp_path / "iv.db"))
+
+    await build_options_context(
+        thalex=thalex,
+        deribit=deribit,
+        iv_history=store,
+        spot_history=[60000.0] * 16,
+        today=_TEST_TODAY,
+    )
+
+    assert store.read_recent(tenor_days=30, limit=5) == []
+
+
+@pytest.mark.asyncio
 async def test_build_includes_top_mispricings(thalex_chain, deribit_chain, tmp_path):
     thalex = FakeThalexAdapter(instruments_cache=thalex_chain, tickers={})
     deribit = FakeDeribitClient(summaries=deribit_chain)

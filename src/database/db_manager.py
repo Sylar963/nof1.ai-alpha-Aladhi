@@ -125,6 +125,59 @@ class DatabaseManager:
             logger.info(f"Created trade: {trade.id} ({asset} {action})")
             return trade
 
+    def record_closed_trade(
+        self,
+        *,
+        asset: str,
+        action: str,
+        venue: str = 'hyperliquid',
+        instrument_name: Optional[str] = None,
+        entry_timestamp: Optional[datetime] = None,
+        entry_price: float,
+        entry_size: float,
+        exit_price: float,
+        realized_pnl: float,
+        realized_pnl_pct: float,
+        leverage: float = 1.0,
+        stop_loss: Optional[float] = None,
+        take_profit: Optional[float] = None,
+        rationale: Optional[str] = None,
+    ) -> int:
+        """Insert a fully-closed trade in one session and return its id.
+
+        Used by the reconcile path, which only learns about a trade after the
+        exchange has already closed it (TP/SL fill, liquidation, manual close).
+        """
+        with self.session_scope() as session:
+            trade = Trade(
+                asset=asset,
+                action=action,
+                venue=venue,
+                instrument_name=instrument_name,
+                entry_timestamp=entry_timestamp or datetime.utcnow(),
+                entry_price=entry_price,
+                entry_size=entry_size,
+                entry_value=entry_price * entry_size,
+                exit_timestamp=datetime.utcnow(),
+                exit_price=exit_price,
+                exit_value=exit_price * entry_size,
+                realized_pnl=realized_pnl,
+                realized_pnl_pct=realized_pnl_pct,
+                leverage=leverage,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                rationale=rationale,
+                status='closed',
+            )
+            session.add(trade)
+            session.flush()
+            trade_id = trade.id
+            logger.info(
+                f"Recorded closed trade: {trade_id} ({venue} {asset} {action}, "
+                f"PnL: {realized_pnl:.2f})"
+            )
+            return trade_id
+
     def close_trade(
         self,
         trade_id: int,

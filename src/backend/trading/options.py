@@ -224,11 +224,16 @@ def validate_options_order(
     contracts: float,
     open_positions_count: int,
     caps: RiskCaps,
+    reducing: bool = False,
 ) -> tuple[bool, str]:
     """Hard preflight check applied to every options order before submission.
 
     Returns ``(True, "ok")`` when the order is allowed, or ``(False, reason)``
     so the bot engine can log the rejection and skip the trade.
+
+    ``reducing=True`` marks a risk-reducing order (close, buy-back, unwind);
+    those are exempt from the open-position cap so a full book can still be
+    de-risked.
     """
     if contracts <= 0:
         return False, "contracts must be > 0"
@@ -238,7 +243,7 @@ def validate_options_order(
         return False, (
             f"max_contracts_per_trade exceeded: {contracts} > {caps.max_contracts_per_trade}"
         )
-    if open_positions_count >= caps.max_open_positions:
+    if not reducing and open_positions_count >= caps.max_open_positions:
         return False, (
             f"max_open_positions reached: {open_positions_count}/{caps.max_open_positions}"
         )

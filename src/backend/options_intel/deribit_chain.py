@@ -12,10 +12,13 @@ The surface parser expects:
   - ``type=option``
   - ``option_type`` in {call, put}
   - ``strike`` OR ``strike_price`` > 0
-  - ``iv`` OR ``mark_iv`` > 0 (decimal; normalizer divides percent by 100)
+  - ``iv`` OR ``mark_iv`` > 0 (decimal; this normalizer divides Deribit's
+    percent values by 100 so downstream consumers see decimal IV)
   - ``expiration_timestamp`` (either seconds or ms is fine — the surface
     parser auto-detects)
-  - ``mark_price`` (BTC; we keep it as published)
+  - ``mark_price`` in USD (Deribit publishes BTC-denominated marks; we
+    convert via ``underlying_price`` / ``estimated_delivery_price``, and
+    drop the mark when no underlying price is available)
 """
 
 from __future__ import annotations
@@ -53,6 +56,18 @@ def normalize_deribit_chain(chain: list[dict]) -> list[dict]:
         iv = float(mark_iv)
         if iv <= 0:
             continue
+        if iv > 2.0:
+            iv = iv / 100.0
+
+        underlying = _positive_float(record.get("underlying_price"))
+        if underlying is None:
+            underlying = _positive_float(record.get("estimated_delivery_price"))
+        mark_price_btc = _safe_float(record.get("mark_price"))
+        mark_price_usd = (
+            mark_price_btc * underlying
+            if mark_price_btc is not None and underlying is not None
+            else None
+        )
 
         expiry_dt = datetime(
             spec.expiry.year, spec.expiry.month, spec.expiry.day,
@@ -68,10 +83,10 @@ def normalize_deribit_chain(chain: list[dict]) -> list[dict]:
             "strike_price": float(spec.strike),
             "iv": iv,
             "mark_iv": iv,
-            "mark_price": _safe_float(record.get("mark_price")),
+            "mark_price": mark_price_usd,
             "expiry_timestamp": expiry_seconds,
             "expiration_timestamp": expiry_seconds,
-            "underlying_price": _safe_float(record.get("underlying_price")),
+            "underlying_price": underlying,
             "source": "deribit",
         }
         out.append(normalized)
@@ -85,3 +100,8 @@ def _safe_float(value) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _positive_float(value) -> Optional[float]:
+    parsed = _safe_float(value)
+    return parsed if parsed is not None and parsed > 0 else None

@@ -130,8 +130,15 @@ def _signal_1(anchor: Optional[IVHistoryRow], current_spot: float) -> str:
 
 
 def _signal_2(rv: float, iv: float) -> tuple[str, float]:
-    """RV/IV ratio test. Returns (label, ratio)."""
+    """RV/IV ratio test. Returns (label, ratio).
+
+    ``rv <= 0`` means the close series was flat, too short, or garbage —
+    there is no realized-vol information, so the signal is 'unknown'
+    rather than a spurious 'rich' (which would bias toward selling vol
+    on every data outage)."""
     if iv <= 0 or math.isnan(rv) or math.isnan(iv):
+        return "unknown", 0.0
+    if rv <= 0:
         return "unknown", 0.0
     ratio = rv / iv
     if ratio > _RV_IV_CHEAP_FLOOR:

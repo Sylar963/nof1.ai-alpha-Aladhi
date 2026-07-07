@@ -7,28 +7,40 @@ source of truth:
 - reconcile open option positions from ``thalex.get_user_state()``
 - subscribe/unsubscribe ticker channels to match the live portfolio
 - compute net option delta per underlying across the WHOLE book
-- compare that against the current Hyperliquid perp delta
+- compare that against a persistent hedge ledger (``data/hedge_ledger.json``)
+  that tracks only the perp delta this manager itself has traded
 - rebalance only the residual drift above the configured threshold
 
-This makes spreads, multi-tenor books, restarts, and manual position changes
-behave correctly because the hedge target comes from venue state rather than
-local bookkeeping.
+Hedging against the ledger instead of the total venue perp position keeps the
+hedge book segregated from any directional perp positions the perps strategy
+holds on the same coin. Safety rails: per-underlying cooldown
+(``hedge_cooldown_seconds``), a minimum residual notional
+(``hedge_min_notional_usd``) treated as acceptable drift, and a per-order
+notional cap (``hedge_max_order_notional_usd``).
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
+import tempfile
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Optional
 
+from src.backend.config_loader import CONFIG
 from src.backend.trading.exchange_adapter import ExchangeAdapter, OrderResult
 from src.backend.trading.options import parse_instrument_name
-from src.backend.trading.options_strategies import DeltaHedger
+from src.backend.trading.options_strategies import DeltaHedger, _order_ok
 
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_LEDGER_PATH = Path("data/hedge_ledger.json")
 
 
 @dataclass
@@ -49,6 +61,7 @@ class DeltaHedgeManager:
         hyperliquid: ExchangeAdapter,
         hedger: Optional[DeltaHedger] = None,
         enabled: bool = True,
+        ledger_path: Optional[Path] = None,
     ) -> None:
         self.thalex = thalex
         self.hyperliquid = hyperliquid
@@ -62,6 +75,51 @@ class DeltaHedgeManager:
         self._last_known_positions: dict[str, list[_OptionPosition]] = {}
         self._last_state_error: Optional[str] = None
         self._unknown_state_logged_for: set[str] = set()
+        self._ledger_path = Path(ledger_path) if ledger_path is not None else _DEFAULT_LEDGER_PATH
+        self._hedge_ledger: dict[str, float] = {}
+        self._last_hedge_at: dict[str, float] = {}
+        self._load_hedge_ledger()
+
+    def _load_hedge_ledger(self) -> None:
+        try:
+            if self._ledger_path.exists():
+                with open(self._ledger_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    self._hedge_ledger = {
+                        str(key).upper(): coerced
+                        for key, value in data.items()
+                        if (coerced := _coerce_float(value)) is not None
+                    }
+                    logger.info(
+                        "Loaded hedge ledger from %s: %s",
+                        self._ledger_path,
+                        self._hedge_ledger,
+                    )
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("Failed to load hedge ledger %s: %s", self._ledger_path, exc)
+
+    def _save_hedge_ledger(self) -> None:
+        try:
+            path = self._ledger_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=path.name + ".", suffix=".tmp", dir=str(path.parent),
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(self._hedge_ledger, f)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_name, path)
+            except Exception:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+                raise
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("Failed to save hedge ledger %s: %s", self._ledger_path, exc)
 
     def is_enabled(self) -> bool:
         return self._enabled
@@ -364,29 +422,23 @@ class DeltaHedgeManager:
                 signed_size = position.size if position.side == "long" else -position.size
                 net_option_delta += signed_size * delta
 
-            if missing_greeks:
-                message = (
-                    "missing live delta for " + ", ".join(sorted(missing_greeks))
-                )
-                previous = self.degraded_underlyings.get(underlying)
-                self.degraded_underlyings[underlying] = message
-                if previous != message:
-                    logger.error(
-                        "delta hedge degraded for %s: %s — skipping rebalance until greeks recover",
-                        underlying,
-                        message,
-                    )
-                current_perp_delta = await self._current_perp_delta(underlying)
-                self._metrics_by_underlying[underlying] = {
+            current_perp_delta = await self._current_perp_delta(underlying)
+            ledger_delta = self._hedge_ledger.get(underlying, 0.0)
+
+            def _metrics(**overrides: Any) -> dict[str, Any]:
+                base: dict[str, Any] = {
                     "underlying": underlying,
-                    "status": "degraded",
-                    "degraded": True,
-                    "degraded_reason": message,
+                    "status": "neutral",
+                    "degraded": False,
+                    "degraded_reason": None,
                     "open_option_positions": len(positions),
                     "subscribed_instruments": subscribed_instruments,
                     "net_option_delta": round(net_option_delta, 6),
                     "target_perp_delta": None,
-                    "current_perp_delta": round(current_perp_delta, 6),
+                    "current_perp_delta": (
+                        round(current_perp_delta, 6) if current_perp_delta is not None else None
+                    ),
+                    "hedge_ledger_delta": round(ledger_delta, 6),
                     "residual_delta": None,
                     "drift_abs": None,
                     "threshold": self.hedger.threshold,
@@ -395,102 +447,189 @@ class DeltaHedgeManager:
                     "last_rebalance_at": None,
                     "updated_at": datetime.now(UTC).isoformat(),
                 }
+                base.update(overrides)
+                return base
+
+            def _mark_degraded(message: str) -> None:
+                previous = self.degraded_underlyings.get(underlying)
+                self.degraded_underlyings[underlying] = message
+                if previous != message:
+                    logger.error(
+                        "delta hedge degraded for %s: %s — skipping rebalance",
+                        underlying,
+                        message,
+                    )
+
+            if missing_greeks:
+                message = (
+                    "missing live delta for " + ", ".join(sorted(missing_greeks))
+                )
+                _mark_degraded(message)
+                self._metrics_by_underlying[underlying] = _metrics(
+                    status="degraded",
+                    degraded=True,
+                    degraded_reason=message,
+                )
+                return []
+
+            if current_perp_delta is None:
+                message = "hyperliquid perp state unknown"
+                _mark_degraded(message)
+                self._metrics_by_underlying[underlying] = _metrics(
+                    status="degraded",
+                    degraded=True,
+                    degraded_reason=message,
+                )
                 return []
 
             self.degraded_underlyings.pop(underlying, None)
 
             target_perp_delta = -net_option_delta
-            current_perp_delta = await self._current_perp_delta(underlying)
-            residual_before = target_perp_delta - current_perp_delta
+            residual_before = target_perp_delta - ledger_delta
             action = self.hedger.compute_rebalance(
                 target_delta=target_perp_delta,
-                current_perp_delta=current_perp_delta,
+                current_perp_delta=ledger_delta,
             )
             if action.side == "noop" or action.contracts_to_trade <= 0:
-                self._metrics_by_underlying[underlying] = {
-                    "underlying": underlying,
-                    "status": "neutral" if positions else "flat",
-                    "degraded": False,
-                    "degraded_reason": None,
-                    "open_option_positions": len(positions),
-                    "subscribed_instruments": subscribed_instruments,
-                    "net_option_delta": round(net_option_delta, 6),
-                    "target_perp_delta": round(target_perp_delta, 6),
-                    "current_perp_delta": round(current_perp_delta, 6),
-                    "residual_delta": round(residual_before, 6),
-                    "drift_abs": round(abs(residual_before), 6),
-                    "threshold": self.hedger.threshold,
-                    "last_rebalance_side": None,
-                    "last_rebalance_size": 0.0,
-                    "last_rebalance_at": None,
-                    "updated_at": datetime.now(UTC).isoformat(),
-                }
+                self._metrics_by_underlying[underlying] = _metrics(
+                    status="neutral" if positions else "flat",
+                    target_perp_delta=round(target_perp_delta, 6),
+                    residual_delta=round(residual_before, 6),
+                    drift_abs=round(abs(residual_before), 6),
+                )
                 logger.debug(
-                    "delta hedge noop for %s (target=%.4f current=%.4f)",
+                    "delta hedge noop for %s (target=%.4f ledger=%.4f)",
                     underlying,
                     target_perp_delta,
-                    current_perp_delta,
+                    ledger_delta,
+                )
+                return []
+
+            contracts_to_trade = action.contracts_to_trade
+            price = None
+            try:
+                price = _coerce_float(await self.hyperliquid.get_current_price(underlying))
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.warning("get_current_price failed for %s: %s", underlying, exc)
+
+            if price is not None and price > 0:
+                min_notional = _coerce_float(CONFIG.get("hedge_min_notional_usd", 10.0)) or 0.0
+                if contracts_to_trade * price < min_notional:
+                    self._metrics_by_underlying[underlying] = _metrics(
+                        status="neutral" if positions else "flat",
+                        target_perp_delta=round(target_perp_delta, 6),
+                        residual_delta=round(residual_before, 6),
+                        drift_abs=round(abs(residual_before), 6),
+                    )
+                    logger.debug(
+                        "delta hedge skip for %s: residual notional %.2f below %.2f",
+                        underlying,
+                        contracts_to_trade * price,
+                        min_notional,
+                    )
+                    return []
+                max_notional = _coerce_float(
+                    CONFIG.get("hedge_max_order_notional_usd", 50000.0)
+                ) or 0.0
+                if max_notional > 0 and contracts_to_trade * price > max_notional:
+                    capped = max_notional / price
+                    logger.warning(
+                        "delta hedge order for %s capped: %.6f -> %.6f contracts (max notional %.2f USD)",
+                        underlying,
+                        contracts_to_trade,
+                        capped,
+                        max_notional,
+                    )
+                    contracts_to_trade = capped
+
+            cooldown_s = _coerce_float(CONFIG.get("hedge_cooldown_seconds", 30)) or 0.0
+            last_hedge_at = self._last_hedge_at.get(underlying)
+            if last_hedge_at is not None and (time.monotonic() - last_hedge_at) < cooldown_s:
+                self._metrics_by_underlying[underlying] = _metrics(
+                    status="cooldown",
+                    target_perp_delta=round(target_perp_delta, 6),
+                    residual_delta=round(residual_before, 6),
+                    drift_abs=round(abs(residual_before), 6),
+                )
+                logger.debug(
+                    "delta hedge cooldown for %s (residual=%.4f)",
+                    underlying,
+                    residual_before,
                 )
                 return []
 
             try:
                 if action.side == "buy":
-                    order = await self.hyperliquid.place_buy_order(underlying, action.contracts_to_trade)
+                    order = await self.hyperliquid.place_buy_order(underlying, contracts_to_trade)
                 else:
-                    order = await self.hyperliquid.place_sell_order(underlying, action.contracts_to_trade)
-
-                updated_perp_delta = await self._current_perp_delta(underlying)
-                residual = target_perp_delta - updated_perp_delta
-                self._metrics_by_underlying[underlying] = {
-                    "underlying": underlying,
-                    "status": "rebalanced",
-                    "degraded": False,
-                    "degraded_reason": None,
-                    "open_option_positions": len(positions),
-                    "subscribed_instruments": subscribed_instruments,
-                    "net_option_delta": round(net_option_delta, 6),
-                    "target_perp_delta": round(target_perp_delta, 6),
-                    "current_perp_delta": round(updated_perp_delta, 6),
-                    "residual_delta": round(residual, 6),
-                    "drift_abs": round(abs(residual), 6),
-                    "threshold": self.hedger.threshold,
-                    "last_rebalance_side": action.side,
-                    "last_rebalance_size": round(action.contracts_to_trade, 6),
-                    "last_rebalance_at": datetime.now(UTC).isoformat(),
-                    "updated_at": datetime.now(UTC).isoformat(),
-                }
-                logger.info(
-                    "delta rebalance %s %.4f %s (target=%.4f before=%.4f after=%.4f residual=%.4f)",
-                    action.side,
-                    action.contracts_to_trade,
-                    underlying,
-                    target_perp_delta,
-                    current_perp_delta,
-                    updated_perp_delta,
-                    residual,
-                )
-                return [order]
+                    order = await self.hyperliquid.place_sell_order(underlying, contracts_to_trade)
             except Exception as exc:  # pylint: disable=broad-except
-                self._metrics_by_underlying[underlying] = {
-                    "underlying": underlying,
-                    "status": "error",
-                    "degraded": True,
-                    "degraded_reason": str(exc),
-                    "open_option_positions": len(positions),
-                    "subscribed_instruments": subscribed_instruments,
-                    "net_option_delta": round(net_option_delta, 6),
-                    "target_perp_delta": round(target_perp_delta, 6),
-                    "current_perp_delta": round(current_perp_delta, 6),
-                    "residual_delta": round(residual_before, 6),
-                    "drift_abs": round(abs(residual_before), 6),
-                    "threshold": self.hedger.threshold,
-                    "last_rebalance_side": action.side,
-                    "last_rebalance_size": round(action.contracts_to_trade, 6),
-                    "last_rebalance_at": None,
-                    "updated_at": datetime.now(UTC).isoformat(),
-                }
+                self._metrics_by_underlying[underlying] = _metrics(
+                    status="error",
+                    degraded=True,
+                    degraded_reason=str(exc),
+                    target_perp_delta=round(target_perp_delta, 6),
+                    residual_delta=round(residual_before, 6),
+                    drift_abs=round(abs(residual_before), 6),
+                    last_rebalance_side=action.side,
+                    last_rebalance_size=round(contracts_to_trade, 6),
+                )
                 logger.error("delta rebalance failed for %s: %s", underlying, exc)
                 return []
+
+            accepted, _filled, reason = _order_ok(order)
+            if not accepted:
+                self._metrics_by_underlying[underlying] = _metrics(
+                    status="rejected",
+                    degraded=True,
+                    degraded_reason=reason,
+                    target_perp_delta=round(target_perp_delta, 6),
+                    residual_delta=round(residual_before, 6),
+                    drift_abs=round(abs(residual_before), 6),
+                    last_rebalance_side=action.side,
+                    last_rebalance_size=round(contracts_to_trade, 6),
+                )
+                logger.error(
+                    "delta rebalance order rejected for %s (%s %.6f): %s — ledger unchanged",
+                    underlying,
+                    action.side,
+                    contracts_to_trade,
+                    reason,
+                )
+                return []
+
+            executed = _executed_amount(order, contracts_to_trade)
+            signed_executed = executed if action.side == "buy" else -executed
+            self._hedge_ledger[underlying] = ledger_delta + signed_executed
+            self._save_hedge_ledger()
+            self._last_hedge_at[underlying] = time.monotonic()
+
+            residual = target_perp_delta - self._hedge_ledger[underlying]
+            updated_perp_delta = await self._current_perp_delta(underlying)
+            self._metrics_by_underlying[underlying] = _metrics(
+                status="rebalanced",
+                target_perp_delta=round(target_perp_delta, 6),
+                current_perp_delta=(
+                    round(updated_perp_delta, 6) if updated_perp_delta is not None else None
+                ),
+                hedge_ledger_delta=round(self._hedge_ledger[underlying], 6),
+                residual_delta=round(residual, 6),
+                drift_abs=round(abs(residual), 6),
+                last_rebalance_side=action.side,
+                last_rebalance_size=round(executed, 6),
+                last_rebalance_at=datetime.now(UTC).isoformat(),
+            )
+            logger.info(
+                "delta rebalance %s %.4f %s (target=%.4f ledger_before=%.4f ledger_after=%.4f residual=%.4f)",
+                action.side,
+                executed,
+                underlying,
+                target_perp_delta,
+                ledger_delta,
+                self._hedge_ledger[underlying],
+                residual,
+            )
+            return [order]
 
     async def _resolve_position_delta(self, position: _OptionPosition) -> Optional[float]:
         if position.delta_hint is not None:
@@ -506,12 +645,12 @@ class DeltaHedgeManager:
                 return _coerce_float(greeks.get("delta"))
         return None
 
-    async def _current_perp_delta(self, underlying: str) -> float:
+    async def _current_perp_delta(self, underlying: str) -> Optional[float]:
         try:
             state = await self.hyperliquid.get_user_state()
         except Exception as exc:  # pylint: disable=broad-except
             logger.warning("get_user_state failed: %s", exc)
-            return 0.0
+            return None
 
         positions = []
         if isinstance(state, dict):
@@ -520,9 +659,12 @@ class DeltaHedgeManager:
             positions = getattr(state, "positions", []) or []
 
         for pos in positions:
-            asset = _field(pos, "asset")
-            if asset != underlying:
+            coin = _field(pos, "coin") or _field(pos, "asset")
+            if str(coin or "").upper() != underlying.upper():
                 continue
+            szi = _coerce_float(_field(pos, "szi"))
+            if szi is not None:
+                return szi
             size = _coerce_float(_field(pos, "size")) or 0.0
             side = str(_field(pos, "side") or "long").lower()
             magnitude = abs(size)
@@ -534,6 +676,28 @@ def _field(obj: Any, name: str) -> Any:
     if isinstance(obj, dict):
         return obj.get(name)
     return getattr(obj, name, None)
+
+
+def _executed_amount(order: Any, requested: float) -> float:
+    if isinstance(order, OrderResult):
+        amount = _coerce_float(order.amount)
+        if amount is not None and amount > 0:
+            return amount
+        return requested
+    if isinstance(order, dict):
+        try:
+            statuses = order["response"]["data"]["statuses"]
+        except (KeyError, TypeError):
+            return requested
+        total = 0.0
+        for st in statuses:
+            if isinstance(st, dict) and isinstance(st.get("filled"), dict):
+                size = _coerce_float(st["filled"].get("totalSz"))
+                if size is not None:
+                    total += size
+        if total > 0:
+            return total
+    return requested
 
 
 def _coerce_float(value: Any) -> Optional[float]:

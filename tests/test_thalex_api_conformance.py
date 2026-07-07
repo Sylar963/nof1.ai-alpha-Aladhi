@@ -76,8 +76,10 @@ async def test_place_buy_order_uses_ioc_limit_price_guard():
 
     assert calls[0]["order_type"] == OrderType.LIMIT
     assert calls[0]["time_in_force"] == TimeInForce.IOC
-    assert calls[0]["price"] == pytest.approx(102.0)
-    assert order.price == pytest.approx(102.0)
+    # Never priced beyond the touch — slippage no longer pays through the ask.
+    assert calls[0]["price"] == pytest.approx(100.0)
+    assert order.price == pytest.approx(100.0)
+    assert isinstance(calls[0]["client_order_id"], int)
 
 
 @pytest.mark.asyncio

@@ -161,6 +161,18 @@ CONFIG = {
         "thalex_hedge_reconcile_interval_seconds",
         _get_int("THALEX_HEDGE_RECONCILE_INTERVAL_SECONDS", 15),
     ),
+    # Hyperliquid execution
+    "hl_meta_cache_ttl_seconds": _get_int("HL_META_CACHE_TTL_SECONDS", 60),
+    "hl_max_slippage": _get_float("HL_MAX_SLIPPAGE", 0.005),
+    # Delta hedge safety caps
+    "hedge_cooldown_seconds": _get_int("HEDGE_COOLDOWN_SECONDS", 30),
+    "hedge_min_notional_usd": _get_float("HEDGE_MIN_NOTIONAL_USD", 10.0),
+    "hedge_max_order_notional_usd": _get_float("HEDGE_MAX_ORDER_NOTIONAL_USD", 50000.0),
+    # Options execution quality
+    "thalex_cross_fraction": _get_float("THALEX_CROSS_FRACTION", 0.25),
+    "options_min_net_credit_usd": _get_float("OPTIONS_MIN_NET_CREDIT_USD", 0.0),
+    "options_fill_timeout_seconds": _get_int("OPTIONS_FILL_TIMEOUT_SECONDS", 30),
+    "mispricing_cost_haircut_bps": _get_float("MISPRICING_COST_HAIRCUT_BPS", 25.0),
     # LLM via OpenRouter
     "openrouter_api_key": _get_env("OPENROUTER_API_KEY"),
     "openrouter_base_url": _get_env("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
@@ -168,6 +180,9 @@ CONFIG = {
     "openrouter_app_title": _get_env("OPENROUTER_APP_TITLE", "trading-agent"),
     "llm_model": _get_env("LLM_MODEL", "x-ai/grok-4"),
     "llm_max_tokens": _get_env("LLM_MAX_TOKENS", "16384"),
+    "llm_temperature": _get_float("LLM_TEMPERATURE", 0.2),
+    "llm_timeout_seconds": _get_int("LLM_TIMEOUT_SECONDS", 180),
+    "sanitize_model": _get_env("SANITIZE_MODEL"),
     # Options reasoning is much more verbose than perps (vol surface,
     # multi-leg construction, greeks, regime). Default 32K, can go up to 96K
     # for models that support it.
@@ -181,7 +196,20 @@ CONFIG = {
     # Runtime controls via env
     "assets": _get_env("ASSETS"),  # e.g., "BTC ETH SOL" or "BTC,ETH,SOL"
     "interval": _get_env("INTERVAL"),  # e.g., "5m", "1h"
+    # Higher-timeframe frame used for "long_term" indicators in the LLM
+    # context. Deliberately separate from INTERVAL (the loop cadence).
+    "analysis_interval": _get_env("ANALYSIS_INTERVAL", "4h"),
     "trading_mode": _get_env("TRADING_MODE", "auto"),  # manual or auto
+    # Risk engine (enforced in code, not just prompt)
+    "max_risk_per_trade_pct": _get_float("MAX_RISK_PER_TRADE_PCT", 1.0),
+    "max_gross_leverage": _get_float("MAX_GROSS_LEVERAGE", 3.0),
+    "max_daily_loss_pct": _get_float("MAX_DAILY_LOSS_PCT", 5.0),
+    "proposal_ttl_seconds": _get_int("PROPOSAL_TTL_SECONDS", 900),
+    "proposal_max_price_drift_pct": _get_float("PROPOSAL_MAX_PRICE_DRIFT_PCT", 1.0),
+    # Circuit breaker (previously read from CONFIG but never loaded from env)
+    "CIRCUIT_BREAKER_CONSECUTIVE_FAILS": _get_int("CIRCUIT_BREAKER_CONSECUTIVE_FAILS", 3),
+    "CIRCUIT_BREAKER_DRAWDOWN_PCT": _get_float("CIRCUIT_BREAKER_DRAWDOWN_PCT", 5.0),
+    "FAILED_PROPOSAL_TTL_SECONDS": _get_int("FAILED_PROPOSAL_TTL_SECONDS", 1800),
     # API server
     "api_host": _get_env("API_HOST", "0.0.0.0"),
     "api_port": _get_env("APP_PORT") or _get_env("API_PORT") or "3000",

@@ -298,7 +298,7 @@ class BotService:
             snapshot = market_data.get(asset, {})
             price = snapshot.get('price')
             indicators = indicator_payloads.get(asset) or {}
-            long_term_interval = str(CONFIG.get('interval', '4h'))
+            long_term_interval = str(CONFIG.get('analysis_interval') or '4h')
             section = {
                 'asset': asset,
                 'current_price': price,
@@ -525,7 +525,7 @@ class BotService:
                             from src.backend.indicators.indicator_engine import build_indicator_bundle
                             from datetime import timezone, timedelta
 
-                            interval = CONFIG.get("interval", "4h")
+                            interval = CONFIG.get("analysis_interval") or "4h"
                             now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
                             avwap_anchor_ms = int(datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp()) * 1000
                             interval_minutes = {"1m": 1, "5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440}

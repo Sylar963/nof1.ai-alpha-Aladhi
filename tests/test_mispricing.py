@@ -9,6 +9,7 @@ from datetime import date
 
 import pytest
 
+from src.backend.config_loader import CONFIG
 from src.backend.options_intel.mispricing import (
     MispricingScanReport,
     interpolate_deribit_surface,
@@ -16,16 +17,18 @@ from src.backend.options_intel.mispricing import (
 )
 
 
-def _thalex(name, expiry, strike, kind, iv):
-    return {
+def _thalex(name, expiry, strike, kind, iv, **extra):
+    record = {
         "instrument_name": name,
         "type": "option",
         "underlying": "BTCUSD",
         "option_type": kind,
         "strike": strike,
-        "mark_iv": iv,
+        "iv": iv,
         "expiry_timestamp": int(expiry),
     }
+    record.update(extra)
+    return record
 
 
 def _deribit(name, expiry_ts, strike, kind, iv):
@@ -64,7 +67,7 @@ def test_scan_finds_top_mispricings_by_iv_diff_bps():
         _deribit("BTC-10MAY26-70000-C", expiry, 70000, "call", 0.65),  # Thalex 1000 bps richer
     ]
 
-    report = scan_mispricings(thalex_chain, deribit_chain, top_n=3)
+    report = scan_mispricings(thalex_chain, deribit_chain, top_n=3, cost_haircut_bps=0.0)
 
     assert isinstance(report, MispricingScanReport)
     assert len(report.top) == 3
@@ -90,7 +93,7 @@ def test_scan_skips_unmatched_thalex_instruments():
         _deribit("BTC-10MAY26-60000-C", expiry_a, 60000, "call", 0.60),
     ]
 
-    report = scan_mispricings(thalex_chain, deribit_chain, top_n=5)
+    report = scan_mispricings(thalex_chain, deribit_chain, top_n=5, cost_haircut_bps=0.0)
 
     assert len(report.top) == 1
     assert report.matched_count == 1
@@ -102,7 +105,7 @@ def test_scan_returns_empty_when_no_matches():
     thalex_chain = [_thalex("BTC-10MAY26-60000-C", expiry, 60000, "call", 0.65)]
     deribit_chain = [_deribit("BTC-10MAY26-65000-C", expiry, 65000, "call", 0.60)]
 
-    report = scan_mispricings(thalex_chain, deribit_chain, top_n=5)
+    report = scan_mispricings(thalex_chain, deribit_chain, top_n=5, cost_haircut_bps=0.0)
     assert report.top == []
     assert report.matched_count == 0
     assert report.skipped_count == 1
@@ -119,7 +122,7 @@ def test_scan_filters_below_threshold_bps():
         _deribit("BTC-10MAY26-60000-C", expiry, 60000, "call", 0.6500),  # 10 bps diff
         _deribit("BTC-10MAY26-65000-C", expiry, 65000, "call", 0.6500),  # 500 bps diff
     ]
-    report = scan_mispricings(thalex_chain, deribit_chain, top_n=5, min_edge_bps=200)
+    report = scan_mispricings(thalex_chain, deribit_chain, top_n=5, min_edge_bps=200, cost_haircut_bps=0.0)
     assert len(report.top) == 1
     assert report.top[0]["instrument_name"] == "BTC-10MAY26-65000-C"
 
@@ -192,6 +195,7 @@ def test_scan_uses_interpolation_when_enabled_and_unmatched_thalex_tenor():
         deribit_chain,
         top_n=5,
         use_interpolation=True,
+        cost_haircut_bps=0.0,
     )
     assert report.matched_count == 1
     assert report.skipped_count == 0
@@ -199,3 +203,126 @@ def test_scan_uses_interpolation_when_enabled_and_unmatched_thalex_tenor():
     # Interpolated IV ≈ sqrt((0.16 + 0.36)/2) ≈ 0.5099, Thalex 0.55 → ~390 bps richer
     edge = report.top[0]["edge_bps"]
     assert 350 < edge < 450
+
+
+# ---------------------------------------------------------------------------
+# Production field shapes, unit normalization, cost-awareness
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_enricher_shaped_chain_produces_matches():
+    """Regression: real Thalex chains carry ``iv`` (via chain_enricher) and
+    ``strike_price``, never ``mark_iv`` — the scanner must still match."""
+    import time
+    from src.backend.options_intel.chain_enricher import enrich_chain_with_tickers
+
+    expiry = int(time.time()) + 30 * 86400
+    instruments = [{
+        "instrument_name": "BTC-XX-80000-C",
+        "type": "option",
+        "option_type": "call",
+        "strike_price": 80000.0,
+        "expiration_timestamp": expiry,
+    }]
+
+    class _FakeThalex:
+        async def get_ticker_snapshot(self, name):
+            return {"iv": 0.65, "mark_price": 3000.0, "delta": 0.5,
+                    "best_bid": 2900.0, "best_ask": 3100.0}
+
+    enriched, stats = await enrich_chain_with_tickers(
+        instruments, thalex=_FakeThalex(), spot=80000.0,
+    )
+    assert stats["enriched"] == 1
+
+    deribit_chain = [{
+        "instrument_name": "BTC-XX-80000-C",
+        "kind": "option",
+        "option_type": "call",
+        "strike": 80000.0,
+        "mark_iv": 60.0,
+        "expiration_timestamp": expiry * 1000,
+    }]
+
+    report = scan_mispricings(enriched, deribit_chain, top_n=5, cost_haircut_bps=0.0)
+    assert report.matched_count == 1
+    assert report.skipped_count == 0
+    assert len(report.top) == 1
+    assert report.top[0]["edge_bps"] == pytest.approx(500, abs=1)
+
+
+def test_units_normalized_percent_deribit_vs_decimal_thalex():
+    """Deribit book summaries publish IV in percent (55.0); Thalex tickers in
+    decimal (0.55). Both must be compared in decimal so the edge is sane."""
+    expiry = _utc_ts(date(2026, 5, 10))
+    thalex_chain = [_thalex("BTC-10MAY26-60000-C", expiry, 60000, "call", 0.65)]
+    deribit_chain = [_deribit("BTC-10MAY26-60000-C", expiry, 60000, "call", 62.0)]
+
+    report = scan_mispricings(thalex_chain, deribit_chain, top_n=5, cost_haircut_bps=0.0)
+    assert report.matched_count == 1
+    assert report.top[0]["edge_bps"] == pytest.approx(300, abs=1)
+    assert report.top[0]["iv_deribit"] == pytest.approx(0.62)
+
+
+def test_haircut_subtracted_when_no_executable_quotes(monkeypatch):
+    expiry = _utc_ts(date(2026, 5, 10))
+    thalex_chain = [_thalex("BTC-10MAY26-60000-C", expiry, 60000, "call", 0.70)]
+    deribit_chain = [_deribit("BTC-10MAY26-60000-C", expiry, 60000, "call", 0.65)]
+
+    monkeypatch.delitem(CONFIG, "mispricing_cost_haircut_bps", raising=False)
+    report = scan_mispricings(thalex_chain, deribit_chain, top_n=5)
+    assert report.top[0]["edge_bps"] == pytest.approx(475, abs=1)
+
+    monkeypatch.setitem(CONFIG, "mispricing_cost_haircut_bps", 100.0)
+    report = scan_mispricings(thalex_chain, deribit_chain, top_n=5)
+    assert report.top[0]["edge_bps"] == pytest.approx(400, abs=1)
+
+
+def test_haircut_preserves_sign_on_cheap_side():
+    expiry = _utc_ts(date(2026, 5, 10))
+    thalex_chain = [_thalex("BTC-10MAY26-60000-C", expiry, 60000, "call", 0.60)]
+    deribit_chain = [_deribit("BTC-10MAY26-60000-C", expiry, 60000, "call", 0.65)]
+
+    report = scan_mispricings(thalex_chain, deribit_chain, top_n=5, cost_haircut_bps=25.0)
+    assert report.top[0]["edge_bps"] == pytest.approx(-475, abs=1)
+
+
+def test_executable_bid_iv_used_for_sell_side_edge():
+    """Thalex looks rich at mark → we'd sell on Thalex → edge from bid IV."""
+    expiry = _utc_ts(date(2026, 5, 10))
+    thalex_chain = [_thalex(
+        "BTC-10MAY26-60000-C", expiry, 60000, "call", 0.70,
+        bid_iv=0.68, ask_iv=0.72, best_bid=3000.0, best_ask=3200.0,
+    )]
+    deribit_chain = [_deribit("BTC-10MAY26-60000-C", expiry, 60000, "call", 0.65)]
+
+    report = scan_mispricings(thalex_chain, deribit_chain, top_n=5)
+    assert report.top[0]["edge_bps"] == pytest.approx(300, abs=1)
+
+
+def test_executable_ask_iv_used_for_buy_side_edge():
+    """Thalex looks cheap at mark → we'd buy on Thalex → edge from ask IV."""
+    expiry = _utc_ts(date(2026, 5, 10))
+    thalex_chain = [_thalex(
+        "BTC-10MAY26-60000-C", expiry, 60000, "call", 0.60,
+        bid_iv=0.58, ask_iv=0.62, best_bid=2500.0, best_ask=2700.0,
+    )]
+    deribit_chain = [_deribit("BTC-10MAY26-60000-C", expiry, 60000, "call", 0.65)]
+
+    report = scan_mispricings(thalex_chain, deribit_chain, top_n=5)
+    assert report.top[0]["edge_bps"] == pytest.approx(-300, abs=1)
+
+
+def test_skips_instrument_with_zero_quote_on_executable_side():
+    expiry = _utc_ts(date(2026, 5, 10))
+    thalex_chain = [_thalex(
+        "BTC-10MAY26-60000-C", expiry, 60000, "call", 0.70,
+        best_bid=0.0, best_ask=3200.0,
+    )]
+    deribit_chain = [_deribit("BTC-10MAY26-60000-C", expiry, 60000, "call", 0.65)]
+
+    report = scan_mispricings(thalex_chain, deribit_chain, top_n=5, cost_haircut_bps=0.0)
+    assert report.top == []
+    assert report.matched_count == 0
+    assert report.skipped_count == 1

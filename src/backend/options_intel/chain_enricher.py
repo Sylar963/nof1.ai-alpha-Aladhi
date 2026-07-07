@@ -34,6 +34,10 @@ _TICKER_FIELDS_TO_MERGE: tuple[str, ...] = (
     "index",
     "open_interest",
     "volume_24h",
+    "best_bid",
+    "best_ask",
+    "bid_iv",
+    "ask_iv",
 )
 
 

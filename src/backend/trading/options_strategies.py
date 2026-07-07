@@ -19,10 +19,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
-from typing import Awaitable, Callable, Optional, TypeVar
+from typing import Any, Awaitable, Callable, Optional, TypeVar
 
 from src.backend.agent.decision_schema import TradeDecision
+from src.backend.config_loader import CONFIG
 from src.backend.trading.exchange_adapter import ExchangeAdapter, OrderResult
 from src.backend.trading.hyperliquid_api import HyperliquidAPI
 from src.backend.trading.options import OptionIntent
@@ -34,7 +36,7 @@ from src.backend.trading.options import OptionIntent
 # which is a legitimate success for credit/iron-condor flows (we want the GTC
 # limit to rest and collect the credit). Anything outside this set is treated
 # as a rejection so the bot never records a phantom fill.
-_ACCEPTED_ORDER_STATUSES = {"ok", "filled", "resting"}
+_ACCEPTED_ORDER_STATUSES = {"ok", "filled", "resting", "partially_filled"}
 
 # Strictly-filled statuses. Delta-hedged flows require the option leg to be
 # filled (not merely resting) before opening a perp hedge, because hedging a
@@ -88,6 +90,35 @@ def _order_ok(order) -> tuple[bool, bool, str]:
             filled = False
         return True, filled, ""
     return False, False, f"unknown order type: {type(order).__name__}"
+
+
+def _filled_amount(order: Any, requested: float) -> float:
+    """Best-effort filled quantity for a submitted Thalex leg.
+
+    Prefers the explicit ``filled_amount`` attribute ThalexAPI attaches to its
+    OrderResults; falls back to the raw payload, then to the status
+    (``filled`` ⇒ fully filled, anything else ⇒ nothing filled).
+    """
+    fa = getattr(order, "filled_amount", None)
+    if fa is not None:
+        try:
+            return max(min(float(fa), float(requested)), 0.0)
+        except (TypeError, ValueError):
+            pass
+    if isinstance(order, OrderResult):
+        raw = order.raw if isinstance(order.raw, dict) else {}
+        for key in ("filled_amount", "filled", "fill_amount", "cumulative_filled", "total_filled"):
+            value = raw.get(key)
+            if value is None:
+                continue
+            try:
+                return max(min(float(value), float(requested)), 0.0)
+            except (TypeError, ValueError):
+                continue
+        if str(order.status or "").lower() == "filled":
+            return float(requested)
+        return 0.0
+    return float(requested)
 
 
 # Default tenor ladder for the multi-tenor target_gamma_btc expansion path.
@@ -322,17 +353,18 @@ class OptionsExecutor:
             )
 
         thalex_order = await self.thalex.place_buy_order(instrument_name, contracts)
-        accepted, filled, reason = _order_ok(thalex_order)
+        accepted, _fully_filled, reason = _order_ok(thalex_order)
         if not accepted:
             return ExecutionResult(
                 ok=False,
                 reason=f"thalex buy {instrument_name} rejected: {reason}",
             )
-        if not filled:
+        filled_contracts = _filled_amount(thalex_order, contracts)
+        if filled_contracts <= 0:
             # Hedging a resting option leaves the book naked on perp if the
-            # option never fills. Bail out and cancel the pending leg so
-            # the operator can re-enter when liquidity supports a fill.
-            await self._unwind_single_delta_hedged_leg(instrument_name, contracts)
+            # option never fills. Cancel the pending leg so the operator can
+            # re-enter when liquidity supports a fill.
+            await self._cancel_and_reverse_leg(thalex_order, instrument_name, "buy", contracts)
             return ExecutionResult(
                 ok=False,
                 reason=(
@@ -340,12 +372,19 @@ class OptionsExecutor:
                     "refusing to hedge a pending option"
                 ),
             )
+        if filled_contracts < contracts:
+            # Partial fill: cancel the resting remainder so the hedge matches
+            # the position actually held.
+            await self._cancel_resting_remainder(
+                thalex_order, instrument_name, filled_contracts, contracts
+            )
 
         if not self._delta_hedge_enabled:
             return ExecutionResult(ok=True, thalex_orders=[thalex_order], hyperliquid_orders=[])
 
-        # Determine hedge direction + size from the live delta.
-        hedge_size = abs(contracts * delta_per_contract)
+        # Determine hedge direction + size from the live delta and the
+        # quantity that actually filled (never the requested contracts).
+        hedge_size = abs(filled_contracts * delta_per_contract)
         hl_orders = []
         if hedge_size > 0:
             hedge_asset = decision.underlying or "BTC"
@@ -367,7 +406,7 @@ class OptionsExecutor:
                         )
                     )
             except Exception as exc:  # pylint: disable=broad-except
-                await self._unwind_single_delta_hedged_leg(instrument_name, contracts)
+                await self._cancel_and_reverse_leg(thalex_order, instrument_name, "buy", contracts)
                 return ExecutionResult(
                     ok=False,
                     reason=f"hyperliquid hedge failed for {hedge_asset}: {exc}",
@@ -383,7 +422,7 @@ class OptionsExecutor:
             else:
                 accepted, filled, reason = False, False, "no hedge order"
             if not accepted or not filled:
-                await self._unwind_single_delta_hedged_leg(instrument_name, contracts)
+                await self._cancel_and_reverse_leg(thalex_order, instrument_name, "buy", contracts)
                 detail = reason if not accepted else "hedge accepted but not filled"
                 return ExecutionResult(
                     ok=False,
@@ -392,42 +431,92 @@ class OptionsExecutor:
 
         return ExecutionResult(ok=True, thalex_orders=[thalex_order], hyperliquid_orders=hl_orders)
 
-    async def _unwind_single_delta_hedged_leg(self, instrument_name: str, contracts: float) -> None:
-        """Best-effort rollback when the Thalex leg lands but the perp hedge fails."""
+    async def _cancel_resting_remainder(
+        self,
+        order: Any,
+        instrument_name: str,
+        filled: float,
+        requested: float,
+    ) -> None:
+        """Cancel the unfilled remainder of an accepted order by id."""
+        if filled >= requested:
+            return
+        order_id = str(getattr(order, "order_id", "") or "") if order is not None else ""
+        if not order_id:
+            logger.warning(
+                "unwind: no order_id for %s — cannot cancel resting remainder (%.4f of %.4f unfilled)",
+                instrument_name, requested - filled, requested,
+            )
+            return
         try:
-            await self.thalex.place_sell_order(instrument_name, contracts)
-            logger.info("unwind: closed single-leg Thalex position %s (%.4f contracts)", instrument_name, contracts)
+            await self.thalex.cancel_order(instrument_name, order_id)
+            logger.info(
+                "unwind: cancelled resting %s order_id=%s (%.4f of %.4f unfilled)",
+                instrument_name, order_id, requested - filled, requested,
+            )
         except Exception as exc:  # pylint: disable=broad-except
             logger.warning(
-                "unwind: thalex sell %s failed: %s — manual intervention may be needed",
-                instrument_name,
-                exc,
+                "unwind: cancel %s order_id=%s failed: %s — manual intervention may be needed",
+                instrument_name, order_id, exc,
+            )
+
+    async def _submit_reduce_only_close(self, instrument_name: str, side: str, contracts: float):
+        """Close a filled leg with reduce-only semantics when the venue supports it."""
+        submit_limit = getattr(self.thalex, "_submit_limit_order", None)
+        entry_limit_price = getattr(self.thalex, "_entry_limit_price", None)
+        if callable(submit_limit) and callable(entry_limit_price):
+            limit_price = await entry_limit_price(instrument_name, side, 0.01)
+            return await submit_limit(
+                instrument_name=instrument_name,
+                amount=contracts,
+                side=side,
+                limit_price=limit_price,
+                reduce_only=True,
+                description=f"Thalex {side} {instrument_name} (unwind)",
+            )
+        if side == "sell":
+            return await self.thalex.place_sell_order(instrument_name, contracts)
+        return await self.thalex.place_buy_order(instrument_name, contracts)
+
+    async def _cancel_and_reverse_leg(
+        self,
+        order: Any,
+        instrument_name: str,
+        side: str,
+        requested_contracts: float,
+    ) -> None:
+        """Best-effort rollback for one submitted leg.
+
+        Cancels any resting (unfilled) remainder by order id so the GTC limit
+        can't fill later, then reverses ONLY the quantity that actually
+        filled. Never places an opposite-side order for contracts that were
+        never held — that would self-match against the resting order or leave
+        a naked short.
+        """
+        filled = _filled_amount(order, requested_contracts)
+        await self._cancel_resting_remainder(order, instrument_name, filled, requested_contracts)
+        if filled <= 0:
+            return
+        close_side = "buy" if side == "sell" else "sell"
+        try:
+            await self._submit_reduce_only_close(instrument_name, close_side, filled)
+            logger.info(
+                "unwind: reversed %s %s (%.4f filled contracts)",
+                side, instrument_name, filled,
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning(
+                "unwind: reverse %s %s failed: %s — manual intervention may be needed",
+                side, instrument_name, exc,
             )
 
     async def _unwind_multi_leg_orders(
         self,
-        submitted_legs: list[tuple[str, str, float]],
+        submitted_legs: list[tuple[str, str, float, Any]],
     ) -> None:
         """Best-effort rollback for partially-submitted multi-leg structures."""
-        for instrument_name, side, contracts in reversed(submitted_legs):
-            try:
-                if side == "sell":
-                    await self.thalex.place_buy_order(instrument_name, contracts)
-                else:
-                    await self.thalex.place_sell_order(instrument_name, contracts)
-                logger.info(
-                    "unwind: reversed multi-leg %s %s (%.4f contracts)",
-                    side,
-                    instrument_name,
-                    contracts,
-                )
-            except Exception as exc:  # pylint: disable=broad-except
-                logger.warning(
-                    "unwind: reverse multi-leg %s %s failed: %s — manual intervention may be needed",
-                    side,
-                    instrument_name,
-                    exc,
-                )
+        for instrument_name, side, contracts, order in reversed(submitted_legs):
+            await self._cancel_and_reverse_leg(order, instrument_name, side, contracts)
 
     async def _execute_delta_hedged_multi_tenor(
         self,
@@ -518,8 +607,8 @@ class OptionsExecutor:
         # ------------------------------------------------------------------
         # SUBMIT PHASE — orders go out only now, with retry + unwind.
         # ------------------------------------------------------------------
-        submitted_thalex: list[tuple[str, float]] = []  # (instrument, contracts)
-        submitted_hl: list[tuple[str, float]] = []      # (side, size)
+        submitted_thalex: list[tuple[str, float, Any]] = []  # (instrument, contracts, order)
+        submitted_hl: list[tuple[str, float]] = []            # (side, size)
         thalex_orders = []
         hl_orders = []
 
@@ -563,7 +652,7 @@ class OptionsExecutor:
                     instrument_name,
                 )
                 await self._unwind_multi_tenor_legs(
-                    submitted_thalex + [(instrument_name, per_leg_contracts)],
+                    submitted_thalex + [(instrument_name, per_leg_contracts, thalex_order)],
                     submitted_hl,
                     underlying,
                     kind,
@@ -576,7 +665,7 @@ class OptionsExecutor:
                     ),
                 )
             thalex_orders.append(thalex_order)
-            submitted_thalex.append((instrument_name, per_leg_contracts))
+            submitted_thalex.append((instrument_name, per_leg_contracts, thalex_order))
 
             if not self._delta_hedge_enabled:
                 continue
@@ -640,7 +729,7 @@ class OptionsExecutor:
 
     async def _unwind_multi_tenor_legs(
         self,
-        submitted_thalex: list[tuple[str, float]],
+        submitted_thalex: list[tuple[str, float, Any]],
         submitted_hl: list[tuple[str, float]],
         underlying: str,
         kind: str,
@@ -648,13 +737,10 @@ class OptionsExecutor:
         """Best-effort compensating rollback for partially-submitted multi-tenor legs.
 
         Called from :meth:`_execute_delta_hedged_multi_tenor` when a Thalex
-        submit or perp hedge fails after retries. For each successfully-
-        submitted leg we send the opposite-direction order to flatten:
-
-        - Long call/put bought on Thalex → submit ``place_sell_order`` for
-          the same instrument and contracts.
-        - Hyperliquid hedge sold (call hedge) → submit ``place_buy_order``
-          to close. Buy (put hedge) → ``place_sell_order``.
+        submit or perp hedge fails after retries. For each Thalex leg the
+        resting remainder is cancelled by order id and only the filled
+        quantity is reversed (see :meth:`_cancel_and_reverse_leg`). Perp
+        hedges are flattened with the opposite-direction order.
 
         Each unwind is wrapped in its own try/except so a single failure
         in the rollback path doesn't abort the rest of the unwind. The
@@ -662,15 +748,8 @@ class OptionsExecutor:
         operator gets a loud log line and the position stays half-open
         for manual intervention.
         """
-        for instrument_name, contracts in submitted_thalex:
-            try:
-                await self.thalex.place_sell_order(instrument_name, contracts)
-                logger.info("unwind: closed thalex leg %s (%.4f contracts)", instrument_name, contracts)
-            except Exception as exc:  # pylint: disable=broad-except
-                logger.warning(
-                    "unwind: thalex sell %s failed: %s — manual intervention may be needed",
-                    instrument_name, exc,
-                )
+        for instrument_name, contracts, order in submitted_thalex:
+            await self._cancel_and_reverse_leg(order, instrument_name, "buy", contracts)
 
         for side, size in submitted_hl:
             try:
@@ -732,8 +811,26 @@ class OptionsExecutor:
                 return ExecutionResult(ok=False, reason=f"no instrument for leg {leg}")
             staged_legs.append((instrument_name, leg.side, leg.contracts))
 
-        submitted_legs: list[tuple[str, str, float]] = []
-        for instrument_name, side, contracts in staged_legs:
+        if decision.strategy in {"credit_put_spread", "credit_call_spread", "iron_condor"}:
+            net_credit = await self._estimate_net_premium(staged_legs)
+            if net_credit is not None:
+                min_credit = float(CONFIG.get("options_min_net_credit_usd", 0.0))
+                if net_credit < min_credit:
+                    return ExecutionResult(
+                        ok=False,
+                        reason=(
+                            f"{decision.strategy} expected net credit ${net_credit:.2f} "
+                            f"below minimum ${min_credit:.2f} — structure would not "
+                            "collect the intended credit"
+                        ),
+                    )
+
+        # Protective (long) legs go in before short legs so the book is never
+        # short an option without its defined-risk wing.
+        ordered_legs = sorted(staged_legs, key=lambda leg: 0 if leg[1] == "buy" else 1)
+
+        submitted_legs: list[tuple[str, str, float, Any]] = []
+        for instrument_name, side, contracts in ordered_legs:
             try:
                 order = await self._submit_multi_leg_entry_order(
                     instrument_name,
@@ -753,10 +850,101 @@ class OptionsExecutor:
                     ok=False,
                     reason=f"thalex leg rejected ({side} {instrument_name}): {reason}",
                 )
-            submitted_legs.append((instrument_name, side, contracts))
+            submitted_legs.append((instrument_name, side, contracts, order))
             thalex_orders.append(order)
 
+        unfilled_legs = await self._await_multi_leg_fills(submitted_legs)
+        if unfilled_legs:
+            unfilled_set = {id(leg[3]) for leg in unfilled_legs}
+            filled_siblings = [leg for leg in submitted_legs if id(leg[3]) not in unfilled_set]
+            for instrument_name, side, contracts, order in unfilled_legs:
+                await self._cancel_and_reverse_leg(order, instrument_name, side, contracts)
+            await self._unwind_multi_leg_orders(filled_siblings)
+            names = ", ".join(f"{side} {name}" for name, side, _c, _o in unfilled_legs)
+            return ExecutionResult(
+                ok=False,
+                reason=f"multi-leg fill timeout: unfilled legs cancelled and siblings unwound ({names})",
+                thalex_orders=thalex_orders,
+            )
+
         return ExecutionResult(ok=True, thalex_orders=thalex_orders)
+
+    async def _estimate_net_premium(
+        self,
+        staged_legs: list[tuple[str, str, float]],
+    ) -> Optional[float]:
+        """Expected net premium (USD, sells positive) from live leg quotes.
+
+        Returns ``None`` when the adapter can't quote (test doubles, missing
+        pricing helper) — callers then skip the credit gate rather than
+        blocking on unknowable data.
+        """
+        entry_limit_price = getattr(self.thalex, "_entry_limit_price", None)
+        if not callable(entry_limit_price):
+            return None
+        total = 0.0
+        for instrument_name, side, contracts in staged_legs:
+            try:
+                price = await entry_limit_price(instrument_name, side, 0.0)
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.warning(
+                    "net-premium estimate failed for %s: %s — skipping credit gate",
+                    instrument_name, exc,
+                )
+                return None
+            if side == "sell":
+                total += float(price) * float(contracts)
+            else:
+                total -= float(price) * float(contracts)
+        return total
+
+    async def _await_multi_leg_fills(
+        self,
+        submitted_legs: list[tuple[str, str, float, Any]],
+    ) -> list[tuple[str, str, float, Any]]:
+        """Poll open orders until every leg fills or the timeout expires.
+
+        A leg is considered done when it reported a full fill at submit time
+        or when its order id no longer appears in the venue's open orders.
+        Returns the legs still resting when the watchdog gives up.
+        """
+        pending: list[tuple[str, str, float, Any]] = []
+        for leg in submitted_legs:
+            instrument_name, side, contracts, order = leg
+            if _filled_amount(order, contracts) >= contracts:
+                continue
+            if not str(getattr(order, "order_id", "") or ""):
+                continue
+            pending.append(leg)
+        if not pending:
+            return []
+
+        get_open_orders = getattr(self.thalex, "get_open_orders", None)
+        if not callable(get_open_orders):
+            return []
+
+        timeout = max(float(CONFIG.get("options_fill_timeout_seconds", 30)), 0.0)
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                open_orders = await get_open_orders()
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.warning("fill watchdog: get_open_orders failed: %s", exc)
+                open_orders = None
+            if isinstance(open_orders, list):
+                open_ids = {
+                    str(o.get("order_id") or o.get("id") or "")
+                    for o in open_orders
+                    if isinstance(o, dict)
+                }
+                pending = [
+                    leg for leg in pending
+                    if str(getattr(leg[3], "order_id", "") or "") in open_ids
+                ]
+            remaining = deadline - time.monotonic()
+            if not pending or remaining <= 0:
+                return pending
+            await asyncio.sleep(min(1.0, remaining))
 
     # ------------------------------------------------------------------
     # Helpers

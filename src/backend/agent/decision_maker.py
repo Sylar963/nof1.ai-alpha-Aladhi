@@ -188,7 +188,7 @@ class TradingAgent:
             "   a) Higher-timeframe structure supports the new direction (e.g., price relative to SMA99, anchored AVWAP, and Keltner position), AND\n"
             "   b) Intraday structure confirms with opening-range behavior plus anchored AVWAP / Keltner alignment.\n"
             "   Otherwise, prefer HOLD or adjust TP/SL.\n"
-            "3) Cooldown: After opening, adding, reducing, or flipping, impose a self-cooldown of at least 3 bars of the decision timeframe (e.g., 3×5m = 15m) before another direction change, unless a hard invalidation occurs. Encode this in exit_plan (e.g., “cooldown_bars:3 until 2025-10-19T15:55Z”). You must honor your own cooldowns on future cycles.\n"
+            "3) Cooldown: After opening, adding, reducing, or flipping, impose a self-cooldown of at least 3 bars of the decision timeframe (e.g., 3×5m = 15m) before another direction change, unless a hard invalidation occurs. Encode this in exit_plan as “cooldown_bars:3 until <ISO timestamp computed from the current time in the user message>”. You must honor your own cooldowns on future cycles.\n"
             "4) Funding is a tilt, not a trigger: Do NOT open/close/flip solely due to funding unless expected funding over your intended holding horizon meaningfully exceeds the technical edge. Consider that funding accrues discretely and slowly relative to 5m bars.\n"
             "5) Extension alone is not reversal: price pressing a Keltner extreme is not enough by itself. You still need opening-range and VWAP confirmation to fade or flip.\n"
             "6) Prefer adjustments over exits: If the thesis weakens but is not invalidated, first consider: tighten stop to a recent structure level, trail TP, or reduce size. Flip only on hard invalidation + fresh confluence.\n\n"
@@ -199,17 +199,19 @@ class TradingAgent:
             "- TP/SL sanity:\n"
             "  • BUY: tp_price > current_price, sl_price < current_price\n"
             "  • SELL: tp_price < current_price, sl_price > current_price\n"
-            "  If sensible TP/SL cannot be set, use null and explain the logic.\n"
+            "  sl_price is MANDATORY for any buy/sell with allocation_usd > 0 — the engine rejects stopless or side-inverted levels. tp_price may be null only when exit_plan carries an explicit exit rule.\n"
             "- exit_plan must include at least ONE explicit invalidation trigger and may include cooldown guidance you will follow later.\n\n"
-            "Leverage policy (perpetual futures)\n"
-            "- YOU CAN USE LEVERAGE, ATLEAST 3X LEVERAGE TO GET BETTER RETURN, KEEP IT WITHIN 10X IN TOTAL\n"
-            "- In high volatility (very wide Keltner envelope) or during funding spikes, reduce or avoid leverage.\n"
-            "- Treat allocation_usd as notional exposure; keep it consistent with safe leverage and available margin.\n"
+            "Sizing & cost policy (perpetual futures)\n"
+            "- Treat allocation_usd as notional exposure. The engine enforces hard caps in code: the loss at your sl_price may not exceed a per-trade risk percentage of account value, and total gross notional may not exceed a gross leverage cap — oversized allocations are clamped down, so size deliberately rather than maximally.\n"
+            "- Execution costs are real: every entry and exit is a taker fill paying fees plus spread — a full round trip costs roughly 10-15 bps of notional. Do not trade edges smaller than that, and avoid churn; flipping repeatedly burns the account even when directionally right.\n"
+            "- In high volatility (very wide Keltner envelope) or during funding spikes, reduce size.\n"
             "\n"
             "Hard margin constraint (DO NOT VIOLATE)\n"
             "- The account context includes `account.buying_power` with `free_margin`, `withdrawable`, and `max_new_notional_by_asset` (a per-asset cap = conservative available × venue max leverage, already including a 5% fee/slippage buffer).\n"
             "- `allocation_usd` for any action other than `hold` MUST be ≤ `account.buying_power.max_new_notional_by_asset[asset]`. Proposals above this cap will be rejected by the pre-trade guard and logged as `proposal_skipped_insufficient_margin` in the next cycle's `recent_diary` — that is wasted edge and should not happen.\n"
             "- If `account.buying_power.free_margin` and `account.buying_power.withdrawable` are both ≤ 0 for every asset, output `action='hold'` across the board and say so in the rationale. Do not propose a trade the account cannot cover.\n"
+            "- If `account.buying_power` contains an `error` field, margin data is unavailable this cycle — hold and say so; do not treat the zeros as real.\n"
+            "- `account.recent_trade_events` contains your recent trade lifecycle history including `trade_closed` entries with realized PnL net of fees. Use these outcomes to adapt: repeated stop-outs on a setup mean the setup or the stop placement is wrong.\n"
             "- The only exception is pure closing (flatten an existing position with no new exposure): set `allocation_usd=0` with the opposite action. Closing consumes margin used, not free margin.\n\n"
             "Reasoning recipe (first principles)\n"
             "- Structure (price vs SMA99, anchored AVWAP, Keltner location, opening-range acceptance/rejection), Liquidity/volatility (Keltner width), Positioning tilt (funding, OI).\n"
@@ -252,12 +254,8 @@ class TradingAgent:
                 log_f.write(f"Model: {payload.get('model')}\n")
                 log_f.write(f"Headers: {json.dumps({k: v for k, v in headers.items() if k != 'Authorization'})}\n")
                 log_f.write(f"Payload:\n{json.dumps(payload, indent=2)}\n")
-                # Tightened from 60s → 45s. The call runs inside
-                # asyncio.to_thread at the bot_engine call sites, so a hang
-                # would tie up a worker thread (uncancellable from the outer
-                # loop) until this fires. 45s is still well above
-                # OpenRouter p99 latency.
-                resp = requests.post(self.base_url, headers=headers, json=payload, timeout=45)
+                timeout_s = float(CONFIG.get("llm_timeout_seconds") or 180)
+                resp = requests.post(self.base_url, headers=headers, json=payload, timeout=timeout_s)
                 logging.info("Received response from OpenRouter (status: %s)", resp.status_code)
                 if resp.status_code != 200:
                     logging.error("OpenRouter error: %s - %s", resp.status_code, resp.text)
@@ -391,6 +389,8 @@ class TradingAgent:
             data = {"model": self.model, "messages": messages}
             _cfg_max = CONFIG.get("llm_max_tokens")
             data["max_tokens"] = int(_cfg_max) if _cfg_max is not None and _cfg_max != "" else 16384
+            _cfg_temp = CONFIG.get("llm_temperature")
+            data["temperature"] = float(_cfg_temp) if _cfg_temp is not None else 0.2
             if allow_structured:
                 data["response_format"] = {
                     "type": "json_schema",
@@ -427,6 +427,12 @@ class TradingAgent:
                     allow_structured = False
                     continue
                 raise
+            except requests.RequestException as e:
+                # Timeouts / connection errors were previously uncaught and
+                # escalated straight to the main-loop error counter, which
+                # stops the whole bot after 5 slow cycles.
+                logging.warning("OpenRouter request failed (%s); retrying", e)
+                continue
 
             choices = resp_json.get("choices")
             if not choices:

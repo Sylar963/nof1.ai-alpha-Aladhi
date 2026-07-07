@@ -9,6 +9,8 @@ which venue it originated from.
 
 from __future__ import annotations
 
+import pytest
+
 from src.backend.options_intel.deribit_chain import normalize_deribit_chain
 
 
@@ -28,15 +30,76 @@ def test_normalizer_parses_strike_and_kind_from_name():
     assert parsed["type"] == "option"
 
 
-def test_normalizer_keeps_iv_as_published_percent():
-    """The surface parser divides by 100 when iv > 2; we preserve the input."""
+def test_normalizer_converts_percent_iv_to_decimal():
+    """Deribit publishes IV in percent; downstream consumers (mispricing,
+    surface) work in decimal, so the normalizer divides by 100."""
     rec = [{
         "instrument_name": "BTC-25DEC26-65000-P",
         "mark_iv": 47.61,
     }]
     out = normalize_deribit_chain(rec)
-    assert out[0]["iv"] == 47.61
-    assert out[0]["mark_iv"] == 47.61
+    assert out[0]["iv"] == pytest.approx(0.4761)
+    assert out[0]["mark_iv"] == pytest.approx(0.4761)
+
+
+def test_normalizer_leaves_decimal_iv_unchanged():
+    rec = [{
+        "instrument_name": "BTC-25DEC26-65000-P",
+        "mark_iv": 0.4761,
+    }]
+    out = normalize_deribit_chain(rec)
+    assert out[0]["iv"] == pytest.approx(0.4761)
+
+
+def test_surface_parser_does_not_double_convert_normalized_iv():
+    """Decimal IV out of the normalizer must survive the surface parser's
+    own >2.0 percent heuristic untouched."""
+    from src.backend.options_intel.vol_surface import _parse_entry
+
+    rec = [{
+        "instrument_name": "BTC-25DEC26-65000-P",
+        "mark_iv": 47.61,
+        "mark_price": 0.063,
+        "underlying_price": 80000.0,
+    }]
+    entry = _parse_entry(normalize_deribit_chain(rec)[0])
+    assert entry is not None
+    assert entry.iv == pytest.approx(0.4761)
+
+
+def test_normalizer_converts_btc_mark_price_to_usd():
+    rec = [{
+        "instrument_name": "BTC-25DEC26-65000-P",
+        "mark_iv": 47.61,
+        "mark_price": 0.063,
+        "underlying_price": 80000.0,
+    }]
+    out = normalize_deribit_chain(rec)
+    assert out[0]["mark_price"] == pytest.approx(0.063 * 80000.0)
+    assert out[0]["underlying_price"] == pytest.approx(80000.0)
+
+
+def test_normalizer_falls_back_to_estimated_delivery_price():
+    rec = [{
+        "instrument_name": "BTC-25DEC26-65000-P",
+        "mark_iv": 47.61,
+        "mark_price": 0.063,
+        "estimated_delivery_price": 79000.0,
+    }]
+    out = normalize_deribit_chain(rec)
+    assert out[0]["mark_price"] == pytest.approx(0.063 * 79000.0)
+
+
+def test_normalizer_drops_mark_price_without_underlying():
+    """A BTC-denominated mark with no USD conversion basis must not leak
+    through — it would poison USD expected-move metrics downstream."""
+    rec = [{
+        "instrument_name": "BTC-25DEC26-65000-P",
+        "mark_iv": 47.61,
+        "mark_price": 0.063,
+    }]
+    out = normalize_deribit_chain(rec)
+    assert out[0]["mark_price"] is None
 
 
 def test_normalizer_emits_seconds_timestamps():
