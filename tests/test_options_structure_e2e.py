@@ -173,6 +173,171 @@ def test_bot_service_omits_structures_when_flag_off(monkeypatch):
     assert view.get("thalex_structures", []) == []
 
 
+_SPREAD_POSITIONS = [
+    {"instrument_name": "BTC-27JUN26-100000-P", "size": 0.1, "side": "short"},
+    {"instrument_name": "BTC-27JUN26-90000-P", "size": 0.1, "side": "long"},
+]
+_SPREAD_GREEKS = {
+    "BTC-27JUN26-100000-P": {"delta": -0.30, "gamma": 0.001, "vega": 50, "theta": -5, "mark_price": 2000.0},
+    "BTC-27JUN26-90000-P": {"delta": -0.10, "gamma": 0.0005, "vega": 20, "theta": -2, "mark_price": 800.0},
+}
+
+
+def _spread_structure_id():
+    from types import SimpleNamespace
+
+    from src.backend.options_intel.structure import compute_structure_id
+
+    return compute_structure_id([
+        SimpleNamespace(instrument_name="BTC-27JUN26-100000-P", side="short"),
+        SimpleNamespace(instrument_name="BTC-27JUN26-90000-P", side="long"),
+    ])
+
+
+@pytest.mark.asyncio
+async def test_aggregate_joins_entry_premium_into_nonzero_pnl():
+    """A credit spread whose marks moved since open must report live pnl.
+
+    Entry premium 200, current net premium 0.1*2000 - 0.1*800 = 120 →
+    pnl_abs = 80, pnl_pct = 0.4 for a credit structure."""
+    result = await aggregate_portfolio_greeks(
+        positions=_SPREAD_POSITIONS,
+        greeks_source=FakeGreeksSource(_SPREAD_GREEKS),
+        today=date(2026, 6, 13),
+        spot=100000.0,
+        entry_premium_by_structure_id={_spread_structure_id(): 200.0},
+    )
+    s = result["structures"][0]
+    assert s["kind"] == "credit_put_spread"
+    assert s["net_premium"] == pytest.approx(120.0)
+    assert s["pnl_abs"] == pytest.approx(80.0)
+    assert s["pnl_pct"] == pytest.approx(0.4)
+
+
+@pytest.mark.asyncio
+async def test_aggregate_missing_or_none_entry_premium_yields_zero_pnl():
+    for premium_map in (None, {}, {_spread_structure_id(): None}):
+        result = await aggregate_portfolio_greeks(
+            positions=_SPREAD_POSITIONS,
+            greeks_source=FakeGreeksSource(_SPREAD_GREEKS),
+            today=date(2026, 6, 13),
+            spot=100000.0,
+            entry_premium_by_structure_id=premium_map,
+        )
+        s = result["structures"][0]
+        assert s["pnl_abs"] == pytest.approx(0.0)
+        assert s["pnl_pct"] == pytest.approx(0.0)
+
+
+@pytest.mark.asyncio
+async def test_builder_joins_persisted_entry_premium_into_structure_views(monkeypatch, tmp_path):
+    """Production path: build_options_context must join DB entry premiums so
+    the classified structures AND the LLM-facing structure views carry live pnl."""
+    from datetime import datetime, timedelta, timezone
+
+    from src.backend.options_intel.builder import build_options_context
+    from src.backend.options_intel.iv_history_store import IVHistoryStore
+
+    class FakeThalex:
+        _instruments_cache = []
+
+        async def get_user_state(self):
+            return {"balance": 10000.0, "positions": _SPREAD_POSITIONS}
+
+        async def get_greeks(self, instrument_name):
+            return _SPREAD_GREEKS.get(instrument_name, {})
+
+    class FakeDeribit:
+        async def get_index_price(self, index_name="btc_usd"):
+            return 100000.0
+
+        async def get_book_summary_by_currency(self, currency, kind):
+            return []
+
+    sid = _spread_structure_id()
+    rows = [{
+        "structure_id": sid,
+        "underlying": "BTC",
+        "kind": "credit_put_spread",
+        "opened_at": datetime.now(timezone.utc) - timedelta(days=3),
+        "last_seen_at": datetime.now(timezone.utc),
+        "entry_net_premium": 200.0,
+        "last_pnl_abs": 0.0,
+        "last_pnl_pct": 0.0,
+        "last_breach_state": "nominal",
+    }]
+
+    class FakeDBManager:
+        def get_open_structures(self):
+            return rows
+
+    import src.database.db_manager as db_manager_module
+    monkeypatch.setattr(db_manager_module, "get_db_manager", lambda db_url=None: FakeDBManager())
+    monkeypatch.setitem(CONFIG, "options_structure_prompt", True)
+
+    ctx = await build_options_context(
+        thalex=FakeThalex(),
+        deribit=FakeDeribit(),
+        iv_history=IVHistoryStore(db_path=str(tmp_path / "iv.db")),
+        spot_history=[100000.0] * 16,
+        today=date(2026, 6, 13),
+    )
+
+    assert len(ctx.structures) == 1
+    assert ctx.structures[0]["pnl_abs"] == pytest.approx(80.0)
+    assert ctx.structures[0]["pnl_pct"] == pytest.approx(0.4)
+
+    assert len(ctx.structure_views) == 1
+    view = ctx.structure_views[0]
+    assert view.pnl_abs == pytest.approx(80.0)
+    assert view.pnl_pct == pytest.approx(0.4)
+    assert view.days_open == 3
+
+    payload = ctx.to_dict()
+    assert payload["structures"][0]["pnl_pct"] == pytest.approx(0.4)
+
+
+@pytest.mark.asyncio
+async def test_builder_new_structure_without_db_row_defaults_to_zero_pnl(monkeypatch, tmp_path):
+    from src.backend.options_intel.builder import build_options_context
+    from src.backend.options_intel.iv_history_store import IVHistoryStore
+
+    class FakeThalex:
+        _instruments_cache = []
+
+        async def get_user_state(self):
+            return {"balance": 10000.0, "positions": _SPREAD_POSITIONS}
+
+        async def get_greeks(self, instrument_name):
+            return _SPREAD_GREEKS.get(instrument_name, {})
+
+    class FakeDeribit:
+        async def get_index_price(self, index_name="btc_usd"):
+            return 100000.0
+
+        async def get_book_summary_by_currency(self, currency, kind):
+            return []
+
+    class FakeDBManager:
+        def get_open_structures(self):
+            return []
+
+    import src.database.db_manager as db_manager_module
+    monkeypatch.setattr(db_manager_module, "get_db_manager", lambda db_url=None: FakeDBManager())
+
+    ctx = await build_options_context(
+        thalex=FakeThalex(),
+        deribit=FakeDeribit(),
+        iv_history=IVHistoryStore(db_path=str(tmp_path / "iv.db")),
+        spot_history=[100000.0] * 16,
+        today=date(2026, 6, 13),
+    )
+
+    assert len(ctx.structures) == 1
+    assert ctx.structures[0]["pnl_abs"] == pytest.approx(0.0)
+    assert ctx.structures[0]["pnl_pct"] == pytest.approx(0.0)
+
+
 @pytest.mark.asyncio
 async def test_structure_view_emitted_through_full_pipeline(monkeypatch):
     """Full pipeline: classifier output → structure_views in OptionsContext.

@@ -105,3 +105,23 @@ def test_snapshot_does_not_leak_raw_chain():
     payload = json.loads(serialized)
     # Top mispricings list should be capped to a sane number (≤10).
     assert len(payload["top_mispricings_vs_deribit"]) <= 10
+
+
+def test_snapshot_does_not_truncate_multi_leg_structure_positions(example_context):
+    """A 4-leg iron condor must survive serialization intact even when
+    max_open_positions (a structure bound) is smaller than the leg count."""
+    condor_legs = [
+        {"instrument_name": "BTC-10MAY26-70000-C", "size": 0.1, "side": "long", "days_to_expiry": 28},
+        {"instrument_name": "BTC-10MAY26-65000-C", "size": 0.1, "side": "short", "days_to_expiry": 28},
+        {"instrument_name": "BTC-10MAY26-55000-P", "size": 0.1, "side": "short", "days_to_expiry": 28},
+        {"instrument_name": "BTC-10MAY26-50000-P", "size": 0.1, "side": "long", "days_to_expiry": 28},
+    ]
+    example_context.open_positions = condor_legs
+    example_context.open_position_count = 4
+    assert example_context.max_open_positions == 3
+
+    payload = json.loads(example_context.to_json())
+    assert len(payload["open_positions"]) == 4
+    assert {p["instrument_name"] for p in payload["open_positions"]} == {
+        leg["instrument_name"] for leg in condor_legs
+    }

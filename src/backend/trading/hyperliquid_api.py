@@ -373,6 +373,39 @@ class HyperliquidAPI(ExchangeAdapter):
             logging.error("Get recent fills error: %s", e)
             return []
 
+    async def get_net_transfers_since(self, start_time_ms: int) -> float:
+        """Net USD flow from deposits/withdrawals/transfers since ``start_time_ms``.
+
+        Positive = net inflow. Used to keep return/drawdown baselines from
+        reading a deposit as profit or a withdrawal as drawdown. Returns 0.0
+        when the SDK variant lacks the ledger endpoint or the call fails.
+        """
+        try:
+            fetch = getattr(self.info, 'user_non_funding_ledger_updates', None)
+            if fetch is None:
+                return 0.0
+            updates = await self._retry(lambda: fetch(self.wallet.address, int(start_time_ms)))
+            net = 0.0
+            for u in updates or []:
+                delta = u.get('delta') if isinstance(u, dict) else None
+                if not isinstance(delta, dict):
+                    continue
+                kind = str(delta.get('type') or '').lower()
+                try:
+                    usdc = float(delta.get('usdc') or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if kind == 'deposit':
+                    net += abs(usdc)
+                elif kind == 'withdraw':
+                    net -= abs(usdc)
+                elif kind in ('accountclasstransfer', 'internaltransfer', 'subaccounttransfer'):
+                    net += usdc
+            return net
+        except Exception as e:  # pylint: disable=broad-except
+            logging.error("Get net transfers error: %s", e)
+            return 0.0
+
     def extract_oids(self, order_result):
         """Extract resting or filled order identifiers from an exchange response.
 

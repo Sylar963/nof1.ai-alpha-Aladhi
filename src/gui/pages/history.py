@@ -231,11 +231,13 @@ def create_history(bot_service: BotService, state_manager: StateManager):
             table.visible = len(trades) > 0
 
             if trades:
-                # Calculate statistics
+                # Statistics over CLOSED trades only — holds and entry
+                # records carry no PnL and would inflate the denominator.
                 total_count = len(trades)
-                profitable_trades = sum(1 for t in trades if t.get('pnl', 0) > 0)
-                win_rate_pct = (profitable_trades / total_count * 100) if total_count > 0 else 0
-                total_pnl_value = sum(t.get('pnl', 0) for t in trades if t.get('pnl') is not None)
+                closed = [t for t in trades if t.get('pnl') is not None]
+                profitable_trades = sum(1 for t in closed if t['pnl'] > 0)
+                win_rate_pct = (profitable_trades / len(closed) * 100) if closed else 0
+                total_pnl_value = sum(t['pnl'] for t in closed)
 
                 # Update statistics cards
                 total_trades.text = str(total_count)

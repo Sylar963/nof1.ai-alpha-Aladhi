@@ -212,6 +212,7 @@ class TradingAgent:
             "- If `account.buying_power.free_margin` and `account.buying_power.withdrawable` are both ≤ 0 for every asset, output `action='hold'` across the board and say so in the rationale. Do not propose a trade the account cannot cover.\n"
             "- If `account.buying_power` contains an `error` field, margin data is unavailable this cycle — hold and say so; do not treat the zeros as real.\n"
             "- `account.recent_trade_events` contains your recent trade lifecycle history including `trade_closed` entries with realized PnL net of fees. Use these outcomes to adapt: repeated stop-outs on a setup mean the setup or the stop placement is wrong.\n"
+            "- `account.performance` aggregates all closed trades (win_rate, total_pnl, avg_profit, avg_loss, profit_factor). A negative expectancy means your current approach is losing after costs — get more selective, not more active.\n"
             "- The only exception is pure closing (flatten an existing position with no new exposure): set `allocation_usd=0` with the opposite action. Closing consumes margin used, not free margin.\n\n"
             "Reasoning recipe (first principles)\n"
             "- Structure (price vs SMA99, anchored AVWAP, Keltner location, opening-range acceptance/rejection), Liquidity/volatility (Keltner width), Positioning tilt (funding, OI).\n"

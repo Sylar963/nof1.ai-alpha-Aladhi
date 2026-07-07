@@ -308,6 +308,7 @@ async def test_long_call_with_target_gamma_btc_distributes_across_default_tenors
     for tenor in (7, 14, 30, 60):
         thalex.instruments_by_intent[("BTC", "call", tenor, 60000.0)] = f"BTC-{tenor}D-60000-C"
         thalex.delta_per_position[f"BTC-{tenor}D-60000-C"] = 0.5
+        thalex.greeks_by_instrument[f"BTC-{tenor}D-60000-C"] = {"gamma": 0.0001}
 
     decision = parse_decision({
         "venue": "thalex",
@@ -344,6 +345,7 @@ async def test_target_gamma_btc_long_put_uses_long_perp_hedge():
     for tenor in (7, 14, 30, 60):
         thalex.instruments_by_intent[("BTC", "put", tenor, 55000.0)] = f"BTC-{tenor}D-55000-P"
         thalex.delta_per_position[f"BTC-{tenor}D-55000-P"] = -0.4
+        thalex.greeks_by_instrument[f"BTC-{tenor}D-55000-P"] = {"gamma": 0.0001}
 
     decision = parse_decision({
         "venue": "thalex",
@@ -407,6 +409,7 @@ async def test_multi_tenor_aborts_when_one_tenor_fails_to_resolve_no_orders_subm
     for tenor in (7, 30, 60):
         thalex.instruments_by_intent[("BTC", "call", tenor, 60000.0)] = f"BTC-{tenor}D-60000-C"
         thalex.delta_per_position[f"BTC-{tenor}D-60000-C"] = 0.5
+        thalex.greeks_by_instrument[f"BTC-{tenor}D-60000-C"] = {"gamma": 0.0001}
 
     # Override resolve_intent so the missing tenor returns None instead of
     # the FakeThalex's default fallback (which always returns SOMETHING).
@@ -452,6 +455,7 @@ async def test_multi_tenor_unwinds_thalex_legs_when_a_later_submit_fails():
     for tenor in (7, 14, 30, 60):
         thalex.instruments_by_intent[("BTC", "call", tenor, 60000.0)] = f"BTC-{tenor}D-60000-C"
         thalex.delta_per_position[f"BTC-{tenor}D-60000-C"] = 0.5
+        thalex.greeks_by_instrument[f"BTC-{tenor}D-60000-C"] = {"gamma": 0.0001}
 
     # Make the third Thalex submission fail on every retry.
     real_buy = thalex.place_buy_order
@@ -503,6 +507,7 @@ async def test_multi_tenor_retries_transient_thalex_failure_and_succeeds():
     for tenor in (7, 14, 30, 60):
         thalex.instruments_by_intent[("BTC", "call", tenor, 60000.0)] = f"BTC-{tenor}D-60000-C"
         thalex.delta_per_position[f"BTC-{tenor}D-60000-C"] = 0.5
+        thalex.greeks_by_instrument[f"BTC-{tenor}D-60000-C"] = {"gamma": 0.0001}
 
     real_buy = thalex.place_buy_order
     fail_count = {"n": 0}
@@ -595,6 +600,129 @@ async def test_target_gamma_btc_respects_max_open_positions_cap():
     result = await executor.execute(decision, open_positions_count=3)
     assert result.ok is False
     assert "max_open_positions" in result.reason
+
+
+def _gamma_target_decision(kind="call", target_gamma_btc=0.0004):
+    return parse_decision({
+        "venue": "thalex",
+        "asset": "BTC",
+        "action": "buy",
+        "strategy": "long_call_delta_hedged" if kind == "call" else "long_put_delta_hedged",
+        "underlying": "BTC",
+        "kind": kind,
+        "tenor_days": 30,
+        "target_strike": 60000,
+        "target_gamma_btc": target_gamma_btc,
+        "rationale": "gamma sizing",
+    })
+
+
+@pytest.mark.asyncio
+async def test_multi_tenor_converts_gamma_target_to_contracts_via_per_contract_gamma(monkeypatch):
+    """0.0004 BTC gamma across 2 tenors with 0.0001 gamma/contract must size
+    each leg at (0.0004/2)/0.0001 = 2 contracts — NOT 0.0002 contracts (the
+    old bug spent the gamma target directly as a contract count)."""
+    import src.backend.trading.options_strategies as strategies_mod
+
+    monkeypatch.setattr(strategies_mod, "_DEFAULT_GAMMA_TENORS", (7, 14))
+    monkeypatch.setitem(CONFIG, "thalex_max_contracts_per_trade", 5.0)
+
+    thalex = FakeThalex()
+    thalex.risk_caps.max_contracts_per_trade = 5.0
+    hl = FakeHyperliquid()
+    executor = OptionsExecutor(thalex=thalex, hyperliquid=hl)
+    for tenor in (7, 14):
+        thalex.instruments_by_intent[("BTC", "call", tenor, 60000.0)] = f"BTC-{tenor}D-60000-C"
+        thalex.delta_per_position[f"BTC-{tenor}D-60000-C"] = 0.5
+        thalex.greeks_by_instrument[f"BTC-{tenor}D-60000-C"] = {"gamma": 0.0001}
+
+    result = await executor.execute(_gamma_target_decision(), open_positions_count=0)
+
+    assert result.ok is True
+    buys = [c for c in thalex.calls if c.method == "buy"]
+    assert len(buys) == 2
+    for buy in buys:
+        assert buy.amount == pytest.approx(2.0)
+    assert len(hl.calls) == 2
+    for hedge in hl.calls:
+        assert hedge.amount == pytest.approx(1.0)
+
+
+@pytest.mark.asyncio
+async def test_multi_tenor_gamma_sizing_clamps_to_config_max_contracts(monkeypatch):
+    """The gamma-derived 2 contracts per leg must clamp to the configured
+    per-trade cap before submission."""
+    import src.backend.trading.options_strategies as strategies_mod
+
+    monkeypatch.setattr(strategies_mod, "_DEFAULT_GAMMA_TENORS", (7, 14))
+    monkeypatch.setitem(CONFIG, "thalex_max_contracts_per_trade", 0.1)
+
+    thalex = FakeThalex()
+    hl = FakeHyperliquid()
+    executor = OptionsExecutor(thalex=thalex, hyperliquid=hl)
+    for tenor in (7, 14):
+        thalex.instruments_by_intent[("BTC", "call", tenor, 60000.0)] = f"BTC-{tenor}D-60000-C"
+        thalex.delta_per_position[f"BTC-{tenor}D-60000-C"] = 0.5
+        thalex.greeks_by_instrument[f"BTC-{tenor}D-60000-C"] = {"gamma": 0.0001}
+
+    result = await executor.execute(_gamma_target_decision(), open_positions_count=0)
+
+    assert result.ok is True
+    buys = [c for c in thalex.calls if c.method == "buy"]
+    assert len(buys) == 2
+    for buy in buys:
+        assert buy.amount == pytest.approx(0.1)
+
+
+@pytest.mark.asyncio
+async def test_multi_tenor_gamma_sizing_rounds_to_min_contract_increment(monkeypatch):
+    """Raw gamma-derived contract counts must land on the 0.001 venue tick."""
+    import src.backend.trading.options_strategies as strategies_mod
+
+    monkeypatch.setattr(strategies_mod, "_DEFAULT_GAMMA_TENORS", (7, 14))
+    monkeypatch.setitem(CONFIG, "thalex_max_contracts_per_trade", 5.0)
+
+    thalex = FakeThalex()
+    thalex.risk_caps.max_contracts_per_trade = 5.0
+    hl = FakeHyperliquid()
+    executor = OptionsExecutor(thalex=thalex, hyperliquid=hl)
+    for tenor in (7, 14):
+        thalex.instruments_by_intent[("BTC", "call", tenor, 60000.0)] = f"BTC-{tenor}D-60000-C"
+        thalex.delta_per_position[f"BTC-{tenor}D-60000-C"] = 0.5
+        thalex.greeks_by_instrument[f"BTC-{tenor}D-60000-C"] = {"gamma": 0.00013}
+
+    # (0.0004/2)/0.00013 = 1.53846... → rounds to 1.538 on the 0.001 tick
+    result = await executor.execute(_gamma_target_decision(), open_positions_count=0)
+
+    assert result.ok is True
+    buys = [c for c in thalex.calls if c.method == "buy"]
+    for buy in buys:
+        assert buy.amount == pytest.approx(1.538)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_greeks", [{}, {"gamma": 0.0}, {"gamma": -0.0001}, {"gamma": 0.5}])
+async def test_multi_tenor_refuses_leg_when_gamma_unusable(monkeypatch, bad_greeks):
+    """Missing, zero, negative, or absurd gamma must fail closed with no
+    orders submitted — never fall back to contracts = gamma target."""
+    import src.backend.trading.options_strategies as strategies_mod
+
+    monkeypatch.setattr(strategies_mod, "_DEFAULT_GAMMA_TENORS", (7, 14))
+
+    thalex = FakeThalex()
+    hl = FakeHyperliquid()
+    executor = OptionsExecutor(thalex=thalex, hyperliquid=hl)
+    for tenor in (7, 14):
+        thalex.instruments_by_intent[("BTC", "call", tenor, 60000.0)] = f"BTC-{tenor}D-60000-C"
+        thalex.delta_per_position[f"BTC-{tenor}D-60000-C"] = 0.5
+        thalex.greeks_by_instrument[f"BTC-{tenor}D-60000-C"] = bad_greeks
+
+    result = await executor.execute(_gamma_target_decision(), open_positions_count=0)
+
+    assert result.ok is False
+    assert "gamma" in result.reason.lower()
+    assert thalex.calls == []
+    assert hl.calls == []
 
 
 @pytest.mark.asyncio

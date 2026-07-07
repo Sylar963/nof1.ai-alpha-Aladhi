@@ -221,9 +221,48 @@ class TestBookClosedTrade:
         assert persisted["realized_pnl"] == pytest.approx(491.0)
 
     @pytest.mark.asyncio
-    async def test_thalex_trade_books_diary_note_only(self, tmp_path, monkeypatch):
+    async def test_thalex_premium_flow_booked_from_fills(self, tmp_path, monkeypatch):
         engine = make_engine(tmp_path)
         engine.hyperliquid = SimpleNamespace()
+        opened_at = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+        opened_s = datetime.fromisoformat(opened_at).timestamp()
+        engine.thalex = SimpleNamespace(
+            get_recent_fills=async_return([
+                {"instrument_name": "BTC-27JUN26-70000-C", "direction": "sell",
+                 "amount": 0.1, "price": 1200.0, "time": opened_s + 60, "fee": 2.0},
+                {"instrument_name": "BTC-27JUN26-70000-C", "direction": "buy",
+                 "amount": 0.1, "price": 400.0, "time": opened_s + 1800, "fee": 2.0},
+                {"instrument_name": "BTC-UNRELATED", "direction": "sell",
+                 "amount": 1.0, "price": 999.0, "time": opened_s + 60, "fee": 1.0},
+            ]),
+        )
+        persisted = {}
+        monkeypatch.setattr(
+            bot_engine_module, "get_db_manager",
+            lambda: SimpleNamespace(record_closed_trade=lambda **k: persisted.update(k) or 1),
+        )
+
+        await engine._book_closed_trade({
+            "venue": "thalex",
+            "asset": "BTC",
+            "instrument_names": ["BTC-27JUN26-70000-C"],
+            "strategy": "credit_call_spread",
+            "opened_at": opened_at,
+        })
+
+        entries = read_diary(engine)
+        assert entries and entries[0]["action"] == "trade_closed"
+        assert entries[0]["venue"] == "thalex"
+        assert entries[0]["premium_flow_usd"] == pytest.approx(0.1 * 1200 - 0.1 * 400)
+        assert entries[0]["realized_pnl_usd"] == pytest.approx(80.0 - 4.0)
+        assert persisted["venue"] == "thalex"
+        assert persisted["realized_pnl"] == pytest.approx(76.0)
+
+    @pytest.mark.asyncio
+    async def test_thalex_trade_without_fills_books_note_only(self, tmp_path, monkeypatch):
+        engine = make_engine(tmp_path)
+        engine.hyperliquid = SimpleNamespace()
+        engine.thalex = SimpleNamespace(get_recent_fills=async_return([]))
         monkeypatch.setattr(
             bot_engine_module, "get_db_manager",
             lambda: SimpleNamespace(record_closed_trade=lambda **k: pytest.fail("should not persist")),
@@ -238,7 +277,8 @@ class TestBookClosedTrade:
 
         entries = read_diary(engine)
         assert entries and entries[0]["action"] == "trade_closed"
-        assert entries[0]["venue"] == "thalex"
+        assert entries[0]["fills_matched"] == 0
+        assert entries[0]["realized_pnl_usd"] is None
 
 
 class TestStopCoverage:
@@ -314,6 +354,72 @@ class TestStopCoverage:
             [],
         )
         assert read_diary(engine) == []
+
+
+class TestTransferBaselines:
+    @pytest.mark.asyncio
+    async def test_deposit_shifts_all_baselines(self, tmp_path):
+        engine = make_engine(tmp_path)
+        engine._session_start_ms = 1_000
+        engine._net_transfers_usd = 0.0
+        engine.initial_account_value = 10_000.0
+        engine.peak_account_value = 11_000.0
+        engine._day_start_value = 10_500.0
+        engine.hyperliquid = SimpleNamespace(
+            get_net_transfers_since=async_return(5_000.0),
+        )
+
+        await engine._adjust_baselines_for_transfers()
+
+        assert engine.initial_account_value == pytest.approx(15_000.0)
+        assert engine.peak_account_value == pytest.approx(16_000.0)
+        assert engine._day_start_value == pytest.approx(15_500.0)
+        assert engine._net_transfers_usd == pytest.approx(5_000.0)
+        entries = read_diary(engine)
+        assert entries and entries[0]["action"] == "transfer_detected"
+
+    @pytest.mark.asyncio
+    async def test_no_transfer_is_noop(self, tmp_path):
+        engine = make_engine(tmp_path)
+        engine._session_start_ms = 1_000
+        engine._net_transfers_usd = 0.0
+        engine.initial_account_value = 10_000.0
+        engine.hyperliquid = SimpleNamespace(
+            get_net_transfers_since=async_return(0.0),
+        )
+        await engine._adjust_baselines_for_transfers()
+        assert engine.initial_account_value == pytest.approx(10_000.0)
+        assert read_diary(engine) == []
+
+
+class TestMarketSnapshotPersistence:
+    def test_snapshot_roundtrip(self, tmp_path):
+        from src.database.db_manager import DatabaseManager
+        from src.database.models import MarketData
+
+        dbm = DatabaseManager(db_url=f"sqlite:///{tmp_path}/bot.db")
+        section = {
+            "asset": "BTC",
+            "current_price": 100_000.0,
+            "intraday": {"sma99": 99_500.0},
+        }
+        count = dbm.save_market_snapshots([{
+            "asset": "BTC",
+            "timestamp": datetime(2026, 7, 7, 12, 0, 0),
+            "price": 100_000.0,
+            "volume_24h": 1_000_000.0,
+            "open_interest": 50_000.0,
+            "funding_rate": 0.0001,
+            "indicators": section,
+        }])
+        assert count == 1
+
+        with dbm.session_scope() as session:
+            row = session.query(MarketData).one()
+            assert row.asset == "BTC"
+            assert row.interval == "cycle"
+            assert row.close == pytest.approx(100_000.0)
+            assert json.loads(row.indicators)["intraday"]["sma99"] == pytest.approx(99_500.0)
 
 
 def async_return(value):

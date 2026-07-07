@@ -126,6 +126,14 @@ def _filled_amount(order: Any, requested: float) -> float:
 # decision builds curve exposure rather than concentrating in one tenor.
 _DEFAULT_GAMMA_TENORS: tuple[int, ...] = (7, 14, 30, 60)
 
+# Smallest contract increment Thalex accepts for BTC options.
+_THALEX_MIN_CONTRACT: float = 0.001
+
+# Sanity ceiling for per-contract gamma. ATM BTC option gamma is ~1e-4–1e-5
+# per contract; anything above this is a corrupt or mis-scaled greek and the
+# leg must be refused rather than sized off nonsense.
+_MAX_SANE_GAMMA_PER_CONTRACT: float = 0.01
+
 # Exponential-backoff retry config for adapter calls in the multi-tenor
 # submit path. Aligned with HyperliquidAPI._retry's defaults so the whole
 # project uses one set of numbers for transient failure handling.
@@ -533,6 +541,15 @@ class OptionsExecutor:
         expansion aborts cleanly with zero orders sent. This makes a
         half-built curve impossible.
 
+        Sizing converts the BTC gamma target into contracts using each
+        resolved instrument's live per-contract gamma:
+        ``contracts_i = (target_gamma_btc / len(tenors)) / gamma_i``.
+        Missing, non-positive, or absurd gamma (>
+        ``_MAX_SANE_GAMMA_PER_CONTRACT``) fails the whole build closed —
+        the gamma target is NEVER spent directly as a contract count.
+        Per-leg contracts are rounded to the venue min increment and
+        clamped to ``CONFIG["thalex_max_contracts_per_trade"]``.
+
         **Submit phase** — once all tenors are staged, place each Thalex
         buy + perp hedge with retry (:func:`_retry_async`, exponential
         backoff via ``_RETRY_MAX_ATTEMPTS`` and ``_RETRY_BACKOFF_BASE_SECONDS``).
@@ -547,11 +564,14 @@ class OptionsExecutor:
         underlying = decision.underlying or decision.asset
         kind = decision.kind or "call"
         tenors = _DEFAULT_GAMMA_TENORS
-        per_leg_contracts = (decision.target_gamma_btc or 0.0) / len(tenors)
+        per_leg_gamma = (decision.target_gamma_btc or 0.0) / len(tenors)
+        max_contracts = float(
+            CONFIG.get("thalex_max_contracts_per_trade", 0.1) or 0.1
+        )
 
         ok, reason = self.thalex.preflight(  # type: ignore[attr-defined]
             underlying=underlying,
-            contracts=per_leg_contracts,
+            contracts=_THALEX_MIN_CONTRACT,
             open_positions_count=open_positions_count,
         )
         if not ok:
@@ -560,7 +580,7 @@ class OptionsExecutor:
         # ------------------------------------------------------------------
         # STAGE PHASE — resolve all tenors before any submit happens.
         # ------------------------------------------------------------------
-        staged_legs: list[tuple[int, str, float]] = []
+        staged_legs: list[tuple[int, str, float, float]] = []
         for tenor in tenors:
             intent = OptionIntent(
                 underlying=underlying,
@@ -602,7 +622,40 @@ class OptionsExecutor:
                     reason=f"missing live delta for {instrument_name}",
                 )
 
-            staged_legs.append((tenor, instrument_name, delta_per_contract))
+            gamma_per_contract = await self._lookup_gamma(instrument_name)
+            if (
+                gamma_per_contract is None
+                or gamma_per_contract <= 0
+                or gamma_per_contract > _MAX_SANE_GAMMA_PER_CONTRACT
+            ):
+                logger.error(
+                    "multi-tenor unusable gamma %r for %s tenor=%d — refusing leg",
+                    gamma_per_contract, instrument_name, tenor,
+                )
+                return ExecutionResult(
+                    ok=False,
+                    reason=(
+                        f"unusable per-contract gamma {gamma_per_contract!r} for "
+                        f"{instrument_name}; refusing to size leg from gamma target"
+                    ),
+                )
+
+            raw_contracts = per_leg_gamma / gamma_per_contract
+            rounded = round(raw_contracts / _THALEX_MIN_CONTRACT) * _THALEX_MIN_CONTRACT
+            leg_contracts = max(_THALEX_MIN_CONTRACT, min(max_contracts, rounded))
+
+            ok, reason = self.thalex.preflight(  # type: ignore[attr-defined]
+                underlying=underlying,
+                contracts=leg_contracts,
+                open_positions_count=open_positions_count,
+            )
+            if not ok:
+                return ExecutionResult(
+                    ok=False,
+                    reason=f"leg rejected for {instrument_name}: {reason}",
+                )
+
+            staged_legs.append((tenor, instrument_name, delta_per_contract, leg_contracts))
 
         # ------------------------------------------------------------------
         # SUBMIT PHASE — orders go out only now, with retry + unwind.
@@ -612,12 +665,12 @@ class OptionsExecutor:
         thalex_orders = []
         hl_orders = []
 
-        for tenor, instrument_name, delta_per_contract in staged_legs:
+        for tenor, instrument_name, delta_per_contract, leg_contracts in staged_legs:
             # Submit Thalex leg with retry.
             try:
                 thalex_order = await _retry_async(
-                    lambda iname=instrument_name: self.thalex.place_buy_order(
-                        iname, per_leg_contracts
+                    lambda iname=instrument_name, c=leg_contracts: self.thalex.place_buy_order(
+                        iname, c
                     ),
                     description=f"thalex buy {instrument_name}",
                 )
@@ -652,7 +705,7 @@ class OptionsExecutor:
                     instrument_name,
                 )
                 await self._unwind_multi_tenor_legs(
-                    submitted_thalex + [(instrument_name, per_leg_contracts, thalex_order)],
+                    submitted_thalex + [(instrument_name, leg_contracts, thalex_order)],
                     submitted_hl,
                     underlying,
                     kind,
@@ -665,12 +718,12 @@ class OptionsExecutor:
                     ),
                 )
             thalex_orders.append(thalex_order)
-            submitted_thalex.append((instrument_name, per_leg_contracts, thalex_order))
+            submitted_thalex.append((instrument_name, leg_contracts, thalex_order))
 
             if not self._delta_hedge_enabled:
                 continue
 
-            hedge_size = abs(per_leg_contracts * delta_per_contract)
+            hedge_size = abs(leg_contracts * delta_per_contract)
             if hedge_size <= 0:
                 continue
 
@@ -970,6 +1023,25 @@ class OptionsExecutor:
                 logger.warning("get_greeks failed for %s: %s", instrument_name, exc)
 
         logger.error("Delta unknown for %s — refusing to hedge on guessed value", instrument_name)
+        return None
+
+    async def _lookup_gamma(self, instrument_name: str) -> Optional[float]:
+        """Return the live per-contract gamma for an instrument, or ``None``.
+
+        The multi-tenor sizer converts a BTC gamma target into contracts
+        with this value. Never guess: without a live gamma the caller must
+        refuse the leg rather than fall back to treating the gamma target
+        as a contract count.
+        """
+        if hasattr(self.thalex, "get_greeks"):
+            try:
+                greeks = await self.thalex.get_greeks(instrument_name)
+                if isinstance(greeks, dict) and greeks.get("gamma") is not None:
+                    return float(greeks["gamma"])
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.warning("get_greeks failed for %s: %s", instrument_name, exc)
+
+        logger.error("Gamma unknown for %s — refusing to size on guessed value", instrument_name)
         return None
 
 

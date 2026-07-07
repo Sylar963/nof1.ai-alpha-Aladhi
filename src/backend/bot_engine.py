@@ -292,6 +292,8 @@ class TradingBotEngine:
         self.active_trades: List[Dict] = []  # Local tracking of open positions
         self.recent_events: deque = deque(maxlen=200)
         self.initial_account_value: Optional[float] = None
+        self._session_start_ms: int = 0
+        self._net_transfers_usd: float = 0.0
         self._last_thalex_execution: Dict[str, Any] = {}
         self.price_history: Dict[str, deque] = {asset: deque(maxlen=60) for asset in assets}
         # Per-asset max leverage rarely changes between cycles; cache to avoid
@@ -377,6 +379,37 @@ class TradingBotEngine:
                 raise
         except Exception as exc:  # pylint: disable=broad-except
             self.logger.warning("Failed to save active_trades.json: %s", exc)
+
+    async def _adjust_baselines_for_transfers(self) -> None:
+        """Shift return/drawdown baselines by net deposits/withdrawals."""
+        if not self.hyperliquid or not getattr(self, "_session_start_ms", 0):
+            return
+        get_transfers = getattr(self.hyperliquid, "get_net_transfers_since", None)
+        if not callable(get_transfers):
+            return
+        net = float(await get_transfers(self._session_start_ms) or 0.0)
+        delta = net - self._net_transfers_usd
+        if abs(delta) < 0.01:
+            return
+        self._net_transfers_usd = net
+        if self.initial_account_value:
+            self.initial_account_value += delta
+        if self.peak_account_value > 0:
+            self.peak_account_value += delta
+            self.state.peak_account_value = self.peak_account_value
+        if getattr(self, "_day_start_value", 0.0) > 0:
+            self._day_start_value += delta
+        self._save_risk_state()
+        self.logger.info(
+            "Detected net transfer of $%.2f — baselines adjusted (session net $%.2f)",
+            delta, net,
+        )
+        self._write_diary_entry({
+            'timestamp': datetime.now(UTC).isoformat(),
+            'action': 'transfer_detected',
+            'net_transfer_usd': round(delta, 2),
+            'session_net_transfers_usd': round(net, 2),
+        })
 
     def _load_risk_state(self) -> None:
         try:
@@ -1031,6 +1064,8 @@ class TradingBotEngine:
         self.state.is_running = True
         self.start_time = datetime.now(UTC)
         self.invocation_count = 0
+        self._session_start_ms = int(self.start_time.timestamp() * 1000)
+        self._net_transfers_usd = 0.0
 
         # Get initial account value.
         # Run Hyperliquid + Thalex fetches in parallel and bound the Thalex call
@@ -1857,13 +1892,26 @@ class TradingBotEngine:
                     balance = account_snapshot['balance']
                     total_value = account_snapshot['total_value']
 
+                    # Deposits/withdrawals shift every baseline (session
+                    # return, HWM, daily loss) — detect them and adjust so a
+                    # deposit doesn't read as profit or a withdrawal as
+                    # drawdown.
+                    try:
+                        await self._adjust_baselines_for_transfers()
+                    except Exception as exc:  # pylint: disable=broad-except
+                        self.logger.warning("transfer baseline adjustment failed: %s", exc)
+
                     # Calculate total return from the actual session baseline.
                     initial_balance = float(self.initial_account_value or total_value or 0.0)
                     total_return_pct = 0.0
                     if initial_balance > 0:
                         total_return_pct = ((total_value - initial_balance) / initial_balance) * 100
 
-                    if self._previous_total_value is not None and self._previous_total_value > 0:
+                    if (
+                        not self.is_paused
+                        and self._previous_total_value is not None
+                        and self._previous_total_value > 0
+                    ):
                         period_return = (total_value - self._previous_total_value) / self._previous_total_value
                         self.trade_log.append(period_return)
                     self._previous_total_value = total_value
@@ -2003,12 +2051,21 @@ class TradingBotEngine:
                     # failures with no feedback to the agent.
                     buying_power = await self._get_buying_power_snapshot()
 
+                    # Aggregate realized performance from the trade ledger —
+                    # win rate / expectancy the LLM can adapt against.
+                    try:
+                        trade_stats = await asyncio.to_thread(get_db_manager().get_trade_stats)
+                    except Exception as exc:  # pylint: disable=broad-except
+                        self.logger.warning("trade stats fetch failed: %s", exc)
+                        trade_stats = {}
+
                     dashboard = {
                         'total_return_pct': total_return_pct,
                         'balance': balance,
                         'account_value': total_value,
                         'buying_power': buying_power,
                         'sharpe_ratio': sharpe_ratio,
+                        'performance': trade_stats,
                         'positions': [
                             {k: v for k, v in pos.items() if k not in ("closable", "row_id")}
                             for pos in combined_positions
@@ -2246,6 +2303,28 @@ class TradingBotEngine:
                                 _frame.pop("series", None)
                                 _s_copy[_frame_key] = _frame
                         _llm_sections.append(_s_copy)
+
+                    # Persist the per-cycle snapshot so the backtest harness
+                    # can replay exactly what the LLM saw.
+                    try:
+                        snapshot_ts = datetime.now(UTC).replace(tzinfo=None)
+                        snapshot_rows = [
+                            {
+                                'asset': s['asset'],
+                                'timestamp': snapshot_ts,
+                                'price': s.get('current_price'),
+                                'volume_24h': s.get('volume_24h'),
+                                'open_interest': s.get('open_interest'),
+                                'funding_rate': s.get('funding_rate'),
+                                'indicators': s,
+                            }
+                            for s in _llm_sections
+                        ]
+                        await asyncio.to_thread(
+                            get_db_manager().save_market_snapshots, snapshot_rows
+                        )
+                    except Exception as exc:  # pylint: disable=broad-except
+                        self.logger.warning("market snapshot persistence failed: %s", exc)
 
                     context_payload = OrderedDict([
                         ("invocation", {
@@ -2798,16 +2877,7 @@ class TradingBotEngine:
         now_iso = datetime.now(UTC).isoformat()
 
         if venue != 'hyperliquid':
-            self._write_diary_entry({
-                'timestamp': now_iso,
-                'venue': venue,
-                'asset': asset,
-                'action': 'trade_closed',
-                'instrument_names': trade.get('instrument_names'),
-                'strategy': trade.get('strategy'),
-                'opened_at': trade.get('opened_at'),
-                'note': 'closed/expired on venue; realized PnL not tracked for options yet',
-            })
+            await self._book_closed_thalex_trade(trade)
             return
 
         opened_at_ms = 0
@@ -2896,16 +2966,139 @@ class TradingBotEngine:
             except Exception as exc:  # pylint: disable=broad-except
                 self.logger.error("trade_closed booking: DB persist failed: %s", exc)
 
+    @staticmethod
+    def _thalex_fill_field(fill: Dict, *names, default=None):
+        for name in names:
+            value = fill.get(name)
+            if value is not None:
+                return value
+        return default
+
+    async def _book_closed_thalex_trade(self, trade: Dict) -> None:
+        """Book the realized premium flow of a closed Thalex options structure.
+
+        Sums signed cash flow (sells +, buys −) minus fees across the
+        structure's instruments since opened_at. Expiry settlement cash is
+        not in trade history, so ITM-settled structures understate PnL —
+        flagged in the diary entry.
+        """
+        asset = trade.get('asset')
+        now_iso = datetime.now(UTC).isoformat()
+        instruments = {
+            str(name) for name in (trade.get('instrument_names') or []) if name
+        }
+        legacy = trade.get('instrument_name')
+        if legacy:
+            instruments.add(str(legacy))
+
+        opened_at_raw = trade.get('opened_at')
+        opened_at_s = 0.0
+        if opened_at_raw:
+            try:
+                opened_at_s = datetime.fromisoformat(str(opened_at_raw)).timestamp()
+            except (ValueError, TypeError):
+                pass
+
+        fills = []
+        if self.thalex is not None and instruments:
+            try:
+                fills = await self.thalex.get_recent_fills(limit=200)
+            except Exception as exc:  # pylint: disable=broad-except
+                self.logger.warning("thalex trade_closed booking: fills fetch failed: %s", exc)
+
+        premium_flow = 0.0
+        fees = 0.0
+        matched = 0
+        last_price = 0.0
+        for fill in fills or []:
+            if not isinstance(fill, dict):
+                continue
+            name = str(self._thalex_fill_field(fill, 'instrument_name', 'asset') or '')
+            if name not in instruments:
+                continue
+            ts = float(self._thalex_fill_field(fill, 'time', 'timestamp', default=0.0) or 0.0)
+            if ts > 1_000_000_000_000:
+                ts /= 1000.0
+            if opened_at_s and ts and ts < opened_at_s - 60:
+                continue
+            try:
+                amount = float(self._thalex_fill_field(fill, 'amount', 'quantity', 'size', default=0.0) or 0.0)
+                price = float(self._thalex_fill_field(fill, 'price', 'px', default=0.0) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            side = str(self._thalex_fill_field(fill, 'direction', 'side', default='') or '').lower()
+            signed = amount * price if side.startswith('sell') else -amount * price
+            premium_flow += signed
+            try:
+                fees += abs(float(self._thalex_fill_field(fill, 'fee', 'fees', 'fee_amount', default=0.0) or 0.0))
+            except (TypeError, ValueError):
+                pass
+            matched += 1
+            last_price = price or last_price
+
+        realized_net = premium_flow - fees
+
+        self._write_diary_entry({
+            'timestamp': now_iso,
+            'venue': 'thalex',
+            'asset': asset,
+            'action': 'trade_closed',
+            'instrument_names': sorted(instruments),
+            'strategy': trade.get('strategy'),
+            'opened_at': opened_at_raw,
+            'premium_flow_usd': round(premium_flow, 4) if matched else None,
+            'fees_usd': round(fees, 4) if matched else None,
+            'realized_pnl_usd': round(realized_net, 4) if matched else None,
+            'fills_matched': matched,
+            'rationale': trade.get('rationale'),
+            'note': (
+                'realized premium flow net of fees; excludes expiry settlement '
+                'cash and hedge-leg PnL'
+                if matched else 'no matching fills found; PnL unknown'
+            ),
+        })
+
+        if matched:
+            entry_price = float(trade.get('execution_price') or 0.0) or abs(premium_flow)
+            opened_dt = None
+            if opened_at_raw:
+                try:
+                    opened_dt = datetime.fromisoformat(str(opened_at_raw)).replace(tzinfo=None)
+                except (ValueError, TypeError):
+                    pass
+            pnl_pct = (realized_net / abs(premium_flow) * 100.0) if premium_flow else 0.0
+            try:
+                await asyncio.to_thread(
+                    get_db_manager().record_closed_trade,
+                    asset=asset or 'BTC',
+                    action='sell' if premium_flow > 0 else 'buy',
+                    venue='thalex',
+                    instrument_name=next(iter(sorted(instruments)), None),
+                    entry_timestamp=opened_dt,
+                    entry_price=entry_price or last_price or 0.0,
+                    entry_size=1.0,
+                    exit_price=last_price or 0.0,
+                    realized_pnl=realized_net,
+                    realized_pnl_pct=pnl_pct,
+                    rationale=trade.get('rationale'),
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                self.logger.error("thalex trade_closed booking: DB persist failed: %s", exc)
+
     def _calculate_sharpe(self, returns: List[float]) -> float:
-        """Calculate naive Sharpe ratio from returns list"""
+        """Annualized Sharpe from per-cycle returns (rf = 0)."""
         if len(returns) < 2:
             return 0.0
 
         try:
+            import math
             import statistics
             mean = statistics.mean(returns)
             stdev = statistics.stdev(returns)
-            return mean / stdev if stdev > 0 else 0.0
+            if stdev <= 0:
+                return 0.0
+            periods_per_year = (365 * 86400) / max(self._get_interval_seconds(), 1)
+            return (mean / stdev) * math.sqrt(periods_per_year)
         except Exception:
             return 0.0
 

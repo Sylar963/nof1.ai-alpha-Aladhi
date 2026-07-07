@@ -442,6 +442,12 @@ class BotService:
                             if action and entry.get('action') != action:
                                 continue
 
+                            if entry.get('action') == 'trade_closed':
+                                if entry.get('pnl') is None:
+                                    entry['pnl'] = entry.get('realized_pnl_usd')
+                                if entry.get('pnl_pct') is None:
+                                    entry['pnl_pct'] = entry.get('realized_pnl_pct')
+
                             entries.append(entry)
                         except json.JSONDecodeError:
                             continue

@@ -209,12 +209,16 @@ async def build_options_context(
     )
 
     # Portfolio greeks — walk Thalex positions and aggregate per-leg greeks.
+    # Persisted entry premiums are joined back in so structure pnl_abs/pnl_pct
+    # reflect the move since open instead of a constant zero.
     raw_positions = _extract_positions(user_state)
+    open_structure_rows = _load_open_structure_rows() if raw_positions else []
     portfolio = await aggregate_portfolio_greeks(
         positions=raw_positions,
         greeks_source=thalex,
         today=today_for_signals,
         spot=float(spot),
+        entry_premium_by_structure_id=_entry_premium_map(open_structure_rows),
     )
 
     # Recent options trade history — last N closed Thalex trades pulled from
@@ -287,6 +291,7 @@ async def build_options_context(
         structure_views=_build_structure_views(
             portfolio.get("structures", []),
             portfolio.get("open_positions", []),
+            open_structure_rows=open_structure_rows,
         ),
         triggered_by_events=[],
         capital_available=capital_available,
@@ -321,9 +326,37 @@ async def build_options_context(
     return ctx
 
 
+def _load_open_structure_rows() -> list[dict]:
+    """Fetch open OptionStructureSnapshot rows. Fail-soft: DB errors return []."""
+    try:
+        from src.database.db_manager import get_db_manager as _get_db_manager
+        return _get_db_manager().get_open_structures() or []
+    except Exception:
+        logger.warning(
+            "options builder: get_open_structures failed; structure lifecycle "
+            "fields (entry premium, days_open) will default",
+            exc_info=True,
+        )
+        return []
+
+
+def _entry_premium_map(open_structure_rows: list) -> dict:
+    out: dict = {}
+    for row in open_structure_rows or []:
+        if not isinstance(row, dict):
+            continue
+        structure_id = row.get("structure_id")
+        premium = row.get("entry_net_premium")
+        if not structure_id or premium is None:
+            continue
+        out[structure_id] = premium
+    return out
+
+
 def _build_structure_views(
     structures: list,
     open_positions: list,
+    open_structure_rows: Optional[list] = None,
 ) -> list:
     """Build StructureView projections from classifier output + DB lifecycle.
 
@@ -337,17 +370,13 @@ def _build_structure_views(
     if not structures:
         return []
 
+    if open_structure_rows is None:
+        open_structure_rows = _load_open_structure_rows()
+
     opened_at_by_id = {}
-    try:
-        from src.database.db_manager import get_db_manager as _get_db_manager
-        for row in _get_db_manager().get_open_structures():
-            opened_at_by_id[row["structure_id"]] = row["opened_at"]
-    except Exception:
-        logger.warning(
-            "structure_views: DB lookup for opened_at failed; days_open will default to 0",
-            exc_info=True,
-        )
-        opened_at_by_id = {}
+    for row in open_structure_rows:
+        if isinstance(row, dict) and row.get("structure_id"):
+            opened_at_by_id[row["structure_id"]] = row.get("opened_at")
 
     now = datetime.now(timezone.utc)
     views = []

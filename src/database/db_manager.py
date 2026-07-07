@@ -716,6 +716,35 @@ class DatabaseManager:
                 if existing.closed_at is not None:
                     existing.closed_at = None
 
+    def save_market_snapshots(self, rows: List[Dict[str, Any]]) -> int:
+        """Persist per-cycle market snapshots for backtesting/replay.
+
+        Each row: asset, timestamp (datetime), price, volume_24h,
+        open_interest, funding_rate, indicators (dict — stored as JSON).
+        """
+        import json as _json
+        from src.database.models import MarketData
+
+        if not rows:
+            return 0
+        with self.session_scope() as session:
+            for r in rows:
+                price = float(r.get('price') or 0.0)
+                session.add(MarketData(
+                    asset=r['asset'],
+                    timestamp=r['timestamp'],
+                    interval='cycle',
+                    open=price,
+                    high=price,
+                    low=price,
+                    close=price,
+                    volume=float(r.get('volume_24h') or 0.0),
+                    open_interest=r.get('open_interest'),
+                    funding_rate=r.get('funding_rate'),
+                    indicators=_json.dumps(r.get('indicators') or {}, default=str),
+                ))
+            return len(rows)
+
     def mark_structure_closed(self, structure_id: str) -> None:
         from datetime import datetime
         from src.database.models import OptionStructureSnapshot

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 from typing import Iterable, Literal, Optional, Sequence
 
@@ -392,12 +392,37 @@ def classify(
     )
 
 
-def classify_many(legs: Sequence[OptionLeg]) -> list[OptionStructure]:
+def _lookup_entry_premium(
+    legs: Sequence[OptionLeg],
+    entry_net_premium_by_id: Optional[dict],
+) -> Optional[Decimal]:
+    if not entry_net_premium_by_id:
+        return None
+    raw = entry_net_premium_by_id.get(compute_structure_id(legs))
+    if raw is None:
+        return None
+    try:
+        return Decimal(str(raw))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+
+
+def classify_many(
+    legs: Sequence[OptionLeg],
+    *,
+    entry_net_premium_by_id: Optional[dict] = None,
+) -> list[OptionStructure]:
     legs_tuple = tuple(legs)
     if not legs_tuple:
         return []
 
-    primary = classify(legs_tuple)
+    def _classify(sub: Sequence[OptionLeg]) -> OptionStructure:
+        return classify(
+            sub,
+            entry_net_premium=_lookup_entry_premium(sub, entry_net_premium_by_id),
+        )
+
+    primary = _classify(legs_tuple)
     if primary.kind != StructureKind.UNKNOWN:
         return [primary]
 
@@ -408,7 +433,7 @@ def classify_many(legs: Sequence[OptionLeg]) -> list[OptionStructure]:
     classified: list[OptionStructure] = []
     orphans: list[OptionLeg] = []
     for tenor in sorted(by_tenor.keys()):
-        sub = classify(by_tenor[tenor])
+        sub = _classify(by_tenor[tenor])
         if sub.kind != StructureKind.UNKNOWN:
             classified.append(sub)
         else:
@@ -416,7 +441,7 @@ def classify_many(legs: Sequence[OptionLeg]) -> list[OptionStructure]:
 
     if classified:
         if orphans:
-            classified.append(classify(orphans))
+            classified.append(_classify(orphans))
         return classified
 
     return [primary]

@@ -77,6 +77,7 @@ async def aggregate_portfolio_greeks(
     today: date,
     *,
     spot: Optional[float] = None,
+    entry_premium_by_structure_id: Optional[dict] = None,
 ) -> dict:
     """Build the open_positions list and net portfolio greeks dict.
 
@@ -219,7 +220,10 @@ async def aggregate_portfolio_greeks(
 
     structures: list[dict] = []
     if structure_legs:
-        results = classify_many(structure_legs)
+        results = classify_many(
+            structure_legs,
+            entry_net_premium_by_id=entry_premium_by_structure_id,
+        )
         for result in results:
             structures.append({
                 "structure_id": result.structure_id,

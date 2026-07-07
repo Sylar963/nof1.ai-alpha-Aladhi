@@ -106,7 +106,7 @@ class OptionsContext:
             "realized_iv_ratio_30d": self.realized_iv_ratio_30d,
             "straddle_test_30d": self.straddle_test_30d,
             "top_mispricings_vs_deribit": self.top_mispricings_vs_deribit[:_MAX_MISPRICINGS],
-            "open_positions": self.open_positions[:self.max_open_positions],
+            "open_positions": self.open_positions,
             "portfolio_greeks": self.portfolio_greeks,
             "capital_available": self.capital_available,
             "max_contracts_per_trade": self.max_contracts_per_trade,
