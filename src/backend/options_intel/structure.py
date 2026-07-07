@@ -65,6 +65,7 @@ class OptionStructure:
     pnl_pct: Decimal
     aggregate_greeks: dict[str, Decimal]
     confidence: float
+    entry_net_premium: Optional[Decimal] = None
 
 
 def compute_structure_id(legs: Iterable[OptionLeg]) -> str:
@@ -389,6 +390,7 @@ def classify(
         pnl_pct=pnl_pct,
         aggregate_greeks=aggregate_greeks,
         confidence=confidence,
+        entry_net_premium=entry_net_premium,
     )
 
 
@@ -407,20 +409,42 @@ def _lookup_entry_premium(
         return None
 
 
+def _fill_based_entry(
+    legs: Sequence[OptionLeg],
+    entry_price_by_instrument: Optional[dict],
+) -> Optional[Decimal]:
+    """Entry premium from actual fill prices when every leg has a basis."""
+    if not entry_price_by_instrument:
+        return None
+    total = Decimal("0")
+    for leg in legs:
+        raw = entry_price_by_instrument.get(leg.instrument_name)
+        if raw is None:
+            return None
+        try:
+            fill_price = Decimal(str(raw))
+        except (InvalidOperation, ValueError, TypeError):
+            return None
+        side_sign = Decimal("1") if leg.side == "short" else Decimal("-1")
+        total += side_sign * leg.contracts * fill_price
+    return total
+
+
 def classify_many(
     legs: Sequence[OptionLeg],
     *,
     entry_net_premium_by_id: Optional[dict] = None,
+    entry_price_by_instrument: Optional[dict] = None,
 ) -> list[OptionStructure]:
     legs_tuple = tuple(legs)
     if not legs_tuple:
         return []
 
     def _classify(sub: Sequence[OptionLeg]) -> OptionStructure:
-        return classify(
-            sub,
-            entry_net_premium=_lookup_entry_premium(sub, entry_net_premium_by_id),
-        )
+        entry = _fill_based_entry(sub, entry_price_by_instrument)
+        if entry is None:
+            entry = _lookup_entry_premium(sub, entry_net_premium_by_id)
+        return classify(sub, entry_net_premium=entry)
 
     primary = _classify(legs_tuple)
     if primary.kind != StructureKind.UNKNOWN:

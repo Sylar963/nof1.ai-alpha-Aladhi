@@ -220,9 +220,19 @@ async def aggregate_portfolio_greeks(
 
     structures: list[dict] = []
     if structure_legs:
+        from src.backend.options_intel.entry_basis import fill_entry_price_map
+
+        entry_prices = await fill_entry_price_map(
+            greeks_source,
+            {
+                leg.instrument_name: (leg.side, float(leg.contracts))
+                for leg in structure_legs
+            },
+        )
         results = classify_many(
             structure_legs,
             entry_net_premium_by_id=entry_premium_by_structure_id,
+            entry_price_by_instrument=entry_prices,
         )
         for result in results:
             structures.append({
@@ -232,6 +242,10 @@ async def aggregate_portfolio_greeks(
                 "tenor_days_min": result.tenor_days_min,
                 "tenor_days_max": result.tenor_days_max,
                 "net_premium": float(result.net_premium),
+                "entry_net_premium": (
+                    float(result.entry_net_premium)
+                    if result.entry_net_premium is not None else None
+                ),
                 "is_credit": result.is_credit,
                 "max_loss": float(result.max_loss) if result.max_loss is not None else None,
                 "max_profit": float(result.max_profit) if result.max_profit is not None else None,

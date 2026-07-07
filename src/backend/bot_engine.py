@@ -51,12 +51,15 @@ def persist_options_structures(db_manager, current_structures: list[dict]) -> No
     current_ids = {s["structure_id"] for s in current_structures}
 
     for s in current_structures:
+        entry = s.get("entry_net_premium")
+        if entry is None:
+            entry = s["net_premium"]
         db_manager.upsert_structure_snapshot(
             structure_id=s["structure_id"],
             underlying=s["underlying"],
             kind=s["kind"],
             legs_json=s.get("legs", []),
-            entry_net_premium=_Decimal(str(s["net_premium"])),
+            entry_net_premium=_Decimal(str(entry)),
             last_pnl_abs=_Decimal(str(s["pnl_abs"])),
             last_pnl_pct=_Decimal(str(s["pnl_pct"])),
             last_breach_state=s["breach_state"],
