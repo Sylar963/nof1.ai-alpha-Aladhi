@@ -108,6 +108,14 @@ def _get_list(name: str, default: list[str] | None = None) -> list[str] | None:
 
 
 CONFIG = {
+    "capture_output_dir": _get_env("CAPTURE_OUTPUT_DIR", "data/market_capture"),
+    "capture_symbol": _get_env("CAPTURE_SYMBOL", "BTCUSDT"),
+    "capture_paradex_market": _get_env("CAPTURE_PARADEX_MARKET", "BTC-USD-PERP"),
+    "capture_sources": _get_env("CAPTURE_SOURCES", "binance_spot,binance_perp_book,binance_perp_market,paradex"),
+    "capture_max_queue_bytes": _get_int("CAPTURE_MAX_QUEUE_BYTES", 8 * 1024 * 1024),
+    "capture_max_file_bytes": _get_int("CAPTURE_MAX_FILE_BYTES", 128 * 1024 * 1024),
+    "capture_max_total_bytes": _get_int("CAPTURE_MAX_TOTAL_BYTES", 1024 * 1024 * 1024),
+    "capture_flush_interval": _get_float("CAPTURE_FLUSH_INTERVAL", 0.25),
     # API keys - not required during module import (checked when bot starts)
     "taapi_api_key": _get_env("TAAPI_API_KEY"),
     "hyperliquid_private_key": _get_env("HYPERLIQUID_PRIVATE_KEY") or _get_env("LIGHTER_PRIVATE_KEY"),

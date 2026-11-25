@@ -266,3 +266,13 @@ Create an ecosystem where AI **learns, adapts, and trades autonomously**, formin
 ---
 
 *Inspired by the [Alpha Arena](https://nof1.ai) experiment.*
+
+## Public market-data capture
+
+Record Binance BTCUSDT spot/perpetual and Paradex BTC-USD-PERP WebSockets for speed and execution research:
+
+```bash
+venv/bin/python scripts/record_market_data.py --duration 60
+```
+
+The standalone recorder uses public data only and never submits orders. It preserves raw frames, timestamps, reconnect gaps and depth snapshots in bounded NDJSON files. See [capture configuration, recovery and replay](docs/market_data_capture.md).
