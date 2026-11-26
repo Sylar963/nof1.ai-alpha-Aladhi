@@ -8,6 +8,8 @@ from pathlib import Path
 
 from src.backtest.paradex_replay import NS, ParadexReplay, ReplayConfig, decimal, utc
 from src.backtest.replay_dataset import IndexedCapture
+from src.backtest.calibration_replay import CalibrationReplay, LABELS
+from src.backend.market_data.calibration import CalibrationConfig
 
 
 TIMEFRAMES = (1, 5, 15, 60, 300, 360, 900, 3600)
@@ -53,6 +55,7 @@ class Workbench:
                  warmup_seconds=60):
         self.engine = ParadexReplay(dataset.source, config, source=dataset, journal_dir=journal_dir)
         self.dataset = dataset
+        self.calibration = CalibrationReplay(dataset.source, CalibrationConfig(), cache_dir=dataset.path.parent)
         self.candles = Candles()
         self.plan = None
         self.drawings = []
@@ -71,6 +74,7 @@ class Workbench:
         count = 0
         while not engine.finished and engine.next_event_ns is not None and engine.next_event_ns <= target_ns and count < max_events:
             engine.step()
+            self.calibration.advance(engine.clock_ns, getattr(engine, 'last_original_sequence', None))
             count += 1
             if engine.last_kind == 'depth' and engine.midpoint is not None:
                 self._protect()
@@ -81,6 +85,7 @@ class Workbench:
             delta = max(0, target_ns - engine.clock_ns)
             engine.clock_ns += delta
             engine.wall_ns += delta
+            self.calibration.advance(engine.clock_ns)
         self.processed += count
         self.last_used = time.monotonic()
         return {'events': count, 'elapsed_ms': round((time.perf_counter() - started) * 1000, 2),
@@ -212,11 +217,40 @@ class Workbench:
                 'capture': engine.capture['run_id'], 'capture_path': str(self.dataset.source), 'plan': self.plan,
                 'price_source': engine.price_source,
                 'trade_history_provenance': engine.capture.get('trade_history_provenance'),
+                'calibration': self.calibration.snapshot(engine.clock_ns),
                 'processed_events': self.processed}
+
+    def label_speed(self, body):
+        if self.engine.finished or self.engine.failure:
+            raise ValueError('labels must be recorded during practice')
+        label = body.get('label')
+        reason = body.get('reason', '')
+        features = self.calibration.snapshot(self.engine.clock_ns)
+        if (body.get('expected_clock_ns') != self.engine.clock_ns
+                or body.get('expected_sequence') != features['capture_sequence']):
+            raise ValueError('Replay advanced; inspect the current features and save your interpretation again')
+        source = body.get('source')
+        stream = body.get('stream')
+        view = features['sources'].get(source)
+        if (label not in LABELS or not view or stream not in {'quote', 'trade'} or view[stream]['price'] is None
+                or not isinstance(reason, str) or not reason.strip()):
+            raise ValueError('choose an observed source, a calibration label, and a reason')
+        if len(reason) > 4000:
+            raise ValueError('calibration reason is limited to 4000 characters')
+        context = {key: features[key] for key in ('version', 'config_version', 'config', 'as_of_ns', 'capture_sequence')}
+        context.update(metrics=view[stream], opening_range=view['opening_range'], market=view['market'],
+                       encounter=view['encounters'][-1] if view['encounters'] else None, basis=features['basis'])
+        self.engine._log('human', 'calibration_label', label=label, source=source, stream=stream,
+                         reason=reason.strip(), features=context)
+
+    def close(self):
+        self.calibration.close()
+        self.engine.close()
 
     def finish(self):
         self.engine.finish()
         return self.save()
 
     def save(self):
-        return self.engine.save_report(extra={'drawings': self.drawings, 'chart_kind': self.engine.price_source + ' candles'})
+        return self.engine.save_report(extra={'drawings': self.drawings, 'chart_kind': self.engine.price_source + ' candles',
+                                              'calibration': self.calibration.snapshot(self.engine.clock_ns)})

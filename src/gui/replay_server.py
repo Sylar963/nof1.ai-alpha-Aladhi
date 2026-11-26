@@ -85,7 +85,7 @@ async def create_session(request):
     async with state['load_lock']:
         for key, (old, _) in list(state['sessions'].items()):
             if old.engine.finished or time.monotonic() - old.last_used > 3600:
-                old.engine.close()
+                old.close()
                 del state['sessions'][key]
         if len(state['sessions']) >= 4:
             raise ValueError('Close another replay attempt before opening more')
@@ -151,6 +151,8 @@ async def session_action(request):
                 desk.cancel_all()
             elif action == 'note':
                 desk.engine.note(body.get('action', 'note'), body.get('reason', ''))
+            elif action == 'calibration-label':
+                desk.label_speed(body)
             elif action == 'drawing':
                 drawings = body.get('drawings', [])
                 if not isinstance(drawings, list) or len(drawings) > 100:
@@ -160,7 +162,7 @@ async def session_action(request):
             elif action == 'finish':
                 desk.finish()
             elif action == 'close':
-                desk.engine.close()
+                desk.close()
                 return {'closed': True}
             elif action != 'state':
                 raise ValueError('unknown replay action')
@@ -207,7 +209,7 @@ def create_server(default_capture: Path | None = None):
     async def shutdown(application):
         for desk, lock in application[STATE]['sessions'].values():
             async with lock:
-                desk.engine.close()
+                desk.close()
 
     app.on_cleanup.append(shutdown)
     return app

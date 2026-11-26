@@ -49,8 +49,16 @@ invis = color.rgb(0,0,0,100)
 //---------------------------------------------------------------------------------------------------------------------}
 //Error
 //---------------------------------------------------------------------------------------------------------------------{
-if timeframe.in_seconds(timeframe.period) >= timeframe.in_seconds("D")
+chartSeconds = timeframe.in_seconds(timeframe.period)
+if chartSeconds >= timeframe.in_seconds("D")
     runtime.error("Timeframe is too High! Please Reduce Timeframe to be Less-Than 1 Day.")
+
+customStartMinutes = str.tonumber(str.substring(crSesh, 0, 2)) * 60 + str.tonumber(str.substring(crSesh, 2, 4))
+customEndMinutes = str.tonumber(str.substring(crSesh, 5, 7)) * 60 + str.tonumber(str.substring(crSesh, 7, 9))
+customRangeMinutes = (customEndMinutes - customStartMinutes + 1440) % 1440
+rangeSeconds = crTog ? (customRangeMinutes == 0 ? 1440 : customRangeMinutes) * 60 : timeframe.in_seconds(orTF)
+if chartSeconds > rangeSeconds
+    runtime.error("Chart timeframe must not exceed the configured opening range. Please use a smaller chart timeframe.")
 
 //---------------------------------------------------------------------------------------------------------------------}
 //Functions
@@ -189,6 +197,10 @@ if or_start
     down_count := 0
     up_check := true
     down_check := true
+    first_up_target := na
+    first_down_target := na
+    hst := na
+    lst := na
     first_up_hit := false
     first_down_hit := false
 
@@ -235,19 +247,20 @@ if not or_sesh and or_token
     m_ln.set_x2(bar_index)
 
 // MODIFIED: Check if first targets are hit
-if not na(first_up_target) and h_src > first_up_target and not first_up_hit
-    first_up_hit := true
-    hst := h_src
+if not or_sesh and or_token
+    if not na(first_up_target) and h_src > first_up_target and not first_up_hit
+        first_up_hit := true
+        hst := h_src
 
-if not na(first_down_target) and l_src < first_down_target and not first_down_hit
-    first_down_hit := true
-    lst := l_src
+    if not na(first_down_target) and l_src < first_down_target and not first_down_hit
+        first_down_hit := true
+        lst := l_src
 
-// MODIFIED: Update subsequent targets if needed
-if first_up_hit and h_src > hst
-    hst := h_src
-if first_down_hit and l_src < lst
-    lst := l_src
+    // MODIFIED: Update subsequent targets if needed
+    if first_up_hit and h_src > hst
+        hst := h_src
+    if first_down_hit and l_src < lst
+        lst := l_src
 
 // Calculate maximum targets based on subsequent targets spacing
 up_max = first_up_hit ? get_1up((hst - first_up_target)/(orw*tSubsequentPer)) : 0
@@ -262,7 +275,7 @@ if  (close > orm and down_check == false)
     down_check := true
 
 xdown = ta.crossunder(close,orl)
-xdown2 = ta.crossunder(close,orl-orw*tSubsequentPer)
+xdown2 = ta.crossunder(close,first_down_target)
 if (useBias ? ((day_dir != 1 and xdown) or (day_dir == 1 and xdown2)) : ta.crossunder(close,orl)) and down_check
     down_signal := true
     down_check := false
@@ -271,7 +284,7 @@ if (close < orm and up_check == false)
     up_check := true
 
 xup = ta.crossover(close,orh)
-xup2 = ta.crossover(close,orh+orw*tSubsequentPer)
+xup2 = ta.crossover(close,first_up_target)
 if (useBias ? ((day_dir != -1 and xup) or (day_dir == -1 and xup2)) : ta.crossover(close,orh)) and up_check
     up_signal := true
     up_check := false

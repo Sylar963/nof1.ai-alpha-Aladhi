@@ -509,6 +509,57 @@ async def test_late_snapshot_retry_cannot_mask_active_fatal_frame_error():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("malformed", [True, False])
+async def test_stop_during_socket_exit_preserves_fatal_frame_error(tmp_path, monkeypatch, malformed):
+    stop = asyncio.Event()
+    exiting = asyncio.Event()
+    exit_cancelled = asyncio.Event()
+
+    class BlockingExit(FakeSocket):
+        async def __aexit__(self, *args):
+            exiting.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                exit_cancelled.set()
+                raise
+
+    final = (aiohttp.WSMessage(aiohttp.WSMsgType.BINARY, b"bad", None) if malformed else
+             aiohttp.WSMessage(aiohttp.WSMsgType.CLOSED, None, None))
+    socket = BlockingExit([aiohttp.WSMessage(aiohttp.WSMsgType.BINARY, paradex_bbo(), None), final])
+    monkeypatch.setattr(aiohttp, "ClientSession", lambda **kwargs: FakeSession([socket]))
+    config = CaptureConfig(output_dir=tmp_path, sources=("paradex",))
+    task = asyncio.create_task(record_market_data(config, stop=stop))
+    try:
+        await asyncio.wait_for(exiting.wait(), 1)
+        stop.set()
+        if malformed:
+            with pytest.raises(ProtocolError) as caught:
+                await asyncio.wait_for(task, 2)
+        else:
+            await asyncio.wait_for(task, 2)
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert exit_cancelled.is_set()
+    rows = list(iter_capture_records(next(tmp_path.iterdir())))
+    quarantined = [row for row in rows if row["kind"] == "quarantine"]
+    assert rows[-1]["kind"] == "run_end"
+    assert rows[-1]["source_message_counts"] == {"paradex": 1}
+    if malformed:
+        assert len(quarantined) == 1
+        assert str(caught.value) == quarantined[0]["error"]
+        assert rows[-1]["outcome"] == "failed"
+        assert rows[-1]["error"] == str(caught.value)
+    else:
+        assert not quarantined
+        assert rows[-1]["outcome"] == "completed"
+        assert rows[-1]["error"] is None
+
+
+@pytest.mark.asyncio
 async def test_snapshot_retry_after_survives_simultaneous_socket_close():
     class ImmediateClose(FakeSocket):
         async def receive(self):

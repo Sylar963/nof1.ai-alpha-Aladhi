@@ -4,7 +4,7 @@ from decimal import Decimal
 
 import pytest
 
-from src.backtest.paradex_replay import ReplayConfig
+from src.backtest.paradex_replay import ParadexReplay, ReplayConfig
 from src.backtest.replay_dataset import IndexedCapture
 from src.backtest.replay_workbench import Candles, Workbench
 from src.backtest.trade_history import recover_trade_history
@@ -92,6 +92,33 @@ def test_opening_range_and_breakout_use_trade_prices_instead_of_book_midpoint(tm
     assert desk.engine.orders[0].actor == 'bot' and desk.engine.orders[0].side == 'buy'
     assert desk.engine.accounts['bot'].position == 0
     desk.engine.close()
+
+
+@pytest.mark.parametrize('delayed_price,expected_high,expected_low', [('110', '110', '101'), ('95', '102', '95')])
+@pytest.mark.parametrize('after_cutoff', [False, True])
+def test_delayed_range_trade_uses_its_own_price_without_replacing_latest_mark(
+        tmp_path, delayed_price, expected_high, expected_low, after_cutoff):
+    latest_time, latest_price = (61.1, '150') if after_cutoff else (20.1, '102')
+    delayed_receive = 62.15 if after_cutoff else 21.15
+    records = [book(i) for i in range(66)] + [
+        trade(.15, .1, '101', '1'), trade(20.15, 20.1, '102', '2'),
+        trade(delayed_receive, 10.1, delayed_price, '4')]
+    if after_cutoff:
+        records.append(trade(61.15, 61.1, latest_price, '3'))
+    source = write_capture(tmp_path / 'capture', records)
+    config = ReplayConfig(session_timezone='UTC', range_start='18:53', range_minutes=1)
+    desk = ParadexReplay(source, config, journal_dir=None)
+    desk.baseline_enabled = False
+    try:
+        desk.advance_to(10 * NS + int((delayed_receive - .05) * NS))
+        assert desk.range['high'] == Decimal('102') and desk.range['low'] == Decimal('101')
+        desk.advance_to(10 * NS + int((delayed_receive + .05) * NS))
+        assert desk.range['high'] == Decimal(expected_high)
+        assert desk.range['low'] == Decimal(expected_low)
+        assert desk.last_trade == desk.mark_price == desk.signal_price == Decimal(latest_price)
+        assert desk.last_trade_time_ns == BASE + int(latest_time * NS)
+    finally:
+        desk.close()
 
 
 def test_late_print_updates_earlier_bar_without_changing_later_close_or_duplicating_volume():

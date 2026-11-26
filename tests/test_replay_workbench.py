@@ -1,4 +1,5 @@
 import json
+import shutil
 from datetime import datetime, timedelta
 from decimal import Decimal
 
@@ -62,6 +63,51 @@ def test_active_checkpoint_copies_only_durable_prefix_and_never_modifies_recordi
     assert json.loads(status_path.read_text())['closed'] is False
     assert segment.read_bytes().endswith(b'{"incomplete":')
     assert json.loads((frozen / 'manifest.json').read_text())['replay_snapshot_of'] == str(capture.resolve())
+
+
+def test_checkpoint_distinguishes_sources_with_the_same_basename_and_prefix(capture, tmp_path):
+    other = tmp_path / 'other' / capture.name
+    shutil.copytree(capture, other)
+    destination = tmp_path / 'snapshots'
+    first = snapshot_capture(capture, destination)
+    second = snapshot_capture(other, destination)
+    assert first != second
+    assert json.loads((first / 'manifest.json').read_text())['replay_snapshot_of'] == str(capture.resolve())
+    assert json.loads((second / 'manifest.json').read_text())['replay_snapshot_of'] == str(other.resolve())
+
+
+def test_checkpoint_reuses_resolved_source_and_separates_durable_prefixes(capture, tmp_path):
+    status_path = capture / 'status.json'
+    full_status = json.loads(status_path.read_text())
+    segment = next(capture.glob('records-*'))
+    prefix_bytes = sum(map(len, segment.read_bytes().splitlines(keepends=True)[:50]))
+    status_path.write_text(json.dumps({**full_status, 'closed': False, 'durable_records': 50,
+                                      'durable_bytes': prefix_bytes}))
+    destination = tmp_path / 'snapshots'
+    first = snapshot_capture(capture, destination)
+    assert snapshot_capture(capture / '..' / capture.name, destination) == first
+    status_path.write_text(json.dumps(full_status))
+    second = snapshot_capture(capture, destination)
+    assert second != first
+    assert json.loads((first / 'status.json').read_text())['durable_records'] == 50
+    assert json.loads((second / 'status.json').read_text())['durable_records'] == 100
+
+
+@pytest.mark.parametrize('file,field,value', [
+    ('manifest.json', 'replay_snapshot_of', '/different/source'),
+    ('manifest.json', 'snapshot_durable_records', 99),
+    ('status.json', 'durable_bytes', 1),
+    ('status.json', 'closed', False),
+])
+def test_checkpoint_reuse_rejects_mismatched_provenance(capture, tmp_path, file, field, value):
+    destination = tmp_path / 'snapshots'
+    frozen = snapshot_capture(capture, destination)
+    path = frozen / file
+    metadata = json.loads(path.read_text())
+    path.write_text(json.dumps({**metadata, field: value}))
+    with pytest.raises(ValueError, match='checkpoint.*provenance'):
+        snapshot_capture(capture, destination)
+    assert json.loads(path.read_text())[field] == value
 
 
 def test_candles_reveal_only_observed_ticks_and_timeframe_changes_cannot_leak_future(workbench):

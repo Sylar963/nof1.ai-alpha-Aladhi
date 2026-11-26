@@ -55,6 +55,13 @@
       <button id="close-position" class="close-trade">Close position <kbd>X</kbd></button><button id="cancel-orders" class="cancel-orders">Cancel orders</button>
       <div class="panel-separator"></div>
       <div class="account-title">Practice account</div><div class="metric"><span>Equity</span><b id="equity">$10,000.00</b></div><div class="metric"><span>Open P&L</span><b id="open-pnl">$0.00</b></div><div class="metric"><span>Realized P&L</span><b id="realized-pnl">$0.00</b></div><div class="metric"><span>Fees</span><b id="fees">$0.00</b></div>
+      <details class="calibration-panel" open><summary>Speed & acceptance <span>RESEARCH</span></summary>
+        <label>Market source<select id="calibration-source"><option value="binance_spot">Binance spot</option><option value="binance_perp_book">Binance perp quotes</option><option value="binance_perp_market">Binance perp trades</option><option value="paradex">Paradex</option></select></label>
+        <label>Speed price<select id="calibration-stream"><option value="quote">Quote midpoint</option><option value="trade">Transactions</option></select></label>
+        <div id="calibration-values">Open a recording to inspect speed.</div>
+        <label>Your interpretation<select id="calibration-label"><option value="fast_add">Fast enough to add a hedge</option><option value="acceptance_no_add">Acceptance — stop adding</option><option value="hold_burst">Hold through this burst</option><option value="release_hedge">Release the hedge</option><option value="wait">Wait</option><option value="skip">Skip this encounter</option></select></label>
+        <button id="save-calibration-label">Save interpretation with your reason</button>
+      </details>
       <div class="panel-separator"></div><div class="note-heading">Your read <kbd>N</kbd></div><textarea id="note" placeholder="Why enter, wait, or skip? Your reasoning helps refine the bot."></textarea><div class="note-actions"><button id="save-note">Save note</button><button id="wait-note">Wait</button><button id="skip-note">Skip</button></div>
       <div class="panel-footer"><span id="feed-health" class="status-dot">No recording loaded</span><small>Recorded depth · IOC fills · bot hidden during practice</small></div>
     </aside>

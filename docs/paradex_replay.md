@@ -85,6 +85,13 @@ recorded interruptions during the range disable that session's entry. Execution
 always requires a fresh two-sided recorded book.
 This baseline is not yet trained to imitate your discretionary decisions.
 
+The **Speed & acceptance** panel adds an independent causal research cursor for
+all captured markets. Select a source to inspect signed speed, earlier-sample
+percentiles, transaction OR/target levels and level persistence. Save an
+interpretation with your reason to journal the current features. These
+measurements do not change the breakout baseline or simulated orders. See
+[speed and acceptance calibration](speed_acceptance.md).
+
 Bot activity stays hidden until the recording ends or you select **Finish &
 review**. Finishing freezes the attempt at the current cursor, expires outstanding
 orders, reveals both decision traces and saves the comparison. It does not run

@@ -18,11 +18,24 @@ INDEX_VERSION = 2
 def snapshot_capture(source: Path, destination: Path) -> Path:
     source = Path(source).resolve()
     status = json.loads((source / 'status.json').read_text())
-    if status.get('failed') or type(status.get('durable_bytes')) is not int or status['durable_bytes'] <= 0:
+    if status.get('failed') or any(type(status.get(key)) is not int or status[key] <= 0
+                                   for key in ('durable_bytes', 'durable_records')):
         raise ValueError('capture has no healthy durable checkpoint')
     manifest = json.loads((source / 'manifest.json').read_text())
-    path = Path(destination) / f"{source.name}-checkpoint-{status['durable_records']}"
+    identity = json.dumps([str(source), manifest, status['durable_records'], status['durable_bytes']], sort_keys=True)
+    key = hashlib.sha256(identity.encode()).hexdigest()[:24]
+    path = Path(destination) / f"{source.name}-checkpoint-{status['durable_records']}-{key}"
+    manifest.update(run_id=path.name, replay_snapshot_of=str(source),
+                    snapshot_durable_records=status['durable_records'])
+    checkpoint_status = {**status, 'closed': True}
     if path.exists():
+        try:
+            stored_manifest = json.loads((path / 'manifest.json').read_text())
+            stored_status = json.loads((path / 'status.json').read_text())
+        except (OSError, ValueError) as exc:
+            raise ValueError('existing checkpoint provenance is missing or invalid') from exc
+        if stored_manifest != manifest or stored_status != checkpoint_status:
+            raise ValueError('existing checkpoint provenance does not match the source durable prefix')
         return path
     temporary = path.with_name(path.name + '-' + uuid4().hex + '.tmp')
     temporary.mkdir(parents=True)
@@ -40,10 +53,8 @@ def snapshot_capture(source: Path, destination: Path) -> Path:
                     remaining -= len(block)
         if remaining:
             raise ValueError('durable checkpoint exceeds available capture bytes')
-        manifest.update(run_id=path.name, replay_snapshot_of=str(source),
-                        snapshot_durable_records=status['durable_records'])
         (temporary / 'manifest.json').write_text(json.dumps(manifest))
-        (temporary / 'status.json').write_text(json.dumps({**status, 'closed': True}))
+        (temporary / 'status.json').write_text(json.dumps(checkpoint_status))
         for _ in iter_capture_records(temporary):
             pass
         temporary.rename(path)

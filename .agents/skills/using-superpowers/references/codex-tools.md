@@ -14,14 +14,20 @@ preset selects (current presets run V2; older ones run V1). Trust your
 actual tool list over any table — including this one — when they
 disagree.
 
-- **Spawning:** give children a clean context with
+- **Spawning (V1):** use `spawn_agent {fork_context: false}` for a
+  clean context (also the default); `true` inherits the parent history.
+  V1 does not use `fork_turns`.
+- **Spawning (V2):** give children a clean context with
   `spawn_agent {fork_turns: "none"}`; the default `"all"` copies your
   entire transcript into the child. On Codex 0.145+, role files under
   `~/.codex/agents/` attach to isolated forks via `agent_type`.
   Full-history forks accept `model` and `reasoning_effort` overrides
   (only `agent_type` is refused there) — isolated forks are the SDD
   default for context hygiene, not because overrides require them.
-- **Fix rounds:** resume the implementer with `followup_task` — it
+- **Fix rounds (V1):** reuse the implementer with `send_input`. If
+  the child was closed, call `resume_agent` first, then `send_input`.
+  V1 does not provide `followup_task`.
+- **Fix rounds (V2):** resume the implementer with `followup_task` — it
   delivers your message, triggers a turn, and transparently reloads a
   child the harness evicted. Never dispatch a fresh implementer on the
   theory that a spawned agent cannot be messaged again; on V2 it
@@ -38,11 +44,15 @@ disagree.
 
 ## Waiting on children
 
-`wait_agent` is an event subscription, not a poll: a long wait wakes
+On V2, `wait_agent` is an event subscription, not a poll: a long wait wakes
 the moment a child produces mailbox activity, with the same latency as
 a short one. Short-timeout polling buys nothing and costs a tool call —
 and a context rebill — per poll. In measured sessions, roughly
 two-thirds of all wait calls were short polls that timed out.
+
+V1 has no `list_agents`: retain child IDs returned by `spawn_agent`
+and pass those IDs to `wait_agent` using its exposed schema. V1 waits
+for final statuses of the requested children, rather than mailbox updates.
 
 - While you still have local work, do not wait at all. A completed
   child's final answer is pushed into your mailbox and arrives with
@@ -50,7 +60,8 @@ two-thirds of all wait calls were short polls that timed out.
 - When you are genuinely idle with children outstanding, wait in
   bounded stretches: `wait_agent` with `timeout_ms` 300000-600000
   (5-10 minutes). After each stretch — wake or timeout — post one
-  status line, run `list_agents`, and chase any child that finished
+  status line, run `list_agents` on V2 (on V1, check the wait results
+  for your recorded child IDs), and chase any child that finished
   without reporting. Never stack polls shorter than five minutes; the
   event subscription wakes a bounded stretch just as fast as a short
   one.

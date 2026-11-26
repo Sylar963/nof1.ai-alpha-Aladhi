@@ -43,11 +43,18 @@ async function requestAction(action, body = {}) {
 function pause() { playing = false; generation++; $('play').textContent = '▶'; }
 
 function applyState(next, reset = false) {
+  if (next.timeframe !== timeframe) return;
+  const timeframeChanged = state && state.timeframe !== next.timeframe;
   state = next;
   $('price-source').textContent = next.price_source === 'trades' ?
     (next.trade_history_provenance ? 'Last traded price · recovered tape' : 'Last traded price · recorded tape') :
     'Legacy book midpoint · no trade tape';
-  if (reset) { candles = []; events = []; chart.offset = 0; }
+  if (reset || timeframeChanged) { candles = []; chart.offset = 0; }
+  if (reset) events = [];
+  if (reset && next.calibration) {
+    const observed=Object.entries(next.calibration.sources).find(([,view])=>view.quote.price!=null||view.trade.price!=null);
+    if(observed){$('calibration-source').value=observed[0];$('calibration-stream').value=observed[1].quote.price!=null?'quote':'trade';}
+  }
   const merged = new Map(candles.map(bar => [bar.time, bar]));
   for (const bar of next.candles || []) merged.set(bar.time, bar);
   candles = Array.from(merged.values()).sort((a,b) => a.time-b.time).slice(-2000);
@@ -79,7 +86,26 @@ function applyState(next, reset = false) {
     const risk = Math.abs(entry - Number(plan.stop)), reward = Math.abs(Number(plan.target) - entry);
     $('risk-reward').textContent = `${risk ? (reward / risk).toFixed(2) : '—'} R · ${money(risk * Math.abs(Number(next.account.position) || Number($('quantity').value)))}`;
   } else $('risk-reward').textContent = '—';
-  chart.draw(); renderJournal();
+  renderCalibration(); chart.draw(); renderJournal();
+}
+
+function renderCalibration() {
+  const source = $('calibration-source').value;
+  const view = state?.calibration?.sources?.[source];
+  const stream = view?.[$('calibration-stream').value];
+  const values = $('calibration-values');
+  $('save-calibration-label').disabled = !state || state.finished;
+  if (!stream) { values.textContent = 'No reached observations.'; return; }
+  const fmt = value => value == null ? '—' : Number(value).toFixed(2);
+  const horizons = Object.entries(stream.horizons || {}).map(([seconds, row]) =>
+    `<tr><td>${escapeHTML(seconds)}s</td><td>${fmt(row.speed_bps_s)}</td><td>${fmt(row.abs_percentile)}</td><td>${row.baseline_samples || 0}</td></tr>`).join('');
+  const encounter = view.encounters?.at(-1);
+  values.innerHTML = `<div class="calibration-status">${escapeHTML(stream.reason || 'Observed')} · age ${fmt(stream.age_s)}s</div>` +
+    `<table><thead><tr><th>Window</th><th>bps/s</th><th>|v| %ile</th><th>Prior n</th></tr></thead><tbody>${horizons}</tbody></table>` +
+    `<p>OR: ${escapeHTML(view.opening_range?.status || 'missing')} · ${escapeHTML(view.opening_range?.reason || state.calibration.config.range_start + ' / ' + state.calibration.config.range_minutes + 'm ' + state.calibration.config.session_timezone)}</p>` +
+    (encounter ? `<p>${escapeHTML(encounter.level)} · ${escapeHTML(encounter.state.replaceAll('_', ' '))}<br>` +
+      `Beyond band ${fmt(encounter.outside_s)}s · occupancy ${fmt(encounter.outside_fraction == null ? null : 100 * encounter.outside_fraction)}%</p>` : '<p>No eligible level encounter observed.</p>') +
+    '<small>Provisional measurements. Percentile is not reversal odds. Overlay uses raw selected-market prices.</small>';
 }
 
 async function advance(seconds, jump = {}) {
@@ -151,13 +177,18 @@ function renderJournal() {
     html = rows.length ? table(['ID','Side','Type','Quantity','Remaining','Price','Status'], rows.map(o => [o.id, escapeHTML(o.side), escapeHTML(o.order_type), escapeHTML(o.quantity), escapeHTML(o.remaining), price(o.price), `<span class="tag">${escapeHTML(o.status)}</span>`])) : '<div class="table-empty">No orders placed.</div>';
   } else if (tab === 'journal') {
     const rows = events.filter(e => e.actor === 'human' && !['drawing'].includes(e.action)).slice(-100).reverse();
-    html = rows.length ? table(['Replay time','Action','Details'], rows.map(e => [escapeHTML(e.utc.slice(11, 23)), escapeHTML(e.action.replaceAll('_',' ')), escapeHTML(e.rationale || (e.action === 'fill' ? `${e.side} ${e.quantity} @ ${price(e.price)}` : JSON.stringify(e.order || e)))])) : '<div class="table-empty">Your decisions and fills are saved here. Press N to add your read.</div>';
+    html = rows.length ? table(['Replay time','Action','Details'], rows.map(e => [escapeHTML(e.utc.slice(11, 23)), escapeHTML(e.action.replaceAll('_',' ')), escapeHTML(eventDetails(e))])) : '<div class="table-empty">Your decisions and fills are saved here. Press N to add your read.</div>';
   } else {
     html = !state.finished ? '<div class="table-empty">Bot decisions stay hidden during practice. Choose Finish & review when you are ready.</div>' :
       table(['Trader','Position','Realized P&L','Open P&L','Fees','Equity'], Object.entries(state.comparison || {}).map(([actor, a]) => [escapeHTML(actor), escapeHTML(a.position), money(a.realized_pnl), money(a.unrealized_pnl), money(a.fees), money(a.equity)])) +
-      table(['Time','Trader','Action','Decision'], events.filter(e => ['order','fill','wait','skip','move_level'].includes(e.action)).slice(-100).map(e => [escapeHTML(e.utc.slice(11,19)), escapeHTML(e.actor), escapeHTML(e.action), escapeHTML(e.rationale || `${e.side} ${e.quantity} @ ${price(e.price)}`)]));
+      table(['Time','Trader','Action','Decision'], events.filter(e => ['order','fill','wait','skip','move_level','calibration_label'].includes(e.action)).slice(-100).map(e => [escapeHTML(e.utc.slice(11,19)), escapeHTML(e.actor), escapeHTML(e.action), escapeHTML(eventDetails(e))]));
   }
   $('journal-content').innerHTML = html;
+}
+
+function eventDetails(e) {
+  if(e.action==='calibration_label')return `${e.source} / ${e.stream} · ${e.label.replaceAll('_',' ')} · ${e.reason}`;
+  return e.rationale || (e.action==='fill' ? `${e.side} ${e.quantity} @ ${price(e.price)}` : JSON.stringify(e.order || e));
 }
 
 class CandleChart {
@@ -231,6 +262,13 @@ class CandleChart {
       const y1=this.y(range.high),y2=this.y(range.low);
       c.fillStyle='#789cff08';c.fillRect(0,y1,right,y2-y1);
       this.line(range.high,'#637dad','OR HIGH',right,false,true);this.line(range.low,'#637dad','OR LOW',right,false,true);
+    }
+    const featureRange = state?.calibration?.sources?.[$('calibration-source').value]?.opening_range;
+    if (showRange && featureRange?.status === 'complete') {
+      const prefix = $('calibration-source').selectedOptions[0].textContent;
+      for (const [name, value] of Object.entries(featureRange.levels || {})) {
+        this.line(value, '#b29adb', `${prefix} ${name}`, right, false, true);
+      }
     }
     for(const drawing of state?.drawings || []) this.drawing(drawing);
     if(this.trendStart && this.cross) this.drawing({kind:'trend',a:this.trendStart,b:this.coordinate(this.cross)});
@@ -331,6 +369,16 @@ $('help-button').onclick=()=>$('help-dialog').showModal();$('play').onclick=togg
 $('step').onclick=()=>{pause();enqueue(()=>advance(Number($('timestep').value)));};
 $('buy').onclick=()=>place('buy');$('sell').onclick=()=>place('sell');$('close-position').onclick=()=>action('flatten');$('cancel-orders').onclick=()=>action('cancel');
 $('save-note').onclick=()=>saveNote();$('wait-note').onclick=()=>saveNote('wait');$('skip-note').onclick=()=>saveNote('skip');
+$('calibration-source').onchange=()=>{renderCalibration();chart.draw();};
+$('calibration-stream').onchange=renderCalibration;
+$('save-calibration-label').onclick=()=>{
+  const reason=$('note').value.trim();
+  if(!reason){$('note').focus();toast('Add your reason, then save the interpretation');return;}
+  action('calibration-label',{label:$('calibration-label').value,source:$('calibration-source').value,
+    stream:$('calibration-stream').value,expected_clock_ns:state.clock_ns,
+    expected_sequence:state.calibration.capture_sequence,reason})
+    .then(()=>{$('note').value='';toast('Interpretation and current features saved');});
+};
 $('finish').onclick=()=>{if(!state)return;action('finish').then(()=>{tab='review';document.querySelectorAll('[data-tab]').forEach(b=>b.classList.toggle('selected',b.dataset.tab===tab));renderJournal();toast('Attempt saved. Compare your decisions with the bot.');});};
 $('export').onclick=()=>{if(state?.finished)window.location.href=`/api/sessions/${state.id}/export`;};
 $('restart').onclick=()=>{if(!state)return;recordings().catch(e=>toast(e.message,true));};
@@ -341,7 +389,21 @@ $('goto-range').onclick=()=>{$('goto-dialog').close();pause();enqueue(()=>advanc
 $('toggle-range').onclick=()=>{showRange=!showRange;$('toggle-range').classList.toggle('range-on',showRange);chart.draw();};
 $('clear-drawings').onclick=()=>{if(state){state.drawings=[];chart.persistDrawings();}};
 for(const field of ['stop','target'])$(field+'-price').onchange=()=>{if(state)action('level',{field,price:$(field+'-price').value});};
-document.querySelectorAll('[data-tf]').forEach(button=>button.onclick=()=>{pause();timeframe=Number(button.dataset.tf);document.querySelectorAll('[data-tf]').forEach(b=>b.classList.toggle('selected',b===button));candles=[];chart.offset=0;if(state)enqueue(()=>requestAction('state',{since:0}));});
+document.querySelectorAll('[data-tf]').forEach(button=>button.onclick=()=>{
+  pause();
+  enqueue(async()=>{
+    const previousTimeframe=timeframe;
+    timeframe=Number(button.dataset.tf);
+    try {
+      if(state)await requestAction('state',{since:0});
+    } catch(error) {
+      timeframe=previousTimeframe;
+      throw error;
+    } finally {
+      document.querySelectorAll('[data-tf]').forEach(b=>b.classList.toggle('selected',Number(b.dataset.tf)===timeframe));
+    }
+  });
+});
 document.querySelectorAll('[data-order]').forEach(button=>button.onclick=()=>{orderType=button.dataset.order;document.querySelectorAll('[data-order]').forEach(b=>b.classList.toggle('selected',b===button));$('entry-label').hidden=orderType!=='limit';if(orderType==='limit'&&state)$('entry').value=Number(state.last_price).toFixed(1);});
 document.querySelectorAll('[data-tab]').forEach(button=>button.onclick=()=>{tab=button.dataset.tab;document.querySelectorAll('[data-tab]').forEach(b=>b.classList.toggle('selected',b===button));renderJournal();});
 function selectTool(tool){chart.tool=tool;chart.trendStart=null;document.querySelectorAll('[data-tool]').forEach(b=>b.classList.toggle('active',b.dataset.tool===tool));chart.draw();}

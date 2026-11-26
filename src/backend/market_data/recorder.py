@@ -271,6 +271,7 @@ async def _connection(session, source, writer, stop, config, session_id, progres
     depth = _DepthState(source, config.max_queue_bytes) if source.depth_url else None
     ordinal = 0
     active_error = None
+    body_error = None
 
     def harvest_completed():
         nonlocal receive_task, snapshot_task, ordinal
@@ -314,26 +315,30 @@ async def _connection(session, source, writer, stop, config, session_id, progres
             ws = await session.ws_connect(source.url, heartbeat=20, autoping=True, max_msg_size=config.max_frame_bytes,
                                           timeout=aiohttp.ClientWSTimeout(ws_close=5))
         async with ws:
-            writer.submit(_envelope(source, session_id, "connected", url=source.url))
-            for message in source.subscribe_messages:
-                await ws.send_json(message)
-            if source.depth_url:
-                snapshot_task = asyncio.create_task(_fetch_snapshot(session, source, writer, session_id, config))
-            receive_task = asyncio.create_task(_receive(ws))
-            while not stop.is_set():
-                waiting = [receive_task] + ([snapshot_task] if snapshot_task is not None else [])
-                await asyncio.wait(waiting, return_when=asyncio.FIRST_COMPLETED)
-                failure = _choose_failure(harvest_completed())
-                if failure is not None:
-                    raise failure
-                if receive_task is None and not stop.is_set():
-                    receive_task = asyncio.create_task(_receive(ws))
+            try:
+                writer.submit(_envelope(source, session_id, "connected", url=source.url))
+                for message in source.subscribe_messages:
+                    await ws.send_json(message)
+                if source.depth_url:
+                    snapshot_task = asyncio.create_task(_fetch_snapshot(session, source, writer, session_id, config))
+                receive_task = asyncio.create_task(_receive(ws))
+                while not stop.is_set():
+                    waiting = [receive_task] + ([snapshot_task] if snapshot_task is not None else [])
+                    await asyncio.wait(waiting, return_when=asyncio.FIRST_COMPLETED)
+                    failure = _choose_failure(harvest_completed())
+                    if failure is not None:
+                        raise failure
+                    if receive_task is None and not stop.is_set():
+                        receive_task = asyncio.create_task(_receive(ws))
+            except BaseException as exc:
+                body_error = exc
+                raise
     except BaseException as exc:
         active_error = exc
     finally:
         late_errors = harvest_completed()
         cleanup_error = await _cancel_tasks((receive_task, snapshot_task))
-    failure = _choose_failure([active_error, cleanup_error, *late_errors])
+    failure = _choose_failure([body_error, active_error, cleanup_error, *late_errors])
     if failure is not None:
         raise failure
 

@@ -355,7 +355,7 @@ class ParadexReplay:
                 order.status = "cancelled"
                 self._log(order.actor, "cancel", order_id=order.id, rationale=reason)
 
-    def _update_range(self, *, now_ns=None, observe=True):
+    def _update_range(self, *, now_ns=None, observe=True, observed_price=None):
         range_now = self.wall_ns if now_ns is None else now_ns
         now = utc(range_now)
         local = now.astimezone(ZoneInfo(self.config.session_timezone))
@@ -377,7 +377,7 @@ class ParadexReplay:
             stale_after = self._previous_depth_wall + self.config.stale_book_ms * 1_000_000
             if stale_after < self.wall_ns and stale_after < end_ns and self.wall_ns > start_ns:
                 state["coverage_ok"] = False
-        reference = self.signal_price
+        reference = self.signal_price if observed_price is None else observed_price
         if observe and start_ns <= range_now < end_ns and reference is not None:
             state["high"] = max(state["high"], reference) if state["high"] is not None else reference
             state["low"] = min(state["low"], reference) if state["low"] is not None else reference
@@ -480,6 +480,9 @@ class ParadexReplay:
             self.clock_ns = max(self.clock_ns, record["received_monotonic_ns"])
             self.wall_ns = record["received_at_ns"]
             self.sequence = record["capture_sequence"]
+            original_sequence = record.get('original_capture_sequence', self.sequence)
+            if original_sequence is not None:
+                self.last_original_sequence = original_sequence
             kind = record["kind"]
             self.last_kind = kind
             if self.session_id is not None and self.session_id != record["session_id"]:
@@ -525,7 +528,7 @@ class ParadexReplay:
                             del self.history[:1000]
                         self.price_updated = True
                         if not self.range or trade_ns >= self.range['start_ns']:
-                            self._update_range(now_ns=trade_ns)
+                            self._update_range(now_ns=trade_ns, observed_price=price)
                         self._baseline()
             self._next = next(self._iterator, None)
             if self._next is None:

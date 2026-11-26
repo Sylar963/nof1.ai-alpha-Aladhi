@@ -74,7 +74,17 @@ Replay rejects incomplete final lines, malformed JSON, and non-contiguous captur
 
 ## Research limits
 
-This is the collection foundation, not a calibrated speed classifier or a trading signal. Six-minute candles, Tijuana session ranges, acceptance/rejection features, portfolio joins and order execution are separate stages. Historical API downloads cannot recover past local receive timestamps. Capture from the intended deployment location with a synchronised system clock before assessing a proposed 50 ms Binance lead. Application receive timestamps include network and scheduling delay; they are not kernel packet timestamps. Source clocks and publish conventions differ, so subtracting exchange timestamps alone does not establish a tradable lead. Actual fees, fill latency and unavailable liquidity still need execution validation later.
+This is the collection foundation. The [speed and acceptance research engine](speed_acceptance.md)
+now measures causal speed, transaction ranges and level encounters from these
+records, with explicit warmup and coverage limitations. Portfolio joins and live
+hedge execution remain separate stages. Historical API downloads cannot recover
+past local receive timestamps. Capture from the intended deployment location
+with a synchronised system clock before assessing a proposed 50 ms Binance lead.
+Application receive timestamps include network and scheduling delay; they are
+not kernel packet timestamps. Source clocks and publish conventions differ, so
+subtracting exchange timestamps alone does not establish a tradable lead.
+Actual fees, fill latency and unavailable liquidity still need execution
+validation later.
 
 ## Validation
 
