@@ -276,3 +276,9 @@ venv/bin/python scripts/record_market_data.py --duration 60
 ```
 
 The standalone recorder uses public data only and never submits orders. It preserves raw frames, timestamps, reconnect gaps and depth snapshots in bounded NDJSON files. See [capture configuration, recovery and replay](docs/market_data_capture.md).
+
+Practise opening-range execution in **Arena Replay**, a lightweight candlestick
+replay with visual entry/stop/target levels, drawing tools, keyboard controls
+and a hidden bot comparison. Run `venv/bin/python scripts/replay_paradex.py`
+and open `http://127.0.0.1:8081`. Active recordings open as frozen checkpoints
+while collection continues. See the [replay workflow and performance benchmark](docs/paradex_replay.md).

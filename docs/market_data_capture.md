@@ -29,7 +29,7 @@ The settings are in `.env.example` under `CAPTURE_*`, with defaults in `src/back
 | `binance_spot` | `stream.binance.com:9443/stream`, combined `bookTicker`, `aggTrade`, `depth@100ms`; initial REST depth snapshot |
 | `binance_perp_book` | `fstream.binance.com/public/stream`, combined `bookTicker`, `depth@100ms`; initial REST depth snapshot |
 | `binance_perp_market` | `fstream.binance.com/market/stream`, combined `aggTrade`, `markPrice@1s`, `forceOrder` |
-| `paradex` | `ws.api.prod.paradex.trade/v1`, `bbo.BTC-USD-PERP` and `order_book.BTC-USD-PERP.snapshot@15@50ms`, SBE 1:1 |
+| `paradex` | `ws.api.prod.paradex.trade/v1`, `trades.BTC-USD-PERP`, `bbo.BTC-USD-PERP` and `order_book.BTC-USD-PERP.snapshot@15@50ms`, SBE 1:1 |
 
 Binance REST snapshots are fetched concurrently with WebSocket receiving. Messages received before snapshot alignment remain in the capture. `depth_alignment.buffered_update_statuses` maps their connection-local frame ordinals to `pre_snapshot`, `bridged`, or `continuous` classifications. Later depth records carry `depth_sequence_status`. A broken snapshot bridge or diff chain records a gap and reconnects with a new session/snapshot. Spot uses inclusive U/u coverage; USD-M uses pu after bridging. BBO sequence numbers are not assumed consecutive. Paradex's depth feed uses replacement snapshots, not incremental book reconstruction.
 
@@ -44,7 +44,7 @@ Each invocation creates a fresh directory like `data/market_capture/20261125T160
 - `records-00000000000000000001.ndjson`, subsequent segments: observations and lifecycle markers in acceptance order.
 - `status.json`: last fsynced record/byte counts and writer `closed`/`failed` state.
 
-The manifest archives the current upstream schema 1:3. The live client explicitly negotiates 1:1 and decodes only public BBO/book layouts and heartbeat controls defined for that version. It rejects an unexpected schema/version rather than silently guessing a layout. Schema provenance and SHA-256 are recorded in the archived README.
+The manifest archives the current upstream schema 1:3. The live client explicitly negotiates 1:1 and decodes public trade/BBO/book layouts and heartbeat controls defined for that version. It rejects an unexpected schema/version rather than silently guessing a layout. Schema provenance and SHA-256 are recorded in the archived README. Trade `created_at_us` and `source_transaction_time_ns` preserve matching-engine time separately from publish/receive times. Schema 1:1 truncates trade IDs to signed low 64 bits; these are labelled `trade_id_low64`, not presented as the full REST trade identity.
 
 Every market frame preserves raw text or base64 binary, the decoded payload, source/session identity and frame ordinal. `capture_sequence` orders accepted records across source workers. Decimal prices/quantities remain strings and unavailable fields remain null. `received_at_ns` is local UTC; `received_monotonic_ns` is a local monotonic clock. Normalised source timestamps use nanoseconds, while `source_time_basis` identifies the original `unix_ms` or `unix_us` unit and the payload retains native fields. Some Binance spot BBO messages supply no exchange timestamp; the recorder does not fabricate one. Paradex binary `ts_us` is the feed publish timestamp, not a guaranteed matching-engine event timestamp.
 
@@ -53,6 +53,9 @@ An ordered writer batches work every 250 ms, with filesystem work off the receiv
 `status.json` describes the writer, not exchange health. A clean writer close can follow a transport/protocol failure: inspect the final `run_end.outcome`, `error`, and `source_message_counts` as well. Failure before a run_end record or a missing closed status means the run was interrupted. If the filesystem also prevents diagnostic writes, the process still reports failure to stderr and exits nonzero.
 
 ## Recovery and replay
+
+For interactive opening-range practice with simulated Paradex fills, human
+annotations and a hidden baseline, see the [Paradex replay desk](paradex_replay.md).
 
 Transient transport errors and 429/5xx responses create explicit gap/retry records, with bounded exponential backoff, jitter and Retry-After. Backoff resets after market data, not merely a successful socket open. Reconnects use new session IDs. There is no historical WebSocket replay: missing intervals remain missing. A newly installed snapshot establishes current depth; it does not recover lost observations.
 

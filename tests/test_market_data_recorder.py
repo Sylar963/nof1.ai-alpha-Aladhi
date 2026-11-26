@@ -117,7 +117,7 @@ def test_sources_use_separate_public_binance_routes_and_api_paradex_book():
     assert "@forceOrder" in sources["binance_perp_market"].url
     assert "sbeSchemaVersion=1" in sources["paradex"].url
     channels = [r["params"]["channel"] for r in sources["paradex"].subscribe_messages]
-    assert channels == ["bbo.BTC-USD-PERP", "order_book.BTC-USD-PERP.snapshot@15@50ms"]
+    assert channels == ["bbo.BTC-USD-PERP", "order_book.BTC-USD-PERP.snapshot@15@50ms", "trades.BTC-USD-PERP"]
     assert all(r["method"] == "subscribe" for r in sources["paradex"].subscribe_messages)
     assert "interactive" not in json.dumps(channels)
 

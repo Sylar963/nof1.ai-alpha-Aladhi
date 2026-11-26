@@ -85,6 +85,19 @@ def test_paradex_heartbeat_retains_native_metadata():
     assert record["source_sequence"] == 432
 
 
+def test_paradex_trade_decodes_matched_price_and_matching_engine_time_without_fabricating_full_id():
+    fixed = struct.pack('<qqqBqqqB', NATIVE_US, 123, -4455, 1, 6012340000000, 1250000, NATIVE_US - 100, 5)
+    raw = struct.pack('<HHHH', len(fixed), 1, 1, 1) + fixed + bytes([len(MARKET)]) + MARKET.encode()
+    record = decode_frame('paradex', raw)
+    assert record['kind'] == 'trade'
+    assert record['channel'] == 'trades.BTC-USD-PERP'
+    assert record['payload']['price'] == '60123.40000000'
+    assert record['payload']['size'] == '0.01250000'
+    assert record['payload']['trade_type'] == 'RPI'
+    assert record['payload']['trade_id_low64'] == '-4455'
+    assert record['source_transaction_time_ns'] == (NATIVE_US - 100) * 1000
+
+
 @pytest.mark.parametrize("raw", [
     _bbo_frame()[:6],
     struct.pack("<HHHH", 47, 2, 1, 1) + _bbo_frame()[8:],

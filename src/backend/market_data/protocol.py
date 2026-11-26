@@ -28,6 +28,7 @@ _SBE_HEADER = struct.Struct("<HHHH")
 _SBE_GROUP_HEADER = struct.Struct("<HH")
 _SBE_LEVEL = struct.Struct("<qq")
 _SBE_TEMPLATES = {
+    1: struct.Struct("<qqqBqqqB"),
     2: struct.Struct("<6q"),
     3: struct.Struct("<qqB9q"),
     40: struct.Struct("<qq"),
@@ -35,6 +36,7 @@ _SBE_TEMPLATES = {
 _SBE_NULL = -(2**63)
 _SBE_PACKAGES = {0: "SNAPSHOT", 1: "DELTA"}
 _SBE_BBO_FIELDS = ("bid_price", "bid_size", "ask_price", "ask_size")
+_SBE_TRADE_TYPES = {1: "FILL", 2: "LIQUIDATION", 3: "UNWIND_TRANSFER", 4: "SETTLE_MARKET", 5: "RPI", 6: "BLOCK_TRADE"}
 _SBE_BOOK_FIELDS = (
     "best_bid_price",
     "best_bid_size",
@@ -389,7 +391,17 @@ def _decode_paradex(raw: bytes) -> dict:
     if template == 40:
         kind, channel = "control", "heartbeat"
     else:
-        if template == 2:
+        if template == 1:
+            kind, prefix = "trade", "trades"
+            trade_id, side, price, size, created, trade_type = fields
+            _unsigned(created, "SBE trade created_at")
+            if price <= 0 or size <= 0:
+                raise ProtocolError("trade price and size must be positive")
+            payload.update(trade_id_low64=str(trade_id), side={1: "BUY", 2: "SELL"}.get(side, "UNKNOWN"),
+                           side_code=side, price=_sbe_decimal(price), size=_sbe_decimal(size),
+                           created_at_us=created, trade_type=_SBE_TRADE_TYPES.get(trade_type, "UNKNOWN"),
+                           trade_type_code=trade_type)
+        elif template == 2:
             kind, prefix = "bbo", "bbo"
             payload.update(zip(_SBE_BBO_FIELDS, (_sbe_decimal(value, nullable=True) for value in fields), strict=True))
         else:
@@ -411,7 +423,9 @@ def _decode_paradex(raw: bytes) -> dict:
         raise ProtocolError(f"unexpected bytes after Paradex SBE template {template}")
     return _record(
         kind, channel, market, payload,
-        encoding="sbe", event_ns=timestamp * _MICROSECONDS_TO_NS, sequence=sequence, time_basis="unix_us",
+        encoding="sbe", event_ns=timestamp * _MICROSECONDS_TO_NS,
+        transaction_ns=payload["created_at_us"] * _MICROSECONDS_TO_NS if template == 1 else None,
+        sequence=sequence, time_basis="unix_us",
     )
 
 

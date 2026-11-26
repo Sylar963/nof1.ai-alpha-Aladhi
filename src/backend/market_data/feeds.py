@@ -22,7 +22,8 @@ def build_sources(config) -> list[SourceSpec]:
     perp_book = (f"{symbol}@bookTicker", f"{symbol}@depth@100ms")
     perp_market = (f"{symbol}@aggTrade", f"{symbol}@markPrice@1s", f"{symbol}@forceOrder")
     channels = (f"bbo.{config.paradex_market}",
-                f"order_book.{config.paradex_market}.snapshot@15@50ms")
+                f"order_book.{config.paradex_market}.snapshot@15@50ms",
+                f"trades.{config.paradex_market}")
     sources = [
         SourceSpec("binance_spot", "wss://stream.binance.com:9443/stream?streams=" + "/".join(spot),
                    config.symbol, spot, depth_url="https://api.binance.com/api/v3/depth?" +
