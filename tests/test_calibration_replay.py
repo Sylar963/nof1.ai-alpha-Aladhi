@@ -55,12 +55,13 @@ def test_workbench_labels_journal_server_computed_features_and_exports_them(tmp_
     desk = Workbench(IndexedCapture(path, cache_dir=tmp_path / 'cache'), ReplayConfig(),
                      journal_dir=tmp_path / 'journals', warmup_seconds=0)
     desk.advance(12 * NS)
-    before = desk.state()['calibration']
+    visible = desk.state()
+    before = visible['calibration']
     assert before['sources']['binance_spot']['quote']['price'] == 103
     with pytest.raises(ValueError):
         desk.label_speed({'label': 'invented', 'source': 'binance_spot', 'reason': 'test'})
     body = {'label': 'acceptance_no_add', 'source': 'binance_spot', 'stream': 'quote',
-            'expected_clock_ns': desk.engine.clock_ns, 'expected_sequence': before['capture_sequence'],
+            'expected_cursor': visible['calibration_cursor'],
             'reason': 'slow persistence', 'features': {'future': True}}
     desk.label_speed(body)
     entry = desk.engine.events[-1]
@@ -111,3 +112,23 @@ def test_recovered_event_does_not_release_original_sequence_bound(tmp_path):
     desk.advance(10 * NS, max_events=1)
     assert desk.state()['calibration']['sources']['binance_spot']['quote']['price'] is None
     desk.close()
+
+
+def test_label_cursor_preserves_nanoseconds_above_javascript_integer_precision(tmp_path):
+    path = sample(tmp_path)
+    desk = Workbench(IndexedCapture(path, cache_dir=tmp_path / 'cache'), ReplayConfig(),
+                     journal_dir=None, warmup_seconds=0)
+    try:
+        desk.advance(12 * NS)
+        desk.engine.clock_ns = 2**53 + 1
+        visible = desk.state()
+        assert str(desk.engine.clock_ns) in visible['calibration_cursor']
+        body = {'label': 'wait', 'source': 'binance_spot', 'stream': 'quote', 'reason': 'same paused view',
+                'expected_cursor': visible['calibration_cursor']}
+        desk.label_speed(body)
+        assert desk.engine.events[-1]['features']['as_of_ns'] == 2**53 + 1
+        desk.engine.clock_ns += 1
+        with pytest.raises(ValueError, match='advanced'):
+            desk.label_speed(body)
+    finally:
+        desk.close()

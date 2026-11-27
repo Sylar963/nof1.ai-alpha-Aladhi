@@ -42,7 +42,7 @@ function harness() {
     vm.runInContext(`applyState(incoming, ${reset})`, context);
   }
   apply(response(60, [{time: 120, close: 100}], [{actor: 'system', action: 'attempt'}]), true);
-  return {requests, buttons, apply,
+  return {requests, buttons, apply, element,
     click(tf) { buttons.find(button => Number(button.dataset.tf) === tf).onclick(); },
     advance() { vm.runInContext("enqueue(() => requestAction('advance', {seconds: 1}))", context); },
     settled() { return vm.runInContext('queue', context); },
@@ -116,4 +116,40 @@ test('a failed timeframe request preserves candles and restores the previous tim
   assert.equal(app.read().state.timeframe, 60);
   assert.deepEqual(app.read().candles.map(bar => bar.time), [120]);
   assert.ok(app.buttons[0].classList.contains('selected'));
+});
+
+test('calibration labels return the exact server cursor despite numeric clock rounding', async () => {
+  const app = harness();
+  const token = 'attempt:9007199254740993:7';
+  app.apply({...response(60, []), clock_ns: Number('9007199254740993'),
+    calibration_cursor: token, calibration: {sources: {}, capture_sequence: 7}});
+  app.element('note').value = 'Wait for a fresh level';
+  app.element('calibration-source').value = 'paradex';
+  app.element('calibration-stream').value = 'quote';
+  app.element('calibration-label').value = 'wait';
+  app.element('save-calibration-label').onclick();
+  await flush();
+  assert.equal(app.requests[0].body.expected_cursor, token);
+  app.requests[0].resolve(response(60, []));
+  await app.settled();
+});
+
+test('level inspection shows a rejection beside the new opposite arrival and their arrival speeds', () => {
+  const app = harness();
+  app.element('calibration-source').value = 'paradex';
+  app.element('calibration-stream').value = 'quote';
+  const shared = {level: 'U1', last_ns: 908000000000, signed_distance_bps: -6.3,
+    outside_s: 5.9, outside_fraction: 1, arrival_speed_bps_s: 66.45};
+  app.apply({...response(60, []), calibration: {
+    config: {range_start: '20:00', range_minutes: 15, session_timezone: 'America/Tijuana'},
+    sources: {paradex: {quote: {reason: null, age_s: .1, horizons: {}},
+      opening_range: {status: 'complete', reason: null}, encounters: [
+        {...shared, direction: 1, state: 'rejection', complete: true},
+        {...shared, direction: -1, state: 'arrival', complete: false},
+      ]}},
+  }});
+  const panel = app.element('calibration-values').innerHTML;
+  assert.ok(panel.includes('rejection'));
+  assert.ok(panel.includes('arrival'));
+  assert.ok(panel.includes('66.45'));
 });

@@ -203,6 +203,7 @@ class Workbench:
                     layers.append({'key': field, 'price': float(self.plan[field]), 'label': label, 'draggable': not engine.finished})
         start = self.dataset.summary['first_replay_ns']
         end = self.dataset.summary['last_replay_ns']
+        calibration = self.calibration.snapshot(engine.clock_ns)
         return {'id': engine.attempt_id, 'market': engine.config.market, 'clock_ns': engine.clock_ns,
                 'utc': utc(engine.wall_ns).isoformat(), 'finished': engine.finished, 'failure': engine.failure,
                 'progress': min(1, max(0, (engine.clock_ns - start) / max(1, end - start))),
@@ -217,8 +218,11 @@ class Workbench:
                 'capture': engine.capture['run_id'], 'capture_path': str(self.dataset.source), 'plan': self.plan,
                 'price_source': engine.price_source,
                 'trade_history_provenance': engine.capture.get('trade_history_provenance'),
-                'calibration': self.calibration.snapshot(engine.clock_ns),
+                'calibration': calibration, 'calibration_cursor': self._calibration_cursor(calibration),
                 'processed_events': self.processed}
+
+    def _calibration_cursor(self, features):
+        return f"{self.engine.attempt_id}:{self.engine.clock_ns}:{features['capture_sequence']}"
 
     def label_speed(self, body):
         if self.engine.finished or self.engine.failure:
@@ -226,8 +230,7 @@ class Workbench:
         label = body.get('label')
         reason = body.get('reason', '')
         features = self.calibration.snapshot(self.engine.clock_ns)
-        if (body.get('expected_clock_ns') != self.engine.clock_ns
-                or body.get('expected_sequence') != features['capture_sequence']):
+        if body.get('expected_cursor') != self._calibration_cursor(features):
             raise ValueError('Replay advanced; inspect the current features and save your interpretation again')
         source = body.get('source')
         stream = body.get('stream')
@@ -238,8 +241,11 @@ class Workbench:
         if len(reason) > 4000:
             raise ValueError('calibration reason is limited to 4000 characters')
         context = {key: features[key] for key in ('version', 'config_version', 'config', 'as_of_ns', 'capture_sequence')}
+        encounters = sorted(view['encounters'], key=lambda row:
+                            (-row['last_ns'], abs(row['signed_distance_bps'])))[:3]
         context.update(metrics=view[stream], opening_range=view['opening_range'], market=view['market'],
-                       encounter=view['encounters'][-1] if view['encounters'] else None, basis=features['basis'])
+                       encounter=view['encounters'][-1] if view['encounters'] else None,
+                       encounters=encounters, basis=features['basis'])
         self.engine._log('human', 'calibration_label', label=label, source=source, stream=stream,
                          reason=reason.strip(), features=context)
 

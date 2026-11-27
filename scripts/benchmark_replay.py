@@ -45,7 +45,7 @@ def main():
         'peak_process_rss_mib': round(maximum_rss / (1048576 if sys.platform == 'darwin' else 1024), 2),
         'chart_candle_limit_per_timeframe': 2000,
     }, indent=2))
-    work.engine.close()
+    work.close()
 
 
 if __name__ == '__main__':

@@ -99,12 +99,15 @@ function renderCalibration() {
   const fmt = value => value == null ? '—' : Number(value).toFixed(2);
   const horizons = Object.entries(stream.horizons || {}).map(([seconds, row]) =>
     `<tr><td>${escapeHTML(seconds)}s</td><td>${fmt(row.speed_bps_s)}</td><td>${fmt(row.abs_percentile)}</td><td>${row.baseline_samples || 0}</td></tr>`).join('');
-  const encounter = view.encounters?.at(-1);
+  const encounters = (view.encounters || []).slice().sort((a,b)=>
+    b.last_ns-a.last_ns || Math.abs(a.signed_distance_bps ?? Infinity)-Math.abs(b.signed_distance_bps ?? Infinity)).slice(0,3);
   values.innerHTML = `<div class="calibration-status">${escapeHTML(stream.reason || 'Observed')} · age ${fmt(stream.age_s)}s</div>` +
     `<table><thead><tr><th>Window</th><th>bps/s</th><th>|v| %ile</th><th>Prior n</th></tr></thead><tbody>${horizons}</tbody></table>` +
     `<p>OR: ${escapeHTML(view.opening_range?.status || 'missing')} · ${escapeHTML(view.opening_range?.reason || state.calibration.config.range_start + ' / ' + state.calibration.config.range_minutes + 'm ' + state.calibration.config.session_timezone)}</p>` +
-    (encounter ? `<p>${escapeHTML(encounter.level)} · ${escapeHTML(encounter.state.replaceAll('_', ' '))}<br>` +
-      `Beyond band ${fmt(encounter.outside_s)}s · occupancy ${fmt(encounter.outside_fraction == null ? null : 100 * encounter.outside_fraction)}%</p>` : '<p>No eligible level encounter observed.</p>') +
+    (encounters.length ? encounters.map(encounter=>
+      `<p>${escapeHTML(encounter.level)} ${encounter.direction===1?'↑':'↓'} · ${escapeHTML(encounter.state.replaceAll('_', ' '))}<br>` +
+      `Arrival ${fmt(encounter.arrival_speed_bps_s)} bps/s · distance ${fmt(encounter.signed_distance_bps)} bp<br>` +
+      `Beyond band ${fmt(encounter.outside_s)}s · occupancy ${fmt(encounter.outside_fraction == null ? null : 100 * encounter.outside_fraction)}%</p>`).join('') : '<p>No eligible level encounter observed.</p>') +
     '<small>Provisional measurements. Percentile is not reversal odds. Overlay uses raw selected-market prices.</small>';
 }
 
@@ -375,8 +378,7 @@ $('save-calibration-label').onclick=()=>{
   const reason=$('note').value.trim();
   if(!reason){$('note').focus();toast('Add your reason, then save the interpretation');return;}
   action('calibration-label',{label:$('calibration-label').value,source:$('calibration-source').value,
-    stream:$('calibration-stream').value,expected_clock_ns:state.clock_ns,
-    expected_sequence:state.calibration.capture_sequence,reason})
+    stream:$('calibration-stream').value,expected_cursor:state.calibration_cursor,reason})
     .then(()=>{$('note').value='';toast('Interpretation and current features saved');});
 };
 $('finish').onclick=()=>{if(!state)return;action('finish').then(()=>{tab='review';document.querySelectorAll('[data-tab]').forEach(b=>b.classList.toggle('selected',b.dataset.tab===tab));renderJournal();toast('Attempt saved. Compare your decisions with the bot.');});};

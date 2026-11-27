@@ -103,6 +103,7 @@ class _Stream:
     def __init__(self, config):
         self.config = config
         self.price = self.ns = self.original_ns = self.channel = None
+        self.evidence_reason = None
         self.samples = 0
         self.reset_history()
 
@@ -114,10 +115,15 @@ class _Stream:
 
     def clear(self):
         self.price = self.ns = self.original_ns = self.channel = None
+        self.evidence_reason = None
+        self.reset_history()
+
+    def invalidate(self, reason):
+        self.evidence_reason = reason
         self.reset_history()
 
     def advance(self, target, on_sample=None):
-        if self.ns is None:
+        if self.ns is None or self.evidence_reason:
             return
         first = (self.ns + NS - 1) // NS if self.grid_second is None else self.grid_second + 1
         last = min(target, (self.original_ns + int(self.config.max_age_s * NS)) // NS)
@@ -138,14 +144,15 @@ class _Stream:
                 on_sample(second * NS, {key: value.copy() for key, value in self.horizons.items()})
 
     def put(self, ns, original_ns, price, channel):
-        if self.ns is not None and ns - self.original_ns > self.config.max_age_s * NS:
+        if self.evidence_reason or (self.ns is not None and ns - self.original_ns > self.config.max_age_s * NS):
             self.reset_history()
+        self.evidence_reason = None
         self.price, self.ns, self.original_ns, self.channel = price, ns, original_ns, channel
         self.samples += 1
 
     def view(self, now):
         stream = self
-        if self.ns is not None and now is not None:
+        if self.ns is not None and now is not None and not self.evidence_reason:
             first = (self.ns + NS - 1) // NS if self.grid_second is None else self.grid_second + 1
             last = min((now - 1) // NS, (self.original_ns + int(self.config.max_age_s * NS)) // NS)
             if last >= first:
@@ -160,7 +167,7 @@ class _Stream:
                     stream.baselines[horizon] = duplicate
                 stream.advance(last)
         age = None if self.ns is None else (now - self.original_ns) / NS
-        reason = 'missing' if age is None else 'stale' if age > self.config.max_age_s else None
+        reason = self.evidence_reason or ('missing' if age is None else 'stale' if age > self.config.max_age_s else None)
         return dict(price=self.price, channel=self.channel, received_ns=self.ns, original_receipt_ns=self.original_ns, age_s=age, reason=reason,
                     samples=self.samples, grid_ns=None if stream.grid_second is None else stream.grid_second * NS,
                     horizons={k: (_empty_horizon(reason, v['baseline_samples']) if reason else v.copy())
@@ -197,7 +204,9 @@ class _Range:
             self.__init__(self.config)
             self.date, self.start, self.next_start = _window(event, self.config)
             self.end = self.start + self.config.range_minutes * 60 * NS
-            if event > self.start and (previous_event is None or previous_event < self.start - self.max_gap):
+            if event == self.start:
+                previous_event, receipt_gap = None, 0
+            elif previous_event is None or previous_event < self.start - self.max_gap:
                 self.fail('missing_open')
         if self.closed:
             return
@@ -302,8 +311,10 @@ class _Source:
         self.counters['trade_breaks'] += 1
         self.last_break_reason = reason
 
-    def break_trade(self, event):
+    def break_trade(self, event, wall=None):
         self.mark_break('invalid_trade')
+        if _time_ns(wall) and (not _time_ns(event) or abs(event - wall) > self.config.or_max_gap_s * NS):
+            event = wall
         if _time_ns(event):
             date, start, next_start = _window(event, self.config)
             if self.range.start is None or event >= self.range.next_start:
@@ -344,21 +355,24 @@ class _Source:
         self.seen[identity] = None
         if self.event is not None and event < self.event:
             self.mark_break('late_trade')
+            self.trade.invalidate('late_trade')
             self.counters['late_trades'] += 1
-            if self.range.start is not None and self.range.start <= event < self.range.end:
+            if self.range.start is not None and (not self.range.closed or self.range.start <= event < self.range.end):
                 self.range.fail('late_range_trade')
                 return self.close('late_range_trade')
-            return []
+            return self.close('late_trade')
         if wall is not None and abs(event - wall) > self.config.or_max_gap_s * NS:
             self.mark_break('trade_clock_mismatch')
+            self.trade.invalidate('trade_clock_mismatch')
             self.counters['clock_mismatch_trades'] += 1
-            if self.range.start is not None and self.range.start <= event < self.range.end:
+            if self.range.start is not None and (not self.range.closed or self.range.start <= event < self.range.end):
                 self.range.fail('trade_clock_mismatch')
                 return self.close('trade_clock_mismatch')
-            return []
-        prev_ns, previous_price = self.trade.ns, self.trade.price
+            return self.close('trade_clock_mismatch')
+        prev_ns = None if self.trade.evidence_reason else self.trade.ns
+        previous_price = self.trade.price
         delta = ns - prev_ns if prev_ns is not None else 0
-        prior_receipt = self.trade.original_ns
+        prior_receipt = self.trade.original_ns if prev_ns is not None else None
         stale = (ns - original > self.config.max_age_s * NS
                  or (prior_receipt is not None and ns - prior_receipt > self.config.max_age_s * NS))
         prev_session_date = self.range.date
@@ -559,7 +573,7 @@ class SpeedAcceptanceEngine:
         if not isinstance(payload, dict):
             source.counters['invalid_records'] += 1
             if kind == 'trade':
-                return changed + source.break_trade(record.get('source_transaction_time_ns'))
+                return changed + source.break_trade(record.get('source_transaction_time_ns'), wall)
             return changed
         if payload.get('recovered') or record.get('recovered'):
             source.counters['recovered_excluded'] += 1
@@ -611,7 +625,7 @@ class SpeedAcceptanceEngine:
                         event = native * 1000
                     elif type(payload.get('created_at')) is int:
                         event = payload['created_at'] * 1_000_000
-                changed += source.break_trade(event)
+                changed += source.break_trade(event, wall)
         return changed
 
     def snapshot(self, now_ns=None):

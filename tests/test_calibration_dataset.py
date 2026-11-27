@@ -1,4 +1,5 @@
 import json
+import sqlite3
 
 import pytest
 
@@ -71,3 +72,20 @@ def test_research_retains_delayed_submission_without_backdating_availability(tmp
     assert [r['received_monotonic_ns'] for r in actual] == [20, 10]
     assert [r['available_monotonic_ns'] for r in actual] == [20, 20]
     assert indexed.summary['delayed_submissions'] == 1
+
+
+def test_research_index_releases_build_and_metadata_connections(tmp_path, monkeypatch):
+    connections = []
+    connect = sqlite3.connect
+
+    def tracked_connect(*args, **kwargs):
+        connection = connect(*args, **kwargs)
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(sqlite3, 'connect', tracked_connect)
+    ResearchCapture(capture(tmp_path / 'capture', [row('paradex', 10)]), cache_dir=tmp_path / 'cache')
+    assert connections
+    for connection in connections:
+        with pytest.raises(sqlite3.ProgrammingError, match='closed'):
+            connection.execute('SELECT 1')

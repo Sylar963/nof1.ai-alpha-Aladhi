@@ -324,3 +324,64 @@ def test_report_accessor_and_fixed_grid_hook_follow_only_accepted_evidence():
     e.observe(trade(2, 'nan'))
     assert e.accepted_trade is None and e.trade_revisions[SPOT] > revision
     assert e.opening_range(SPOT)['status'] == 'incomplete'
+
+
+@pytest.mark.parametrize('event,reason', [(905.5, 'late_trade'), (950, 'trade_clock_mismatch')])
+def test_rejected_trade_cannot_preserve_acceptance_across_a_continuity_break(event, reason):
+    e = SpeedAcceptanceEngine(CalibrationConfig(min_dwell_s=2))
+    opening_range(e)
+    for t in range(901, 907):
+        rows = e.observe(trade(t, 102))
+    prior = next(row for row in rows if row['level'] == 'ORH')
+    assert prior['state'] == 'persistent_acceptance'
+    rows = e.observe(trade(906.5, 90, event=event))
+    assert e.accepted_trade is None and e.trade_breaks[SPOT] == reason
+    closed = next(row for row in rows if row['id'] == prior['id'])
+    assert closed['complete'] and closed['state'] == 'insufficient_evidence'
+    view = src(e)['trade']
+    assert view['price'] == 102 and view['reason'] == reason
+    assert view['horizons']['1']['speed_bps_s'] is None
+    e.observe(trade(907, 102))
+    assert src(e)['trade']['horizons']['1']['speed_bps_s'] is None
+    assert not any(not row['complete'] for row in src(e)['encounters'])
+
+
+def test_pre_session_trade_silence_does_not_invalidate_an_exact_opening_print():
+    plain, prefixed = SpeedAcceptanceEngine(), SpeedAcceptanceEngine()
+    prefix = trade(-55, 100)
+    prefix['payload']['a'] = 0
+    prefixed.observe(prefix)
+    for t in range(901):
+        price = 99 if t == 0 else 101 if t == 899 else 100
+        for engine in (plain, prefixed):
+            engine.observe(trade(t, price))
+    expected, actual = src(plain)['opening_range'], src(prefixed)['opening_range']
+    assert expected['status'] == 'complete'
+    assert actual == expected
+
+
+@pytest.mark.parametrize('bad_event', [-2, 1000])
+def test_rejected_out_of_range_trade_cannot_hide_a_hole_in_forming_range(bad_event):
+    e = SpeedAcceptanceEngine()
+    for t in range(-1, 101):
+        e.observe(trade(t, 99 if t == 0 else 101 if t == 100 else 100))
+    e.observe(trade(101, 90, event=bad_event))
+    for t in range(200, 901):
+        e.observe(trade(t, 100))
+    assert src(e)['opening_range']['status'] == 'incomplete'
+    assert not src(e)['opening_range']['levels']
+
+
+def test_malformed_future_timestamp_cannot_move_range_to_tomorrow():
+    e = SpeedAcceptanceEngine()
+    for t in range(-1, 101):
+        e.observe(trade(t, 99 if t == 0 else 101 if t == 100 else 100))
+    start = src(e)['opening_range']['start_ns']
+    invalid = trade(101, 90, event=86400)
+    invalid['payload']['q'] = 'invalid'
+    e.observe(invalid)
+    assert src(e)['opening_range']['start_ns'] == start
+    for t in range(102, 901):
+        e.observe(trade(t, 100))
+    assert src(e)['opening_range']['status'] == 'incomplete'
+    assert src(e)['opening_range']['start_ns'] == start

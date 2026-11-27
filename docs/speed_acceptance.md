@@ -17,6 +17,23 @@ from the same stream; an extreme percentile is not a reversal probability.
 Histories are bounded and sampled on a fixed time grid so a burst of messages
 does not get hundreds of times the statistical weight of a quiet second.
 
+Initial research settings are explicit and versioned in every report:
+
+| Setting | Default |
+| --- | --- |
+| Price freshness | 3 seconds since original receipt |
+| Percentile history | Last 3,600 valid one-second samples per stream/horizon |
+| Percentile warmup | 30 earlier samples |
+| OR coverage gap tolerance | 30 seconds |
+| Level band | 1 bp on each side |
+| Acceptance observation | At least 5 seconds, 3 prints and 70% observed time beyond the band |
+| Encounter measurement window | 120 seconds |
+
+These are provisional measurement settings, not optimized entry rules. A
+late/malformed print or clock mismatch interrupts the evidence; it cannot
+preserve an acceptance state through an unknown interval. Trusted prior prices
+may remain visible while their speed evidence is unavailable.
+
 Quotes measure price discovery. Transactions form the opening range. They are
 kept separate: a midpoint jump is not proof of a transaction at that price.
 Binance spot and perpetual ranges are independent; Paradex has its own
@@ -81,3 +98,55 @@ encounters and later untouched sessions for validation.
 
 See [capture and durability](market_data_capture.md) and
 [Arena Replay](paradex_replay.md) for the existing recording and practice workflow.
+The [validation record and controlled scenario](superpowers/reports/2026-11-26-speed-acceptance-validation.md)
+describe the tested state transitions, source outages and available data coverage.
+
+## Generate an offline measurement report
+
+Run from the repository root with a healthy closed capture or an existing
+frozen checkpoint and a new output directory.
+
+```bash
+venv/bin/python scripts/calibrate_market_data.py \
+  --capture data/market_capture/CAPTURE_OR_CHECKPOINT \
+  --output data/research/CAPTURE-speed \
+  --outcome-seconds 60
+```
+
+The outcome horizon is optional and defaults to 60 seconds. The command prints
+the path to `report.json`. An existing output directory causes an error. A
+failure after reserving the directory records the input path and error in
+`report.json` with status `failed`. A failed or interrupted run may contain
+partial artifacts. Use a fresh directory when retrying.
+
+- **`report.json`** records capture provenance, config and schema versions,
+  source coverage and counters, sample counts, warnings and chronological
+  split guidance. Success has status `measurement_only_uncalibrated`. Each
+  source and stream reports actual settled one-second grid points and valid
+  speed counts, signed mean, maximum absolute speed, and nearest-rank
+  quantiles over the latest 4,096 valid absolute speeds per horizon.
+- **`encounters.ndjson`** contains every observed level encounter with its
+  stable `id`, first-observed `arrival` row and last observed `latest` state.
+  Arrival features are available for entry-time analysis. The two rows retain
+  their original capture sequence and clocks.
+- **`outcomes.ndjson`** joins to encounters using `encounter_id`. Each row
+  holds the horizon, status, reason, transaction sample count and source
+  evidence sequences. It calculates direction-adjusted returns from the
+  arrival price using subsequent same-source transactions through the horizon.
+  MFE is at least zero, MAE is at most zero, and terminal return uses the last
+  eligible print inside the horizon. A fresh print at or beyond the deadline
+  witnesses continuity. A witness beyond the deadline does not contribute
+  a price to the excursions. A censored row can contain partial prefix
+  measurements. A covered window without a subsequent in-window transaction
+  is unknown. Use complete outcomes for full-horizon comparisons.
+- **`measurements.sqlite`** retains encountered rows, accepted transactions,
+  continuity breaks and observed opening-range evidence. Sequence numbers
+  refer to the original capture identified by `report.json`. The
+  `capture-index/` directory contains the local receipt-order index.
+
+Duplicate and recovered prints supply no outcome samples. A gap, capture or
+exchange-session boundary, stale transaction stream or invalid or late trade
+can censor a window. Quotes never supply transaction labels. Opening-range
+completion establishes coverage of the range itself. Split selection also
+requires coverage of the full study window, sufficient complete sessions and
+cursor-time user labels.

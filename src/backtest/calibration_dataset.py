@@ -3,6 +3,7 @@
 import hashlib
 import json
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 from uuid import uuid4
 
@@ -32,7 +33,7 @@ class ResearchCapture:
         self.built = not self.path.exists()
         if self.built:
             self._build(manifest, status)
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path)) as db:
             self.summary = json.loads(db.execute('SELECT value FROM metadata').fetchone()[0])
 
     def _build(self, manifest, status):
