@@ -96,8 +96,9 @@ def test_opening_range_and_breakout_use_trade_prices_instead_of_book_midpoint(tm
 
 @pytest.mark.parametrize('delayed_price,expected_high,expected_low', [('110', '110', '101'), ('95', '102', '95')])
 @pytest.mark.parametrize('after_cutoff', [False, True])
+@pytest.mark.parametrize('coverage_gap', [False, True])
 def test_delayed_range_trade_uses_its_own_price_without_replacing_latest_mark(
-        tmp_path, delayed_price, expected_high, expected_low, after_cutoff):
+        tmp_path, delayed_price, expected_high, expected_low, after_cutoff, coverage_gap):
     latest_time, latest_price = (61.1, '150') if after_cutoff else (20.1, '102')
     delayed_receive = 62.15 if after_cutoff else 21.15
     records = [book(i) for i in range(66)] + [
@@ -105,6 +106,8 @@ def test_delayed_range_trade_uses_its_own_price_without_replacing_latest_mark(
         trade(delayed_receive, 10.1, delayed_price, '4')]
     if after_cutoff:
         records.append(trade(61.15, 61.1, latest_price, '3'))
+    if coverage_gap:
+        records.append({**book(5.1), 'kind': 'gap', 'payload': {}})
     source = write_capture(tmp_path / 'capture', records)
     config = ReplayConfig(session_timezone='UTC', range_start='18:53', range_minutes=1)
     desk = ParadexReplay(source, config, journal_dir=None)
@@ -112,11 +115,14 @@ def test_delayed_range_trade_uses_its_own_price_without_replacing_latest_mark(
     try:
         desk.advance_to(10 * NS + int((delayed_receive - .05) * NS))
         assert desk.range['high'] == Decimal('102') and desk.range['low'] == Decimal('101')
+        assert desk.range['complete'] is (after_cutoff and not coverage_gap)
         desk.advance_to(10 * NS + int((delayed_receive + .05) * NS))
         assert desk.range['high'] == Decimal(expected_high)
         assert desk.range['low'] == Decimal(expected_low)
         assert desk.last_trade == desk.mark_price == desk.signal_price == Decimal(latest_price)
         assert desk.last_trade_time_ns == BASE + int(latest_time * NS)
+        assert desk.range['complete'] is (after_cutoff and not coverage_gap)
+        assert desk.range['coverage_ok'] is not coverage_gap
     finally:
         desk.close()
 
@@ -185,3 +191,17 @@ def test_recovery_rejects_wrong_market_and_removes_only_its_temporary_output(tmp
         recover_trade_history(source, tmp_path / 'repaired', get=lambda *args, **kwargs: Reply({'results': [bad]}))
     assert (source / 'manifest.json').exists()
     assert not list((tmp_path / 'repaired').iterdir())
+
+
+def test_recovery_rejects_open_capture_before_requesting_or_copying_history(tmp_path):
+    source = write_capture(tmp_path / 'original', [book(0), book(1)])
+    status = json.loads((source / 'status.json').read_text())
+    (source / 'status.json').write_text(json.dumps({**status, 'closed': False}))
+
+    def unexpected_request(*args, **kwargs):
+        pytest.fail('open captures must be rejected before fetching history')
+
+    with pytest.raises(ValueError, match='closed'):
+        recover_trade_history(source, tmp_path / 'repaired', get=unexpected_request)
+    assert not (tmp_path / 'repaired').exists()
+    assert not (source / 'chart-trades.ndjson').exists()

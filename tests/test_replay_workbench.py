@@ -1,5 +1,9 @@
+import asyncio
 import json
 import shutil
+import time
+from pathlib import Path
+from types import SimpleNamespace
 from datetime import datetime, timedelta
 from decimal import Decimal
 
@@ -63,6 +67,30 @@ def test_active_checkpoint_copies_only_durable_prefix_and_never_modifies_recordi
     assert json.loads(status_path.read_text())['closed'] is False
     assert segment.read_bytes().endswith(b'{"incomplete":')
     assert json.loads((frozen / 'manifest.json').read_text())['replay_snapshot_of'] == str(capture.resolve())
+
+
+@pytest.mark.parametrize('valid', [True, False])
+def test_checkpoint_publication_race_validates_winner_and_cleans_loser(capture, tmp_path, monkeypatch, valid):
+    destination = tmp_path / 'snapshots'
+    rename_error = FileExistsError('another checkpoint publisher won')
+
+    def publish_other(temporary, target):
+        shutil.copytree(temporary, target)
+        if not valid:
+            (target / 'status.json').write_text('{}')
+        raise rename_error
+
+    monkeypatch.setattr(Path, 'rename', publish_other)
+    if valid:
+        frozen = snapshot_capture(capture, destination)
+        monkeypatch.undo()
+        assert IndexedCapture(frozen, cache_dir=tmp_path / 'cache').summary['depth_snapshots'] == 100
+    else:
+        with pytest.raises(FileExistsError) as raised:
+            snapshot_capture(capture, destination)
+        assert raised.value is rename_error
+    assert len(list(destination.iterdir())) == 1
+    assert not list(destination.glob('*.tmp'))
 
 
 def test_checkpoint_distinguishes_sources_with_the_same_basename_and_prefix(capture, tmp_path):
@@ -204,3 +232,41 @@ async def test_http_contract_blocks_cross_origin_actions_and_returns_only_visibl
         exported = await client.get(f'/api/sessions/{session}/export')
         assert exported.status == 200
         assert (await exported.json(content_type=None))['chart_kind'] == 'midpoint candles'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('renewed', [True, False])
+async def test_session_eviction_checks_idle_state_under_session_lock(capture, monkeypatch, renewed):
+    from src.gui import replay_server
+
+    lock = asyncio.Lock()
+    closed = []
+
+    def close():
+        assert lock.locked()
+        closed.append(True)
+
+    old = SimpleNamespace(engine=SimpleNamespace(finished=False), last_used=time.monotonic() - 4000, close=close)
+    state = dict(default=str(capture), load_lock=asyncio.Lock(), sessions={'old': (old, lock)}, paths=set())
+    new = SimpleNamespace(engine=SimpleNamespace(attempt_id='new'), state=lambda frame: {})
+    monkeypatch.setattr(replay_server, 'catalog', lambda app: [{'id': str(capture)}])
+    monkeypatch.setattr(replay_server, 'IndexedCapture', lambda *args: SimpleNamespace(built=False))
+    monkeypatch.setattr(replay_server, 'Workbench', lambda *args, **kwargs: new)
+
+    async def body():
+        return {}
+
+    request = SimpleNamespace(app={replay_server.STATE: state}, json=body)
+    await lock.acquire()
+    task = asyncio.create_task(replay_server.create_session(request))
+    try:
+        await asyncio.sleep(0)
+        assert not closed
+        assert not task.done()
+        if renewed:
+            old.last_used = time.monotonic()
+    finally:
+        lock.release()
+        await task
+    assert bool(closed) is not renewed
+    assert ('old' in state['sessions']) is renewed

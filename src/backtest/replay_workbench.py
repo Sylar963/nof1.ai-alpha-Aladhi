@@ -61,6 +61,7 @@ class Workbench:
         self.drawings = []
         self.last_used = time.monotonic()
         self.processed = 0
+        self._calibration_pending = False
         self.engine.baseline_enabled = False
         available = max(0, dataset.summary['last_replay_ns'] - self.engine.clock_ns)
         target = self.engine.clock_ns + min(max(0, min(int(warmup_seconds), 3600)) * NS, available // 5)
@@ -69,27 +70,47 @@ class Workbench:
         self.engine._log('system', 'practice_start', warmup_seconds=warmup_seconds)
 
     def advance(self, target_ns, max_events=10000):
+        if type(max_events) is not int or max_events <= 0:
+            raise ValueError('playback event budget must be a positive integer')
         started = time.perf_counter()
         engine = self.engine
         count = 0
-        while not engine.finished and engine.next_event_ns is not None and engine.next_event_ns <= target_ns and count < max_events:
+        research_count = 0
+
+        def advance_research():
+            nonlocal research_count
+            work = self.calibration.advance(engine.clock_ns, getattr(engine, 'last_original_sequence', None),
+                                            max_events=max_events - research_count)
+            research_count += work['events']
+            self._calibration_pending = work['more']
+
+        if self._calibration_pending:
+            advance_research()
+        while (not self._calibration_pending and not engine.finished and engine.next_event_ns is not None
+               and engine.next_event_ns <= target_ns and count < max_events):
             engine.step()
-            self.calibration.advance(engine.clock_ns, getattr(engine, 'last_original_sequence', None))
+            advance_research()
             count += 1
             if engine.last_kind == 'depth' and engine.midpoint is not None:
                 self._protect()
             if engine.price_updated:
                 self.candles.observe(engine.history[-1][0], engine.history[-1][1],
                                      engine.last_trade_size if engine.price_source == 'trades' else 0)
-        if not engine.finished and (engine.next_event_ns is None or engine.next_event_ns > target_ns):
+        if (not self._calibration_pending and not engine.finished
+                and (engine.next_event_ns is None or engine.next_event_ns > target_ns)):
             delta = max(0, target_ns - engine.clock_ns)
             engine.clock_ns += delta
             engine.wall_ns += delta
-            self.calibration.advance(engine.clock_ns)
+            advance_research()
         self.processed += count
         self.last_used = time.monotonic()
-        return {'events': count, 'elapsed_ms': round((time.perf_counter() - started) * 1000, 2),
-                'target_ns': target_ns, 'more': not engine.finished and engine.clock_ns < target_ns}
+        execution_due = not engine.finished and engine.next_event_ns is not None and engine.next_event_ns <= target_ns
+        return {'events': count, 'research_events': research_count,
+                'elapsed_ms': round((time.perf_counter() - started) * 1000, 2),
+                'target_ns': target_ns,
+                'more': self._calibration_pending or execution_due or (not engine.finished and engine.clock_ns < target_ns),
+                'continuation': {'clock_ns': engine.clock_ns,
+                                 'sequence_bound': getattr(engine, 'last_original_sequence', None)}}
 
     def _active(self, actor='human'):
         return [order for order in self.engine.orders if order.actor == actor and order.status in ACTIVE]
@@ -185,7 +206,8 @@ class Workbench:
 
     def state(self, frame=5, since=0, event_offset=0):
         engine = self.engine
-        visible_events = [e for e in engine.events if e['actor'] != 'bot' or engine.finished]
+        finished = engine.finished and not self._calibration_pending
+        visible_events = [e for e in engine.events if e['actor'] != 'bot' or finished]
         mark = engine.mark_price
         account = engine.accounts['human'].summary(mark, engine.config.starting_equity)
         layers = []
@@ -205,16 +227,16 @@ class Workbench:
         end = self.dataset.summary['last_replay_ns']
         calibration = self.calibration.snapshot(engine.clock_ns)
         return {'id': engine.attempt_id, 'market': engine.config.market, 'clock_ns': engine.clock_ns,
-                'utc': utc(engine.wall_ns).isoformat(), 'finished': engine.finished, 'failure': engine.failure,
+                'utc': utc(engine.wall_ns).isoformat(), 'finished': finished, 'failure': engine.failure,
                 'progress': min(1, max(0, (engine.clock_ns - start) / max(1, end - start))),
                 'book_valid': engine.book_valid, 'midpoint': engine.midpoint, 'last_price': mark,
                 'bid': engine.bids[0][0] if engine.bids else None, 'ask': engine.asks[0][0] if engine.asks else None,
                 'opening_range': engine.range, 'candles': self.candles.visible(frame, since), 'timeframe': frame,
                 'layers': layers, 'account': account,
-                'orders': [asdict(o) for o in engine.orders if o.actor == 'human' or engine.finished][-100:],
-                'events': visible_events[0 if engine.finished else max(0, event_offset):], 'event_count': len(visible_events),
+                'orders': [asdict(o) for o in engine.orders if o.actor == 'human' or finished][-100:],
+                'events': visible_events[0 if finished else max(0, event_offset):], 'event_count': len(visible_events),
                 'drawings': self.drawings, 'rule_version': engine.config.rule_version,
-                'comparison': engine.report()['accounts'] if engine.finished and not engine.failure else None,
+                'comparison': engine.report()['accounts'] if finished and not engine.failure else None,
                 'capture': engine.capture['run_id'], 'capture_path': str(self.dataset.source), 'plan': self.plan,
                 'price_source': engine.price_source,
                 'trade_history_provenance': engine.capture.get('trade_history_provenance'),
@@ -234,6 +256,8 @@ class Workbench:
             raise ValueError('Replay advanced; inspect the current features and save your interpretation again')
         source = body.get('source')
         stream = body.get('stream')
+        if not all(isinstance(value, str) for value in (source, label, stream)):
+            raise ValueError('source, label, and stream must be strings')
         view = features['sources'].get(source)
         if (label not in LABELS or not view or stream not in {'quote', 'trade'} or view[stream]['price'] is None
                 or not isinstance(reason, str) or not reason.strip()):
@@ -255,6 +279,7 @@ class Workbench:
 
     def finish(self):
         self.engine.finish()
+        self._calibration_pending = False
         return self.save()
 
     def save(self):

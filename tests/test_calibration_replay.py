@@ -57,7 +57,7 @@ def test_workbench_labels_journal_server_computed_features_and_exports_them(tmp_
     desk.advance(12 * NS)
     visible = desk.state()
     before = visible['calibration']
-    assert before['sources']['binance_spot']['quote']['price'] == 103
+    assert before['sources']['binance_spot']['quote']['price'] == 102
     with pytest.raises(ValueError):
         desk.label_speed({'label': 'invented', 'source': 'binance_spot', 'reason': 'test'})
     body = {'label': 'acceptance_no_add', 'source': 'binance_spot', 'stream': 'quote',
@@ -95,6 +95,22 @@ def test_calibration_or_is_independent_of_generic_baseline_settings(tmp_path):
     desk.close()
 
 
+@pytest.mark.parametrize('field', ['source', 'label', 'stream'])
+@pytest.mark.parametrize('value', [[], {}, None, 1, True])
+def test_labels_reject_non_string_identifiers(tmp_path, field, value):
+    desk = Workbench(IndexedCapture(sample(tmp_path), cache_dir=tmp_path / 'cache'),
+                     ReplayConfig(), journal_dir=None, warmup_seconds=0)
+    try:
+        desk.advance(12 * NS)
+        body = dict(source='binance_spot', label='wait', stream='quote', reason='test',
+                    expected_cursor=desk.state()['calibration_cursor'])
+        body[field] = value
+        with pytest.raises(ValueError):
+            desk.label_speed(body)
+    finally:
+        desk.close()
+
+
 def test_recovered_event_does_not_release_original_sequence_bound(tmp_path):
     path = sample(tmp_path)
     dataset = IndexedCapture(path, cache_dir=tmp_path / 'cache')
@@ -107,11 +123,63 @@ def test_recovered_event_does_not_release_original_sequence_bound(tmp_path):
              'received_monotonic_ns': 9 * NS}
     dataset.records = lambda market: (r for r in [early, first, recovered, third])
     desk = Workbench(dataset, ReplayConfig(), journal_dir=None, warmup_seconds=0)
-    desk.advance(10 * NS, max_events=1)
+    work = desk.advance(10 * NS, max_events=1)
+    assert work['more'] and desk.engine.clock_ns == work['target_ns']
     assert desk.state()['calibration']['sources']['binance_spot']['quote']['price'] is None
-    desk.advance(10 * NS, max_events=1)
+    work = desk.advance(10 * NS, max_events=1)
+    assert work['more'] and desk.engine.clock_ns == work['target_ns']
     assert desk.state()['calibration']['sources']['binance_spot']['quote']['price'] is None
     desk.close()
+
+
+def test_no_event_and_zero_delta_advances_keep_original_sequence_bound(tmp_path):
+    dataset = IndexedCapture(sample(tmp_path), cache_dir=tmp_path / 'cache')
+    first = next(dataset.records('BTC-USD-PERP'))
+    early = {**first, 'capture_sequence': 0, 'original_capture_sequence': 0,
+             'received_monotonic_ns': 9 * NS}
+    dataset.records = lambda market: (r for r in [early, first, {**first, 'received_monotonic_ns': 11 * NS}])
+    desk = Workbench(dataset, ReplayConfig(), journal_dir=None, warmup_seconds=0)
+    try:
+        for _ in range(2):
+            work = desk.advance(10 * NS)
+            assert not work['more']
+            assert desk.state()['calibration']['sources']['binance_spot']['quote']['price'] is None
+    finally:
+        desk.close()
+
+
+@pytest.mark.parametrize('target', [15, 20])
+def test_playback_bounds_research_work_and_resumes_at_same_cursor(tmp_path, target):
+    first = {'source': 'paradex', 'market': 'BTC-USD-PERP', 'kind': 'depth', 'session_id': 'p',
+             'received_monotonic_ns': 10 * NS, 'received_at_ns': BASE,
+             'payload': {'pkg_type': 'SNAPSHOT', 'bids': [['100', '1']], 'asks': [['102', '1']]}}
+    quotes = [dict(source='binance_spot', market='BTCUSDT', kind='bbo', session_id='b',
+                   received_monotonic_ns=11 * NS, received_at_ns=BASE + NS,
+                   payload={'b': str(100 + i), 'a': str(102 + i)}) for i in range(25)]
+    last = {**first, 'received_monotonic_ns': 20 * NS, 'received_at_ns': BASE + 10 * NS}
+    future = {**quotes[-1], 'received_monotonic_ns': 20 * NS, 'received_at_ns': BASE + 10 * NS,
+              'payload': {'b': '900', 'a': '902'}}
+    path = capture(tmp_path / 'busy', [first, *quotes, last, future])
+    desk = Workbench(IndexedCapture(path, cache_dir=tmp_path / 'cache'), ReplayConfig(),
+                     journal_dir=None, warmup_seconds=0)
+    try:
+        for call in range(20):
+            work = desk.advance(target * NS, max_events=3)
+            assert work['events'] <= 3 and work['research_events'] <= 3
+            assert desk.engine.clock_ns == target * NS
+            assert work['continuation']['clock_ns'] == target * NS
+            assert work['continuation']['sequence_bound'] == (27 if target == 20 else 1)
+            assert desk.state()['calibration']['sources']['binance_spot']['quote']['price'] != 901
+            if not work['more']:
+                break
+            assert not desk.state()['finished']
+        else:
+            pytest.fail('bounded playback did not finish its continuation')
+        assert call > 0
+        assert desk.state()['calibration']['capture_sequence'] == (27 if target == 20 else 26)
+        assert desk.state()['finished'] is (target == 20)
+    finally:
+        desk.close()
 
 
 def test_label_cursor_preserves_nanoseconds_above_javascript_integer_precision(tmp_path):

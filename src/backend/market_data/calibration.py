@@ -3,13 +3,14 @@
 from bisect import bisect_left, bisect_right, insort
 from collections import Counter, OrderedDict, deque
 from copy import copy
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, time, timedelta
 from hashlib import sha256
 import json
 import math
 from zoneinfo import ZoneInfo
 
+from src.backend import config_loader
 from src.backend.market_data.feeds import SOURCE_NAMES
 from src.backend.market_data.trades import trade_print
 
@@ -21,20 +22,20 @@ VERSION = 'speed-acceptance-v1'
 
 @dataclass(frozen=True)
 class CalibrationConfig:
-    session_timezone: str = 'America/Tijuana'
-    range_start: str = '20:00'
-    range_minutes: int = 15
-    max_age_s: float = 3
-    history_seconds: int = 3600
-    min_baseline_samples: int = 30
-    or_max_gap_s: float = 30
-    band_bps: float = 1
-    min_dwell_s: float = 5
-    min_outside_fraction: float = 0.7
-    min_encounter_samples: int = 3
-    encounter_timeout_s: float = 120
-    recent_encounters: int = 128
-    dedup_capacity: int = 8192
+    session_timezone: str = field(default_factory=lambda: config_loader.CONFIG['calibration_session_timezone'])
+    range_start: str = field(default_factory=lambda: config_loader.CONFIG['calibration_range_start'])
+    range_minutes: int = field(default_factory=lambda: config_loader.CONFIG['calibration_range_minutes'])
+    max_age_s: float = field(default_factory=lambda: config_loader.CONFIG['calibration_max_age_s'])
+    history_seconds: int = field(default_factory=lambda: config_loader.CONFIG['calibration_history_seconds'])
+    min_baseline_samples: int = field(default_factory=lambda: config_loader.CONFIG['calibration_min_baseline_samples'])
+    or_max_gap_s: float = field(default_factory=lambda: config_loader.CONFIG['calibration_or_max_gap_s'])
+    band_bps: float = field(default_factory=lambda: config_loader.CONFIG['calibration_band_bps'])
+    min_dwell_s: float = field(default_factory=lambda: config_loader.CONFIG['calibration_min_dwell_s'])
+    min_outside_fraction: float = field(default_factory=lambda: config_loader.CONFIG['calibration_min_outside_fraction'])
+    min_encounter_samples: int = field(default_factory=lambda: config_loader.CONFIG['calibration_min_encounter_samples'])
+    encounter_timeout_s: float = field(default_factory=lambda: config_loader.CONFIG['calibration_encounter_timeout_s'])
+    recent_encounters: int = field(default_factory=lambda: config_loader.CONFIG['calibration_recent_encounters'])
+    dedup_capacity: int = field(default_factory=lambda: config_loader.CONFIG['calibration_dedup_capacity'])
 
     def __post_init__(self):
         ZoneInfo(self.session_timezone)
@@ -259,6 +260,9 @@ class _Encounter:
 
     def update(self, ns, wall, event, price, size, side, config):
         r = self.row
+        if ns > r['start_ns'] + round(config.encounter_timeout_s * NS):
+            r.update(complete=True, reason=r['reason'] or 'measurement_window_end')
+            return
         dt = (ns - r['last_ns']) / NS
         if self.was_outside:
             r['outside_s'] += dt
@@ -413,7 +417,8 @@ class _Source:
                 self.active[key] = _Encounter(row, row['direction'], price, band)
         for key, encounter in list(self.active.items()):
             encounter.update(ns, wall, event, price, size, side, self.config)
-            encounter.row.update(last_receipt_ns=original, last_sequence=sequence)
+            if encounter.row['last_ns'] == ns:
+                encounter.row.update(last_receipt_ns=original, last_sequence=sequence)
             changed.append(_copy_encounter(encounter.row))
             if encounter.row['complete']:
                 self.recent.append(encounter.row)

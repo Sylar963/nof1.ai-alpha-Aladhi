@@ -282,3 +282,9 @@ replay with visual entry/stop/target levels, drawing tools, keyboard controls
 and a hidden bot comparison. Run `venv/bin/python scripts/replay_paradex.py`
 and open `http://127.0.0.1:8081`. Active recordings open as frozen checkpoints
 while collection continues. See the [replay workflow and performance benchmark](docs/paradex_replay.md).
+
+Speed/acceptance research reads the `CALIBRATION_*` settings documented in
+[.env.example](.env.example). Its opening range defaults to 20:00–20:15 in
+`America/Tijuana`, independently of the replay baseline range. These settings
+control measurement freshness, history, encounter bands and deadlines; explicit
+`CalibrationConfig` constructor arguments override the runtime defaults.

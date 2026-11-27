@@ -35,10 +35,12 @@ def src(engine, source=SPOT):
     return engine.snapshot()['sources'][source]
 
 
-def opening_range(engine, base=WINTER, source=SPOT, skip=()):
+def opening_range(engine, base=WINTER, source=SPOT, skip=(), receipt_offset=0):
     for t in [-1, *range(0, 901)]:
         if t not in skip:
-            engine.observe(trade(t, 99 if t == 0 else 101 if t == 899 else 100, source, base=base))
+            point = trade(t, 99 if t == 0 else 101 if t == 899 else 100, source, base=base)
+            point['received_monotonic_ns'] += receipt_offset
+            engine.observe(point)
 
 
 def test_grid_is_past_only_equal_weighted_and_snapshot_does_not_train():
@@ -172,6 +174,43 @@ def test_encounters_include_skipped_bands_time_weighting_persistence_and_rejecti
     assert rejected['complete'] and rejected['arrival_speed_bps_s'] > 0
     assert rejected['samples'] == 8
     json.dumps(rows, allow_nan=False)
+
+
+@pytest.mark.parametrize('offset,included', [(2, True), (2.000000001, False)])
+@pytest.mark.parametrize('receipt_offset', [0, 2**53 + 1])
+def test_encounter_deadline_includes_exact_cutoff_only(offset, included, receipt_offset):
+    e = SpeedAcceptanceEngine(CalibrationConfig(encounter_timeout_s=2.0, min_dwell_s=1,
+                                              min_encounter_samples=2))
+    opening_range(e, receipt_offset=receipt_offset)
+    arrival = trade(901, 102)
+    arrival['received_monotonic_ns'] += receipt_offset
+    initial = next(row for row in e.observe(arrival) if row['level'] == 'ORH')
+    point = trade(901 + offset, 102.5)
+    point['received_monotonic_ns'] += receipt_offset
+    rows = e.observe(point)
+    final = next(row for row in rows if row['id'] == initial['id'])
+    assert final['complete']
+    assert final['samples'] == (2 if included else 1)
+    assert final['volume'] == (3 if included else 1.5)
+    assert final['last_price'] == (102.5 if included else 102)
+    expected_ns = point['received_monotonic_ns'] if included else initial['last_ns']
+    assert final['last_ns'] == expected_ns
+    assert final['last_receipt_ns'] == final['last_ns']
+    assert final['state'] == ('persistent_acceptance' if included else initial['state'])
+
+
+def test_calibration_defaults_use_runtime_settings_and_allow_explicit_overrides(monkeypatch):
+    from src.backend.config_loader import CONFIG
+
+    monkeypatch.setitem(CONFIG, 'calibration_session_timezone', 'UTC')
+    monkeypatch.setitem(CONFIG, 'calibration_range_start', '03:00')
+    monkeypatch.setitem(CONFIG, 'calibration_range_minutes', 5)
+    monkeypatch.setitem(CONFIG, 'calibration_band_bps', 2.5)
+    default = CalibrationConfig()
+    assert (default.session_timezone, default.range_start, default.range_minutes, default.band_bps) == (
+        'UTC', '03:00', 5, 2.5)
+    explicit = CalibrationConfig(range_minutes=10, band_bps=4)
+    assert explicit.range_minutes == 10 and explicit.band_bps == 4
 
 
 def test_configured_window_restarts_on_dst_zone_and_cutoff_requires_observed_witness():

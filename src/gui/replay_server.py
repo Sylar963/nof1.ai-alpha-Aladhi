@@ -83,10 +83,11 @@ async def create_session(request):
         raise ValueError('unknown replay setting')
     config = ReplayConfig(**config_body)
     async with state['load_lock']:
-        for key, (old, _) in list(state['sessions'].items()):
-            if old.engine.finished or time.monotonic() - old.last_used > 3600:
-                old.close()
-                del state['sessions'][key]
+        for key, (old, lock) in list(state['sessions'].items()):
+            async with lock:
+                if old.engine.finished or time.monotonic() - old.last_used > 3600:
+                    old.close()
+                    state['sessions'].pop(key, None)
         if len(state['sessions']) >= 4:
             raise ValueError('Close another replay attempt before opening more')
         started = time.perf_counter()

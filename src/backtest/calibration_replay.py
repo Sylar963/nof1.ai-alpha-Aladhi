@@ -14,15 +14,22 @@ class CalibrationReplay:
         self._records = self.dataset.records()
         self._next = next(self._records, None)
 
-    def advance(self, now_ns, sequence_bound=None):
-        while self._next is not None:
-            record = self._next
-            available = record['available_monotonic_ns']
-            if available > now_ns or (available == now_ns and sequence_bound is not None
-                                      and record['capture_sequence'] > sequence_bound):
-                break
-            self.engine.observe(record)
+    def has_due(self, now_ns, sequence_bound=None):
+        if self._next is None:
+            return False
+        available = self._next['available_monotonic_ns']
+        return available < now_ns or (available == now_ns and
+                                     (sequence_bound is None or self._next['capture_sequence'] <= sequence_bound))
+
+    def advance(self, now_ns, sequence_bound=None, *, max_events=10000):
+        if type(max_events) is not int or max_events < 0:
+            raise ValueError('research event budget must be a nonnegative integer')
+        count = 0
+        while count < max_events and self.has_due(now_ns, sequence_bound):
+            self.engine.observe(self._next)
             self._next = next(self._records, None)
+            count += 1
+        return {'events': count, 'more': self.has_due(now_ns, sequence_bound)}
 
     def snapshot(self, now_ns):
         return self.engine.snapshot(now_ns)

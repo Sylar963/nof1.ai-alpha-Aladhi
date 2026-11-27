@@ -51,8 +51,10 @@ and a context rebill — per poll. In measured sessions, roughly
 two-thirds of all wait calls were short polls that timed out.
 
 V1 has no `list_agents`: retain child IDs returned by `spawn_agent`
-and pass those IDs to `wait_agent` using its exposed schema. V1 waits
-for final statuses of the requested children, rather than mailbox updates.
+and pass those IDs to `wait_agent` using its exposed schema. V1 returns when
+any requested child reaches a final status, rather than on mailbox updates.
+After a child's final status is reported, remove its ID from subsequent
+waits and pass only IDs for children that are still running.
 
 - While you still have local work, do not wait at all. A completed
   child's final answer is pushed into your mailbox and arrives with

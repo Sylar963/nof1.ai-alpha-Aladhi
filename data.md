@@ -60,6 +60,16 @@ rangeSeconds = crTog ? (customRangeMinutes == 0 ? 1440 : customRangeMinutes) * 6
 if chartSeconds > rangeSeconds
     runtime.error("Chart timeframe must not exceed the configured opening range. Please use a smaller chart timeframe.")
 
+boundaryInsideBar(boundaryMinutes, dateTime) =>
+    boundary = timestamp(tz, year(dateTime, tz), month(dateTime, tz), dayofmonth(dateTime, tz), int(boundaryMinutes / 60), int(boundaryMinutes % 60))
+    time < boundary and boundary < time_close
+
+if crTog
+    if na(time_close)
+        runtime.error("Custom opening ranges require time-based chart bars with a known closing time.")
+    if boundaryInsideBar(customStartMinutes, time) or boundaryInsideBar(customStartMinutes, time_close) or boundaryInsideBar(customEndMinutes, time) or boundaryInsideBar(customEndMinutes, time_close)
+        runtime.error("Custom opening range boundaries must align with chart bars. Please use a smaller chart timeframe.")
+
 //---------------------------------------------------------------------------------------------------------------------}
 //Functions
 //---------------------------------------------------------------------------------------------------------------------{
@@ -248,11 +258,11 @@ if not or_sesh and or_token
 
 // MODIFIED: Check if first targets are hit
 if not or_sesh and or_token
-    if not na(first_up_target) and h_src > first_up_target and not first_up_hit
+    if not na(first_up_target) and h_src >= first_up_target and not first_up_hit
         first_up_hit := true
         hst := h_src
 
-    if not na(first_down_target) and l_src < first_down_target and not first_down_hit
+    if not na(first_down_target) and l_src <= first_down_target and not first_down_hit
         first_down_hit := true
         lst := l_src
 
@@ -265,6 +275,10 @@ if not or_sesh and or_token
 // Calculate maximum targets based on subsequent targets spacing
 up_max = first_up_hit ? get_1up((hst - first_up_target)/(orw*tSubsequentPer)) : 0
 down_max = first_down_hit ? get_1up((first_down_target - lst)/(orw*tSubsequentPer)) : 0
+if first_up_hit and hst >= first_up_target + orw*tSubsequentPer*up_max
+    up_max += 1
+if first_down_hit and lst <= first_down_target - orw*tSubsequentPer*down_max
+    down_max += 1
 
 // Calculate current target level for subsequent targets
 up_cur = first_up_hit ? math.max(0,get_1up((h_src - first_up_target)/(orw*tSubsequentPer))) : 0
@@ -275,7 +289,8 @@ if  (close > orm and down_check == false)
     down_check := true
 
 xdown = ta.crossunder(close,orl)
-xdown2 = ta.crossunder(close,first_down_target)
+xdown2_regular = ta.crossunder(close,first_down_target)
+xdown2 = or_end and or_token ? close < first_down_target and close[1] >= first_down_target : xdown2_regular
 if (useBias ? ((day_dir != 1 and xdown) or (day_dir == 1 and xdown2)) : ta.crossunder(close,orl)) and down_check
     down_signal := true
     down_check := false
@@ -284,7 +299,8 @@ if (close < orm and up_check == false)
     up_check := true
 
 xup = ta.crossover(close,orh)
-xup2 = ta.crossover(close,first_up_target)
+xup2_regular = ta.crossover(close,first_up_target)
+xup2 = or_end and or_token ? close > first_up_target and close[1] <= first_up_target : xup2_regular
 if (useBias ? ((day_dir != -1 and xup) or (day_dir == -1 and xup2)) : ta.crossover(close,orh)) and up_check
     up_signal := true
     up_check := false

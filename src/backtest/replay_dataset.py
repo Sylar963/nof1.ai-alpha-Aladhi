@@ -15,6 +15,16 @@ from src.backend.market_data.trades import trade_print
 INDEX_VERSION = 2
 
 
+def _validate_checkpoint(path, manifest, status):
+    try:
+        stored_manifest = json.loads((path / 'manifest.json').read_text())
+        stored_status = json.loads((path / 'status.json').read_text())
+    except (OSError, ValueError) as exc:
+        raise ValueError('existing checkpoint provenance is missing or invalid') from exc
+    if stored_manifest != manifest or stored_status != status:
+        raise ValueError('existing checkpoint provenance does not match the source durable prefix')
+
+
 def snapshot_capture(source: Path, destination: Path) -> Path:
     source = Path(source).resolve()
     status = json.loads((source / 'status.json').read_text())
@@ -29,13 +39,7 @@ def snapshot_capture(source: Path, destination: Path) -> Path:
                     snapshot_durable_records=status['durable_records'])
     checkpoint_status = {**status, 'closed': True}
     if path.exists():
-        try:
-            stored_manifest = json.loads((path / 'manifest.json').read_text())
-            stored_status = json.loads((path / 'status.json').read_text())
-        except (OSError, ValueError) as exc:
-            raise ValueError('existing checkpoint provenance is missing or invalid') from exc
-        if stored_manifest != manifest or stored_status != checkpoint_status:
-            raise ValueError('existing checkpoint provenance does not match the source durable prefix')
+        _validate_checkpoint(path, manifest, checkpoint_status)
         return path
     temporary = path.with_name(path.name + '-' + uuid4().hex + '.tmp')
     temporary.mkdir(parents=True)
@@ -57,7 +61,17 @@ def snapshot_capture(source: Path, destination: Path) -> Path:
         (temporary / 'status.json').write_text(json.dumps(checkpoint_status))
         for _ in iter_capture_records(temporary):
             pass
-        temporary.rename(path)
+        try:
+            temporary.rename(path)
+        except OSError:
+            try:
+                _validate_checkpoint(path, manifest, checkpoint_status)
+            except ValueError:
+                pass
+            else:
+                shutil.rmtree(temporary)
+                return path
+            raise
     except BaseException:
         shutil.rmtree(temporary)
         raise

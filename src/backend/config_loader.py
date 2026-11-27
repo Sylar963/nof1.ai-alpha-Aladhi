@@ -108,6 +108,20 @@ def _get_list(name: str, default: list[str] | None = None) -> list[str] | None:
 
 
 CONFIG = {
+    "calibration_session_timezone": _get_env("CALIBRATION_SESSION_TIMEZONE", "America/Tijuana"),
+    "calibration_range_start": _get_env("CALIBRATION_RANGE_START", "20:00"),
+    "calibration_range_minutes": _get_int("CALIBRATION_RANGE_MINUTES", 15),
+    "calibration_max_age_s": _get_float("CALIBRATION_MAX_AGE_S", 3),
+    "calibration_history_seconds": _get_int("CALIBRATION_HISTORY_SECONDS", 3600),
+    "calibration_min_baseline_samples": _get_int("CALIBRATION_MIN_BASELINE_SAMPLES", 30),
+    "calibration_or_max_gap_s": _get_float("CALIBRATION_OR_MAX_GAP_S", 30),
+    "calibration_band_bps": _get_float("CALIBRATION_BAND_BPS", 1),
+    "calibration_min_dwell_s": _get_float("CALIBRATION_MIN_DWELL_S", 5),
+    "calibration_min_outside_fraction": _get_float("CALIBRATION_MIN_OUTSIDE_FRACTION", 0.7),
+    "calibration_min_encounter_samples": _get_int("CALIBRATION_MIN_ENCOUNTER_SAMPLES", 3),
+    "calibration_encounter_timeout_s": _get_float("CALIBRATION_ENCOUNTER_TIMEOUT_S", 120),
+    "calibration_recent_encounters": _get_int("CALIBRATION_RECENT_ENCOUNTERS", 128),
+    "calibration_dedup_capacity": _get_int("CALIBRATION_DEDUP_CAPACITY", 8192),
     "capture_output_dir": _get_env("CAPTURE_OUTPUT_DIR", "data/market_capture"),
     "capture_symbol": _get_env("CAPTURE_SYMBOL", "BTCUSDT"),
     "capture_paradex_market": _get_env("CAPTURE_PARADEX_MARKET", "BTC-USD-PERP"),

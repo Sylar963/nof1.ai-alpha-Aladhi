@@ -368,6 +368,7 @@ class ParadexReplay:
             self.range = {"start_ns": start_ns, "end_ns": end_ns, "high": None, "low": None,
                           "complete": False, "coverage_ok": True}
         state = self.range
+        state['observed_ns'] = max(state.get('observed_ns', range_now), range_now)
         if self._last_gap_wall is not None and start_ns <= self._last_gap_wall < end_ns:
             state["coverage_ok"] = False
         if (self._last_gap_wall is not None and self._previous_depth_wall is not None
@@ -384,7 +385,7 @@ class ParadexReplay:
         elif observe and start_ns <= range_now < end_ns:
             state["coverage_ok"] = False
         coverage_start = self._coverage_start_ns if self.price_source == 'trades' else self._first_depth_wall
-        state["complete"] = bool(range_now >= end_ns and state["coverage_ok"]
+        state["complete"] = bool(state['observed_ns'] >= end_ns and state["coverage_ok"]
                                  and coverage_start is not None and coverage_start <= start_ns
                                  and state["high"] is not None and state["high"] > state["low"])
 
