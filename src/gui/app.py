@@ -8,7 +8,7 @@ from src.gui.services.bot_service import BotService
 from src.gui.services.state_manager import StateManager
 
 # Import pages
-from src.gui.pages import dashboard, positions, history, market, reasoning, settings, recommendations
+from src.gui.pages import dashboard, positions, history, market, reasoning, settings, recommendations, replay
 
 # Global services
 bot_service = BotService()
@@ -84,6 +84,8 @@ def create_app():
                 history.create_history(bot_service, state_manager)
             elif page == 'Market':
                 market.create_market(bot_service, state_manager)
+            elif page == 'Replay':
+                replay.create_replay()
             elif page == 'Reasoning':
                 reasoning.create_reasoning(bot_service, state_manager)
             elif page == 'Settings':
@@ -103,6 +105,7 @@ def create_app():
                     ('Positions', '💼 Positions', 'Active trading positions'),
                     ('History', '📜 History', 'Trade history and logs'),
                     ('Market', '📈 Market', 'Market data and indicators'),
+                    ('Replay', '⏪ Paradex Replay', 'Practice opening-range execution on recorded liquidity'),
                     ('Reasoning', '🧠 AI Reasoning', 'LLM decision logic'),
                     ('Settings', '⚙️ Settings', 'Configuration'),
                 ]

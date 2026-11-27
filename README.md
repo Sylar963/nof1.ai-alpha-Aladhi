@@ -266,3 +266,27 @@ Create an ecosystem where AI **learns, adapts, and trades autonomously**, formin
 ---
 
 *Inspired by the [Alpha Arena](https://nof1.ai) experiment.*
+
+## Public market-data capture
+
+Record Binance BTCUSDT spot/perpetual and Paradex BTC-USD-PERP WebSockets for speed and execution research:
+
+```bash
+venv/bin/python scripts/record_market_data.py --duration 60
+```
+
+The standalone recorder uses public data only and never submits orders. It preserves raw frames, timestamps, reconnect gaps and depth snapshots in bounded NDJSON files. See [capture configuration, recovery and replay](docs/market_data_capture.md).
+
+Practise opening-range execution in **Arena Replay**, a lightweight candlestick
+replay with visual entry/stop/target levels, drawing tools, keyboard controls
+and a hidden bot comparison. Run `venv/bin/python scripts/replay_paradex.py`
+and open `http://127.0.0.1:8081`. Active recordings open as frozen checkpoints
+while collection continues. See the [replay workflow and performance benchmark](docs/paradex_replay.md).
+
+Speed/acceptance research reads the `CALIBRATION_*` settings documented in
+[.env.example](.env.example). Its opening range defaults to 20:00–20:15 in
+`America/Tijuana`, independently of the replay baseline range. These settings
+control the research cache location, measurement freshness, history, encounter
+bands and deadlines, plus report sample tails and outcome horizons. Explicit
+`CalibrationConfig` constructor arguments, `cache_dir`, `outcome_seconds` and
+`--outcome-seconds` override their runtime defaults.
