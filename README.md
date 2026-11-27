@@ -286,5 +286,7 @@ while collection continues. See the [replay workflow and performance benchmark](
 Speed/acceptance research reads the `CALIBRATION_*` settings documented in
 [.env.example](.env.example). Its opening range defaults to 20:00–20:15 in
 `America/Tijuana`, independently of the replay baseline range. These settings
-control measurement freshness, history, encounter bands and deadlines; explicit
-`CalibrationConfig` constructor arguments override the runtime defaults.
+control the research cache location, measurement freshness, history, encounter
+bands and deadlines, plus report sample tails and outcome horizons. Explicit
+`CalibrationConfig` constructor arguments, `cache_dir`, `outcome_seconds` and
+`--outcome-seconds` override their runtime defaults.

@@ -44,6 +44,35 @@ def test_research_keeps_all_sources_bbo_lifecycle_and_original_order(tmp_path):
     assert list(reused.records()) == actual
 
 
+def test_research_cache_uses_runtime_config_unless_explicitly_overridden(tmp_path, monkeypatch):
+    from src.backend.config_loader import CONFIG
+
+    monkeypatch.chdir(tmp_path)
+    path = capture(tmp_path / 'capture', [row('paradex', 10)])
+    configured = tmp_path / 'configured-cache'
+    monkeypatch.setitem(CONFIG, 'calibration_cache_dir', str(configured))
+    default = ResearchCapture(path)
+    assert default.path.parent == configured
+    reused = ResearchCapture(path, cache_dir=None)
+    assert reused.path == default.path and not reused.built
+    other = tmp_path / 'other-cache'
+    monkeypatch.setitem(CONFIG, 'calibration_cache_dir', str(other))
+    changed = ResearchCapture(path)
+    assert changed.path.parent == other and changed.built
+    explicit = ResearchCapture(path, cache_dir=tmp_path / 'explicit-cache')
+    assert explicit.path.parent == tmp_path / 'explicit-cache'
+    assert list(explicit.records()) == list(default.records())
+
+
+def test_research_cache_falls_back_when_runtime_key_is_absent(tmp_path, monkeypatch):
+    from src.backend.config_loader import CONFIG
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delitem(CONFIG, 'calibration_cache_dir', raising=False)
+    indexed = ResearchCapture(capture(tmp_path / 'capture', [row('paradex', 10)]))
+    assert indexed.path.parent.resolve() == tmp_path / 'data/replay_cache'
+
+
 def test_research_cursor_reads_only_reached_receipt_times(tmp_path):
     indexed = ResearchCapture(capture(tmp_path / 'capture', [row('paradex', 10), row('paradex', 20)]),
                               cache_dir=tmp_path / 'cache')

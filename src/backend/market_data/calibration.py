@@ -369,9 +369,13 @@ class _Source:
             self.mark_break('trade_clock_mismatch')
             self.trade.invalidate('trade_clock_mismatch')
             self.counters['clock_mismatch_trades'] += 1
-            if self.range.start is not None and (not self.range.closed or self.range.start <= event < self.range.end):
+            if self.range.start is None or wall >= self.range.next_start:
+                self.range = _Range(self.config)
+                self.range.date, self.range.start, self.range.next_start = _window(wall, self.config)
+                self.range.end = self.range.start + self.config.range_minutes * 60 * NS
+            if (self.range.start <= wall < self.range.end or not self.range.closed
+                    or self.range.start <= event < self.range.end):
                 self.range.fail('trade_clock_mismatch')
-                return self.close('trade_clock_mismatch')
             return self.close('trade_clock_mismatch')
         prev_ns = None if self.trade.evidence_reason else self.trade.ns
         previous_price = self.trade.price

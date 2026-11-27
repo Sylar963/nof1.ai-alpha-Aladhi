@@ -7,13 +7,15 @@ from collections import Counter, deque
 from contextlib import closing
 from pathlib import Path
 
+from src.backend.config_loader import CONFIG
 from src.backend.market_data.calibration import HORIZONS, NS, SpeedAcceptanceEngine
 from src.backend.market_data.feeds import SOURCE_NAMES
 from src.backtest.calibration_dataset import ResearchCapture
 
 
 REPORT_VERSION = 1
-TAIL_SAMPLES = 4096
+TAIL_SAMPLES = CONFIG.get('calibration_report_tail_samples', 4096)
+DEFAULT_OUTCOME_SECONDS = CONFIG.get('calibration_outcome_seconds', 60)
 MAX_SQLITE_INTEGER = 2**63 - 1
 STREAMS = {
     'binance_spot': ('quote', 'trade'),
@@ -318,7 +320,7 @@ def _coverage(db, snapshot, summary, speed, counts):
     return coverage, warnings, split
 
 
-def generate_report(capture, output, config=None, outcome_seconds=60) -> Path:
+def generate_report(capture, output, config=None, outcome_seconds=DEFAULT_OUTCOME_SECONDS) -> Path:
     """Measure one immutable capture and write a fresh, self-contained report directory."""
     source = Path(capture).resolve()
     directory = Path(output).resolve()

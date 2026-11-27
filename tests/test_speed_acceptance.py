@@ -399,6 +399,27 @@ def test_pre_session_trade_silence_does_not_invalidate_an_exact_opening_print():
     assert actual == expected
 
 
+@pytest.mark.parametrize('prefix', [False, True])
+@pytest.mark.parametrize('bad_receipt', [-0.1, 0])
+def test_first_clock_mismatch_taints_only_its_receipt_opening_window(prefix, bad_receipt):
+    e = SpeedAcceptanceEngine()
+    if prefix:
+        e.observe(trade(-55, 100))
+    e.observe(trade(bad_receipt, 1000, event=1000))
+    assert e.accepted_trade is None
+    assert e.trade_breaks[SPOT] == 'trade_clock_mismatch'
+    for t in range(901):
+        e.observe(trade(t + 0.1, 99 if t == 0 else 101 if t == 899 else 100, event=t))
+    view = src(e)['opening_range']
+    if bad_receipt < 0:
+        assert view['status'] == 'complete'
+        assert view['levels']['ORH'] == 101 and view['levels']['ORL'] == 99
+    else:
+        assert view['status'] == 'incomplete'
+        assert view['reason'] == 'trade_clock_mismatch'
+        assert view['levels'] == {}
+
+
 @pytest.mark.parametrize('bad_event', [-2, 1000])
 def test_rejected_out_of_range_trade_cannot_hide_a_hole_in_forming_range(bad_event):
     e = SpeedAcceptanceEngine()

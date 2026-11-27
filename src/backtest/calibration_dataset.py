@@ -7,6 +7,7 @@ from contextlib import closing
 from pathlib import Path
 from uuid import uuid4
 
+from src.backend.config_loader import CONFIG
 from src.backend.market_data.storage import iter_capture_records
 
 
@@ -14,7 +15,7 @@ INDEX_VERSION = 1
 
 
 class ResearchCapture:
-    def __init__(self, source: Path, cache_dir=Path('data/replay_cache')):
+    def __init__(self, source: Path, cache_dir=None):
         self.source = Path(source).resolve()
         manifest_bytes = (self.source / 'manifest.json').read_bytes()
         manifest = json.loads(manifest_bytes)
@@ -27,7 +28,7 @@ class ResearchCapture:
         signature = json.dumps([INDEX_VERSION, str(self.source), status,
                                 hashlib.sha256(manifest_bytes).hexdigest(),
                                 [(p.name, p.stat().st_size, p.stat().st_mtime_ns) for p in segments]])
-        directory = Path(cache_dir)
+        directory = Path(CONFIG.get('calibration_cache_dir', 'data/replay_cache') if cache_dir is None else cache_dir)
         directory.mkdir(parents=True, exist_ok=True)
         self.path = directory / ('research-' + hashlib.sha256(signature.encode()).hexdigest()[:24] + '.sqlite')
         self.built = not self.path.exists()

@@ -108,6 +108,7 @@ def _get_list(name: str, default: list[str] | None = None) -> list[str] | None:
 
 
 CONFIG = {
+    "calibration_cache_dir": _get_env("CALIBRATION_CACHE_DIR", "data/replay_cache"),
     "calibration_session_timezone": _get_env("CALIBRATION_SESSION_TIMEZONE", "America/Tijuana"),
     "calibration_range_start": _get_env("CALIBRATION_RANGE_START", "20:00"),
     "calibration_range_minutes": _get_int("CALIBRATION_RANGE_MINUTES", 15),
@@ -122,6 +123,8 @@ CONFIG = {
     "calibration_encounter_timeout_s": _get_float("CALIBRATION_ENCOUNTER_TIMEOUT_S", 120),
     "calibration_recent_encounters": _get_int("CALIBRATION_RECENT_ENCOUNTERS", 128),
     "calibration_dedup_capacity": _get_int("CALIBRATION_DEDUP_CAPACITY", 8192),
+    "calibration_report_tail_samples": _get_int("CALIBRATION_REPORT_TAIL_SAMPLES", 4096),
+    "calibration_outcome_seconds": _get_float("CALIBRATION_OUTCOME_SECONDS", 60),
     "capture_output_dir": _get_env("CAPTURE_OUTPUT_DIR", "data/market_capture"),
     "capture_symbol": _get_env("CAPTURE_SYMBOL", "BTCUSDT"),
     "capture_paradex_market": _get_env("CAPTURE_PARADEX_MARKET", "BTC-USD-PERP"),

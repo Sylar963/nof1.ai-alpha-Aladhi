@@ -214,3 +214,32 @@ def test_cli_help_is_clean_and_cli_runs_without_overwrite(tmp_path):
     invalid = subprocess.run([*command, '--outcome-seconds', 'inf'], cwd=tmp_path,
                              capture_output=True, text=True)
     assert invalid.returncode != 0 and 'finite' in invalid.stderr
+
+
+@pytest.mark.parametrize('interface', ['api', 'cli'])
+@pytest.mark.parametrize('override', [None, 2.5])
+def test_report_runtime_defaults_and_explicit_outcome_overrides(tmp_path, monkeypatch, interface, override):
+    monkeypatch.setenv('CALIBRATION_REPORT_TAIL_SAMPLES', '3')
+    monkeypatch.setenv('CALIBRATION_OUTCOME_SECONDS', '7.5')
+    source = capture(tmp_path / 'capture', [quote(t, 100 + t) for t in range(10)])
+    output = tmp_path / 'report'
+    root = Path(__file__).resolve().parents[1]
+    if interface == 'cli':
+        command = [sys.executable, root / 'scripts/calibrate_market_data.py',
+                   '--capture', source, '--output', output]
+        if override is not None:
+            command.extend(['--outcome-seconds', str(override)])
+        cwd = tmp_path
+    else:
+        code = ('import sys; from src.backtest.calibration_report import generate_report; '
+                'kwargs = {} if len(sys.argv) == 3 else {"outcome_seconds": float(sys.argv[3])}; '
+                'print(generate_report(sys.argv[1], sys.argv[2], **kwargs))')
+        command = [sys.executable, '-c', code, source, output]
+        if override is not None:
+            command.append(str(override))
+        cwd = root
+    subprocess.run(command, cwd=cwd, capture_output=True, text=True, check=True)
+    report = json.loads((output / 'report.json').read_text())
+    assert report['outcome_seconds'] == (7.5 if override is None else override)
+    assert report['speed_sampling']['tail_limit_per_horizon'] == 3
+    assert report['speed'][SPOT]['quote']['horizons']['1']['tail_samples'] == 3
